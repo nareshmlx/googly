@@ -1,28 +1,55 @@
-import json
 import settings
-from agents.basic_agent import basic_agent
+from agents.multi.planner import planner_agent
+from agents.multi.executor import executor_agent
 
-def main():
-    print("\n🧠 Agent started. Streaming output:\n")
 
-    response = basic_agent.run(
-        "What is the current time? Explain briefly."
-    )
+def collect_text(agent, prompt, session_id=None):
+    response = agent.run(prompt, session_id=session_id)
+    text = ""
+    current_session_id = None
 
     for event in response:
-        event_dict = vars(event)
+        data = vars(event)
 
-        event_type = event_dict.get("event")
+        if current_session_id is None:
+            current_session_id = data.get("session_id")
 
-        # 1️⃣ Tool call event
-        if event_type == "RunToolCall":
-            print(f"\n🛠️ Calling tool: {event_dict.get('tools')}\n")
+        if data.get("content"):
+            text += data["content"]
 
-        # 2️⃣ Normal content tokens
-        if event_dict.get("content"):
-            print(event_dict["content"], end="", flush=True)
+    return text.strip(), current_session_id
 
-    print("\n\n✅ Agent run complete")
+
+def main():
+    user_request = "What is the current time and explain what timezone it is in?"
+
+    print("\n🧠 USER REQUEST\n")
+    print(user_request, "\n")
+
+    # 1️⃣ Planner
+    plan, session_id = collect_text(planner_agent, user_request)
+
+    print("📋 PLAN\n")
+    print(plan, "\n")
+
+    # 2️⃣ Executor runs each step
+    results = []
+
+    for step in plan.split("\n"):
+        if not step.strip():
+            continue
+
+        result, _ = collect_text(
+            executor_agent,
+            step,
+            session_id=session_id
+        )
+        results.append(result)
+
+    # 3️⃣ Combine (fake supervisor)
+    print("✅ FINAL ANSWER\n")
+    print("\n".join(results))
+
 
 if __name__ == "__main__":
     main()
