@@ -1,0 +1,33 @@
+{
+    "created_at": 1769583004,
+    "event": "RunContent",
+    "agent_id": "basic-agent",
+    "agent_name": "basic-agent",
+    "run_id": "75034e33-932e-4b24-8765-14151ec10a3d",
+    "parent_run_id": null,
+    "session_id": "fac974b1-4c7b-4f23-822d-4b18bb864186",
+    "workflow_id": null,
+    "workflow_run_id": null,
+    "step_id": null,
+    "step_name": null,
+    "step_index": null,
+    "tools": null,
+    "content": "",
+    "workflow_agent": false,
+    "content_type": "str",
+    "reasoning_content": "",
+    "model_provider_data": {
+        "id": "chatcmpl-D2tfKi59hoKqNHJ2d1U9WI9mwGaYO",
+        "system_fingerprint": "fp_8bbc38b4db",
+        "model_extra": {
+            "obfuscation": "dAx8ZHmIJ"
+        }
+    },
+    "citations": null,
+    "response_audio": null,
+    "image": null,
+    "references": null,
+    "additional_input": null,
+    "reasoning_steps": null,
+    "reasoning_messages": null
+}
