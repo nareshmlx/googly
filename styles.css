@@ -1,0 +1,40 @@
+/* Beauty Social AI - Clean Minimal Styles */
+
+/* Hide Streamlit branding only */
+#MainMenu,
+footer {
+    visibility: hidden;
+}
+
+/* Main container */
+.main .block-container {
+    padding-top: 2rem;
+    padding-bottom: 5rem;
+    max-width: 900px;
+}
+
+/* Dark theme */
+[data-testid="stAppViewContainer"] {
+    background-color: #0f0f14;
+}
+
+/* Sidebar */
+[data-testid="stSidebar"] {
+    background-color: #0a0a0f;
+}
+
+/* Chat input styling */
+.stChatInput textarea {
+    background: #191921 !important;
+    border: 1px solid rgba(255, 255, 255, 0.1) !important;
+    border-radius: 12px !important;
+}
+
+/* Video cards */
+.video-card {
+    background: #191921;
+    border-radius: 12px;
+    padding: 1rem;
+    margin-bottom: 1rem;
+    border: 1px solid rgba(255, 255, 255, 0.05);
+}
