@@ -1,0 +1,16 @@
+services:
+  db:
+    image: agnohq/pgvector:16
+    container_name: agentos-db
+    restart: always
+    environment:
+      POSTGRES_USER: ai
+      POSTGRES_PASSWORD: ai
+      POSTGRES_DB: ai
+    ports:
+      - "5432:5432"
+    volumes:
+      - agentos_pgdata:/var/lib/postgresql/data
+
+volumes:
+  agentos_pgdata:
