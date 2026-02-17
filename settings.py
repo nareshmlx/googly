@@ -15,7 +15,12 @@ DB_PASSWORD = os.getenv("DB_PASSWORD", "ai")
 DB_NAME = os.getenv("DB_NAME", "ai")
 
 # Construct database URL for agno
-DATABASE_URL = f"postgresql+psycopg://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+# Check if DATABASE_URL is directly provided (e.g., Streamlit Cloud Secrets)
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not DATABASE_URL:
+    # Fallback to local Docker configuration
+    DATABASE_URL = f"postgresql+psycopg://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY not found in environment")
