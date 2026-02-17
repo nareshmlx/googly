@@ -20,7 +20,7 @@ DATABASE_URL = f"postgresql+psycopg://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY not found in environment")
 
-if not GOOGLE_API_KEY:
-    raise RuntimeError("GOOGLE_API_KEY not found in environment")
+# if not GOOGLE_API_KEY:
+#     raise RuntimeError("GOOGLE_API_KEY not found in environment")
 
 # Ensemble API token is optional - only needed if using TikTok search tool
