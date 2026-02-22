@@ -237,28 +237,99 @@ def _format_openalex_context(papers: list[dict]) -> str:
 
 
 def _clean_openalex_query(query: str, intent: dict) -> str:
-    """
-    Clean user text before OpenAlex search.
+    """Build a focused keyword query for academic search APIs from intent or raw query.
 
-    Guards against prompts accidentally containing prior assistant output.
+    Academic APIs (arXiv, PubMed, Semantic Scholar) do keyword matching, not
+    natural-language understanding.  Sending a full English question sentence like
+    "What are the latest research papers on peptide anti-aging?" causes false-positive
+    matches on stop-words ("research", "papers", "latest") returning completely
+    off-topic results.
+
+    Strategy (in priority order):
+    1. Use intent["entities"] when available — the IntentAgent already extracted the
+       key terms, so "peptide anti-aging" is far cleaner than the full sentence.
+    2. Fall back to stripping question words and common filler from the raw query.
+    3. Append domain-specific boost terms when the domain is beauty/cosmetics and
+       no beauty keywords are present in the query.
     """
+    intent = intent or {}
+
+    # ── 1. Use intent entities (primary path) ────────────────────────────────
+    # Strip meta-query terms the IntentAgent sometimes includes as entities
+    # (e.g. "research papers", "latest studies") — these are query type descriptors,
+    # not subject keywords, and will match off-topic academic papers.
+    _META_TERMS = frozenset(
+        {
+            "research papers",
+            "research paper",
+            "papers",
+            "paper",
+            "studies",
+            "study",
+            "articles",
+            "article",
+            "publications",
+            "publication",
+            "latest",
+            "recent",
+            "newest",
+            "current",
+        }
+    )
+    entities: list[str] = [
+        e.strip()
+        for e in (intent.get("entities") or [])
+        if isinstance(e, str) and e.strip() and e.strip().lower() not in _META_TERMS
+    ]
+    if entities:
+        text = " ".join(entities[:5])
+        # Add domain boost if domain is beauty-adjacent and not already in entities
+        lowered = text.lower()
+        domain = str(intent.get("domain") or "").lower()
+        if domain in {"cosmetics", "beauty_market_intelligence", "fragrance", "skincare"}:
+            if not any(t in lowered for t in {"beauty", "cosmetics", "skincare", "fragrance"}):
+                text = f"{text} skincare cosmetics"
+        return re.sub(r"\s+", " ", text).strip()
+
+    # ── 2. Fallback: strip question words and filler from raw query ───────────
     text = str(query or "")
+    # Remove prompt-injection markers (prior assistant output leaked in)
     for marker in ("\n\nAnswer", "\nAnswer", "\n\nEvidence", "\nEvidence"):
         idx = text.find(marker)
         if idx > 0:
             text = text[:idx]
             break
 
+    # Remove question starters ("What are the", "Tell me about", etc.)
+    text = re.sub(
+        r"^(what|which|who|where|when|how|why|tell me|show me|find|list|give me)"
+        r"\s+(are|is|do|does|were|was|the|me|a|an)?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    # Remove research-query filler that matches off-topic papers via keyword overlap
+    text = re.sub(
+        r"\b(latest|recent|newest|current|research\s+papers?|papers?|studies|study"
+        r"|about|regarding|on|for|from|in|a|the)\b\s*",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
+
     text = re.sub(r"\s+", " ", text).strip()
     if len(text) > 220:
         text = text[:220].rstrip()
 
-    beauty_terms = {"beauty", "cosmetics", "skincare", "makeup", "fragrance"}
+    # Add domain boost if applicable and not already present
     lowered = text.lower()
-    if not any(term in lowered for term in beauty_terms):
+    if not any(
+        term in lowered for term in {"beauty", "cosmetics", "skincare", "makeup", "fragrance"}
+    ):
         domain = str(intent.get("domain") or "").lower()
         if domain in {"cosmetics", "beauty_market_intelligence", "fragrance", "skincare"}:
-            text = f"{text} beauty cosmetics skincare fragrance".strip()
+            text = f"{text} skincare cosmetics".strip()
 
     return text
 
@@ -566,6 +637,7 @@ async def run_query(
         "orchestrator.intent_and_relevance",
         domain=intent.get("domain"),
         query_type=query_type,
+        entities=intent.get("entities"),
         is_research_query=is_research_query,
         exclude_papers=exclude_papers,
         relevant_project_ids=relevant_project_ids,
@@ -688,6 +760,12 @@ async def run_query(
     if openalex_enabled and is_research_query and not kb_has_paper:
         research_query = _clean_openalex_query(cleaned_query, intent)
         stage_start = time.perf_counter()
+        logger.info(
+            "orchestrator.research.query_cleaned",
+            cleaned_query_preview=cleaned_query[:80],
+            research_query=research_query,
+            intent_entities=intent.get("entities"),
+        )
 
         try:
             # Phase 3.1: Call academic tools first (Semantic Scholar, arXiv, PubMed) in parallel
