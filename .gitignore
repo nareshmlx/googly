@@ -1,3 +1,13 @@
+# Markdown files (except README.md)
+*.md
+!README.md
+
+# Docs, plans, logs and test directories
+docs/
+plans/
+tests/
+logs/
+
 # Python-generated files
 __pycache__/
 *.py[oc]
@@ -6,9 +16,9 @@ dist/
 wheels/
 *.egg-info
 
-# Virtual environments
-.venv
+# Virtual environments (each app has its own)
+apps/api/.venv/
+apps/streamlit/.venv/
 .*env
-docs/
 ensemble_data/
 .agent
