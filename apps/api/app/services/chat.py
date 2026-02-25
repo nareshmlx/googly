@@ -21,7 +21,7 @@ from app.core.metrics import (
 )
 from app.core.redis import get_redis
 from app.repositories import chat_history as chat_history_repo
-from app.repositories.project import fetch_project_openalex_enabled, list_projects_summary
+from app.repositories.project import fetch_project_papers_enabled, list_projects_summary
 
 logger = structlog.get_logger(__name__)
 
@@ -459,7 +459,7 @@ async def stream_response(
                 return
 
         pool = await get_db_pool()
-        openalex_enabled = (await fetch_project_openalex_enabled(pool, project_id)) or False
+        papers_enabled = (await fetch_project_papers_enabled(pool, project_id)) or False
         all_projects = await _list_projects_summary_cached(pool, user_id)
         if not all_projects:
             all_projects = [{"id": project_id, "title": "", "description": ""}]
@@ -485,48 +485,61 @@ async def stream_response(
                 all_projects=all_projects,
                 user_id=user_id,
                 session_id=session_id,
-                openalex_enabled=openalex_enabled,
+                openalex_enabled=papers_enabled,
             ):
                 yield chunk
 
         async for chunk in _deduplicated_stream(dedup_key, _run_query_generator):
-            if chunk != "data: [DONE]\n\n":
+            if chunk == "data: [DONE]\n\n":
+                # Persist and cache BEFORE yielding the [DONE] frame.
+                #
+                # The Streamlit SSE client breaks its read loop the instant it
+                # receives [DONE] and closes the HTTP connection.  Starlette
+                # then cancels this async generator at the next await point,
+                # making any code placed after "yield chunk" for [DONE]
+                # unreachable in practice (confirmed: zero DB rows saved for
+                # any query when persist lived after the loop).
+                #
+                # By doing the DB write here — while the connection is still
+                # alive — we guarantee chat history is always persisted.
+                full_text = "".join(tokens)
+                token_count = len(tokens)
+                chat_stream_tokens_total.inc(token_count)
+
+                if not full_text and streamed_frame_count > 0:
+                    logger.warning(
+                        "chat.stream_completed_without_text",
+                        project_id=project_id,
+                        session_id=session_id,
+                        frame_count=streamed_frame_count,
+                        query_preview=query[:80],
+                    )
+
+                if full_text and not bypass_cache:
+                    await cache_response(
+                        query,
+                        project_id,
+                        full_text,
+                        is_trending=_is_trending_query(query),
+                    )
+
+                if full_text:
+                    await persist_chat_turn(
+                        user_id=user_id,
+                        project_id=project_id,
+                        session_id=session_id,
+                        user_message=query,
+                        assistant_message=full_text,
+                    )
+
+                yield chunk  # Send [DONE] only after history is saved
+                break
+            else:
                 streamed_frame_count += 1
                 token = _extract_token_from_sse_chunk(chunk)
                 if token:
                     tokens.append(token)
-            yield chunk
-
-        full_text = "".join(tokens)
-        if not full_text and streamed_frame_count > 0:
-            logger.warning(
-                "chat.stream_completed_without_text",
-                project_id=project_id,
-                session_id=session_id,
-                frame_count=streamed_frame_count,
-                query_preview=query[:80],
-            )
-
-        # Track token count
-        token_count = len(tokens)
-        chat_stream_tokens_total.inc(token_count)
-
-        if full_text and not bypass_cache:
-            await cache_response(
-                query,
-                project_id,
-                full_text,
-                is_trending=_is_trending_query(query),
-            )
-
-        if full_text:
-            await persist_chat_turn(
-                user_id=user_id,
-                project_id=project_id,
-                session_id=session_id,
-                user_message=query,
-                assistant_message=full_text,
-            )
+                yield chunk
 
         success = True
     except Exception:

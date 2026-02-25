@@ -3,15 +3,18 @@
 All public functions return list[dict] on success, [] on any failure — never raise.
 The agent layer must never see exceptions from tools.
 
-PatentsView provides free, comprehensive access to USPTO patent data.
-No API key required. Conservative rate limit: 5 req/sec (no official limit documented).
+PatentsView provides access to USPTO patent data via their v2 Search API
+(search.patentsview.org). An API key is required — register at
+https://patentsview.org/apis/api-faqs. Rate limit: 45 req/min.
 
 Integrated with production infrastructure: rate limiting, circuit breaker, caching, retry.
+
+NOTE: The legacy API (api.patentsview.org) was shut down on May 1, 2025.
+      This tool targets the new Search API endpoint.
 """
 
 import hashlib
 import time
-from itertools import zip_longest
 
 import httpx
 import structlog
@@ -27,9 +30,9 @@ from app.core.retry import retry_with_backoff
 
 logger = structlog.get_logger(__name__)
 
-_BASE_URL = "https://api.patentsview.org/patents/query"
+_BASE_URL = "https://search.patentsview.org/api/v1/patent/"
 _TIMEOUT = 15.0  # seconds
-_MAX_RESULTS = 10
+_MAX_RESULTS = 20
 
 # Module-level HTTP client pool (reused across requests to prevent memory leak)
 _http_client: httpx.AsyncClient | None = None
@@ -39,7 +42,10 @@ async def _get_http_client() -> httpx.AsyncClient:
     """Get or create shared HTTP client pool for module."""
     global _http_client
     if _http_client is None:
-        _http_client = httpx.AsyncClient(timeout=_TIMEOUT)
+        headers = {}
+        if settings.PATENTSVIEW_API_KEY:
+            headers["X-Api-Key"] = settings.PATENTSVIEW_API_KEY
+        _http_client = httpx.AsyncClient(timeout=_TIMEOUT, headers=headers)
     return _http_client
 
 
@@ -49,7 +55,41 @@ def _cache_key(query: str) -> str:
     return f"{CacheKeys.PATENTS_PATENTSVIEW}:{query_hash}"
 
 
-async def _search_with_retry(query: str) -> dict | None:
+def _build_patentsview_query(
+    query: str,
+    must_match_terms: list[str] | None = None,
+    domain_terms: list[str] | None = None,
+) -> dict:
+    """Build PatentsView boolean query across title and abstract fields."""
+    must_match_terms = [str(term).strip() for term in (must_match_terms or []) if str(term).strip()]
+    domain_terms = [str(term).strip() for term in (domain_terms or []) if str(term).strip()]
+    terms = must_match_terms[:3]
+    if not terms:
+        terms = [query]
+    and_clauses: list[dict] = []
+    for term in terms:
+        and_clauses.append(
+            {
+                "_or": [
+                    {"_text_all": {"patent_title": term}},
+                    {"_text_all": {"patent_abstract": term}},
+                ]
+            }
+        )
+    if domain_terms:
+        domain_clause = {
+            "_or": [
+                {"_text_all": {"patent_title": term}} for term in domain_terms[:2]
+            ]
+            + [{"_text_all": {"patent_abstract": term}} for term in domain_terms[:2]]
+        }
+        and_clauses.append(domain_clause)
+    if len(and_clauses) == 1:
+        return and_clauses[0]
+    return {"_and": and_clauses}
+
+
+async def _search_with_retry(query_payload: dict) -> dict | None:
     """
     Internal POST helper for the PatentsView /patents/query endpoint with retry logic.
 
@@ -62,16 +102,16 @@ async def _search_with_retry(query: str) -> dict | None:
         response = await client.post(
             _BASE_URL,
             json={
-                "q": {"_text_all": {"patent_title": query}},
+                "q": query_payload,
                 "f": [
-                    "patent_number",
+                    "patent_id",
                     "patent_title",
                     "patent_abstract",
                     "patent_date",
-                    "inventor_first_name",
-                    "inventor_last_name",
+                    "inventors.inventor_name_first",
+                    "inventors.inventor_name_last",
                 ],
-                "o": {"per_page": _MAX_RESULTS},
+                "o": {"size": _MAX_RESULTS},
             },
         )
         response.raise_for_status()
@@ -91,7 +131,7 @@ async def _search_with_retry(query: str) -> dict | None:
     return result
 
 
-async def _search_impl(query: str) -> list[dict]:
+async def _search_impl(query: str, query_payload: dict) -> list[dict]:
     """
     Internal implementation of PatentsView search (without cache/circuit breaker).
 
@@ -99,7 +139,7 @@ async def _search_impl(query: str) -> list[dict]:
     """
     start_time = time.perf_counter()
     try:
-        data = await _search_with_retry(query)
+        data = await _search_with_retry(query_payload)
         api_calls_total.labels(api_name="patentsview", status="success").inc()
     except httpx.HTTPStatusError as exc:
         api_calls_total.labels(api_name="patentsview", status="error").inc()
@@ -139,27 +179,23 @@ async def _search_impl(query: str) -> list[dict]:
     normalized = []
     for p in patents:
         try:
-            # Extract patent number and construct Google Patents URL
-            patent_number = p.get("patent_number", "")
+            # New API uses patent_id (was patent_number in legacy API)
+            patent_id = p.get("patent_id", "")
             google_patents_url = (
-                f"https://patents.google.com/patent/US{patent_number}" if patent_number else ""
+                f"https://patents.google.com/patent/US{patent_id}" if patent_id else ""
             )
 
-            # Combine inventor names (handle multiple inventors)
+            # New API nests inventors: [{"inventor_name_first": "...", "inventor_name_last": "..."}]
             inventors = []
-            first_names = p.get("inventor_first_name", [])
-            last_names = p.get("inventor_last_name", [])
+            inventor_list = p.get("inventors", [])
+            if not isinstance(inventor_list, list):
+                inventor_list = []
 
-            # Handle both single inventor (non-list) and multiple inventors (list)
-            if not isinstance(first_names, list):
-                first_names = [first_names] if first_names else []
-            if not isinstance(last_names, list):
-                last_names = [last_names] if last_names else []
-
-            # Combine first and last names (use zip_longest to avoid data loss from mismatched lengths)
-            for first, last in zip_longest(first_names, last_names, fillvalue=""):
-                first_str = first or ""
-                last_str = last or ""
+            for inv in inventor_list:
+                if not isinstance(inv, dict):
+                    continue
+                first_str = inv.get("inventor_name_first") or ""
+                last_str = inv.get("inventor_name_last") or ""
                 if first_str or last_str:
                     inventors.append({"first_name": first_str, "last_name": last_str})
 
@@ -168,7 +204,7 @@ async def _search_impl(query: str) -> list[dict]:
                     "title": p.get("patent_title", ""),
                     "url": google_patents_url,
                     "content": p.get("patent_abstract", ""),
-                    "patent_number": patent_number,
+                    "patent_number": patent_id,
                     "date": p.get("patent_date", ""),
                     "inventors": inventors,
                     "source": "patentsview",
@@ -182,7 +218,7 @@ async def _search_impl(query: str) -> list[dict]:
     return normalized
 
 
-async def _search_patentsview_impl(query: str, cache_key: str) -> list[dict]:
+async def _search_patentsview_impl(query: str, cache_key: str, query_payload: dict) -> list[dict]:
     """
     Internal implementation (called by dedup layer).
 
@@ -202,7 +238,7 @@ async def _search_patentsview_impl(query: str, cache_key: str) -> list[dict]:
 
     # Wrap entire search operation in circuit breaker
     async def _fetch_impl() -> list[dict]:
-        return await _search_impl(query)
+        return await _search_impl(query, query_payload)
 
     result = await call_with_circuit_breaker(
         patentsview_breaker,
@@ -220,7 +256,13 @@ async def _search_patentsview_impl(query: str, cache_key: str) -> list[dict]:
     return result
 
 
-async def search_patentsview(query: str) -> list[dict]:
+async def search_patentsview(
+    query: str,
+    *,
+    must_match_terms: list[str] | None = None,
+    domain_terms: list[str] | None = None,
+    query_specificity: str | None = None,
+) -> list[dict]:
     """
     Search for patents using PatentsView API with the given query string.
 
@@ -258,15 +300,21 @@ async def search_patentsview(query: str) -> list[dict]:
         logger.warning("patents_patentsview.query_too_long", original_length=len(query))
         query = query[:1000]
 
+    query_payload = _build_patentsview_query(query, must_match_terms, domain_terms)
+    if str(query_specificity or "").lower() == "specific" and must_match_terms:
+        logger.info(
+            "patents_patentsview.specific_query",
+            must_match_terms=must_match_terms[:3],
+        )
     logger.info("patents_patentsview.start", query_preview=query[:80])
 
     # Generate cache key (used for both dedup and cache)
-    cache_key = _cache_key(query)
+    cache_key = _cache_key(f"{query}|{query_payload}")
 
     # Deduplicate concurrent identical requests
     result = await deduplicate_request(
         cache_key,
-        lambda: _search_patentsview_impl(query, cache_key),
+        lambda: _search_patentsview_impl(query, cache_key, query_payload),
     )
 
     logger.info("patents_patentsview.complete", result_count=len(result))

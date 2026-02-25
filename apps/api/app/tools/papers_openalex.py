@@ -28,7 +28,7 @@ logger = structlog.get_logger(__name__)
 
 _OPENALEX_BASE_URL = "https://api.openalex.org/works"
 _TIMEOUT = 10.0  # seconds
-_TARGET_PAPER_COUNT = 10
+_TARGET_PAPER_COUNT = 20
 _OPENALEX_VARIANT_LIMIT = 3
 _OPENALEX_PER_PAGE = 50
 _STRICT_PAGES: tuple[int, ...] = (1, 2)

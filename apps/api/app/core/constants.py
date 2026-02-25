@@ -21,6 +21,7 @@ class RedisKeys:
     UPLOAD_STAGING = "upload:staging:{upload_id}"
     PROJECT_CACHE_VERSION = "cache_version:{project_id}"
     PROJECTS_SUMMARY = "projects_summary:{user_id}"
+    PROJECT_INGEST_STATUS = "ingest_status:{project_id}"
 
     # Search API cache keys (project-scoped, deterministic SHA256)
     SEARCH_CACHE = "search:cache:{project_id}:{api}:{query_type}:{hash}"
@@ -42,6 +43,7 @@ class RedisTTL(Enum):
     CHAT_HISTORY = 604800  # 7 days
     UPLOAD_STAGING = 3600  # 1 hour
     PROJECTS_SUMMARY = 300  # 5 minutes
+    PROJECT_INGEST_STATUS = 86400  # 24 hours
 
     # Search API cache TTLs (query type-specific for freshness)
     SEARCH_CACHE_NEWS = 3600  # 1 hour (news changes frequently)

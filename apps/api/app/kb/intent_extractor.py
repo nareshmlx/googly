@@ -291,8 +291,12 @@ async def extract_intent(
             description_preview=description[:60],
         )
         return _postprocess_intent(default, description=description)
-    except Exception:
-        logger.exception("intent_extractor.extract.error")
+    except Exception as exc:
+        logger.error(
+            "intent_extractor.extract.error",
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
         return _postprocess_intent(default, description=description)
 
 
@@ -360,8 +364,12 @@ async def refine_intent(
     except json.JSONDecodeError:
         logger.warning("intent_extractor.refine.parse_error")
         return existing_intent
-    except Exception:
-        logger.exception("intent_extractor.refine.error")
+    except Exception as exc:
+        logger.error(
+            "intent_extractor.refine.error",
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
         return existing_intent
 
 

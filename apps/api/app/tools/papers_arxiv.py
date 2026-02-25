@@ -29,7 +29,7 @@ logger = structlog.get_logger(__name__)
 
 _BASE_URL = "https://export.arxiv.org/api/query"
 _TIMEOUT = 15.0  # seconds
-_MAX_RESULTS = 10
+_MAX_RESULTS = 20
 
 # Module-level HTTP client pool (reused across requests to prevent memory leak)
 _http_client: httpx.AsyncClient | None = None
@@ -41,6 +41,23 @@ async def _get_http_client() -> httpx.AsyncClient:
     if _http_client is None:
         _http_client = httpx.AsyncClient(timeout=_TIMEOUT)
     return _http_client
+
+
+def _build_arxiv_query(
+    query: str,
+    must_match_terms: list[str] | None = None,
+    domain_terms: list[str] | None = None,
+) -> str:
+    """Build arXiv query expression with title/abstract emphasis for specific entities."""
+    must_match_terms = [str(term).strip() for term in (must_match_terms or []) if str(term).strip()]
+    domain_terms = [str(term).strip() for term in (domain_terms or []) if str(term).strip()]
+    if not must_match_terms:
+        return query
+    must_expr = " OR ".join(f'ti:"{term}" OR abs:"{term}"' for term in must_match_terms[:3])
+    if domain_terms:
+        domain_expr = " OR ".join(f'all:"{term}"' for term in domain_terms[:2])
+        return f"({must_expr}) AND ({domain_expr})"
+    return must_expr
 
 
 def _cache_key(query: str) -> str:
@@ -62,7 +79,7 @@ async def _search_with_retry(query: str) -> str | None:
         response = await client.get(
             _BASE_URL,
             params={
-                "search_query": f"all:{query}",
+                "search_query": query,
                 "max_results": _MAX_RESULTS,
                 "sortBy": "relevance",
                 "sortOrder": "descending",
@@ -269,7 +286,13 @@ async def _search_arxiv_impl(query: str, cache_key: str) -> list[dict]:
     return result
 
 
-async def search_arxiv(query: str) -> list[dict]:
+async def search_arxiv(
+    query: str,
+    *,
+    must_match_terms: list[str] | None = None,
+    domain_terms: list[str] | None = None,
+    query_specificity: str | None = None,
+) -> list[dict]:
     """
     Search academic papers using arXiv API with the given query string.
 
@@ -305,15 +328,22 @@ async def search_arxiv(query: str) -> list[dict]:
         logger.warning("search_arxiv.query_too_long", original_length=len(query))
         query = query[:1000]
 
-    logger.info("search_arxiv.start", query_preview=query[:80])
+    effective_query = _build_arxiv_query(query, must_match_terms, domain_terms)
+    if str(query_specificity or "").lower() == "specific" and must_match_terms:
+        logger.info(
+            "search_arxiv.specific_query",
+            must_match_terms=must_match_terms[:3],
+            effective_query=effective_query[:120],
+        )
+    logger.info("search_arxiv.start", query_preview=effective_query[:80])
 
     # Generate cache key (used for both dedup and cache)
-    cache_key = _cache_key(query)
+    cache_key = _cache_key(effective_query)
 
     # Deduplicate concurrent identical requests
     result = await deduplicate_request(
         cache_key,
-        lambda: _search_arxiv_impl(query, cache_key),
+        lambda: _search_arxiv_impl(effective_query, cache_key),
     )
 
     logger.info("search_arxiv.complete", result_count=len(result))

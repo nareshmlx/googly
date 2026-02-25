@@ -6,7 +6,9 @@ Used only by Alembic autogenerate. Runtime DB access goes through asyncpg direct
 from datetime import UTC, datetime
 from uuid import uuid4
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     Column,
     DateTime,
@@ -54,6 +56,14 @@ class Project(Base):
     refresh_strategy = Column(String(50), nullable=False, server_default="once")
     last_refreshed_at = Column(DateTime(timezone=True), nullable=True)
     kb_chunk_count = Column(Integer, nullable=False, server_default="0")
+    tiktok_enabled = Column(Boolean, nullable=False, server_default="true")
+    instagram_enabled = Column(Boolean, nullable=False, server_default="true")
+    papers_enabled = Column(Boolean, nullable=False, server_default="true")
+    perigon_enabled = Column(Boolean, nullable=False, server_default="true")
+    tavily_enabled = Column(Boolean, nullable=False, server_default="true")
+    exa_enabled = Column(Boolean, nullable=False, server_default="true")
+    patents_enabled = Column(Boolean, nullable=False, server_default="true")
+    intent_embedding = Column(Vector(dim=1536), nullable=True)  # type: ignore[var-annotated]
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False)
     updated_at = Column(
         DateTime(timezone=True),

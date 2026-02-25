@@ -28,7 +28,7 @@ logger = structlog.get_logger(__name__)
 
 _BASE_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
 _TIMEOUT = 15.0  # seconds
-_MAX_RESULTS = 10
+_MAX_RESULTS = 20
 
 # Module-level HTTP client pool (reused across requests to prevent memory leak)
 _http_client: httpx.AsyncClient | None = None
@@ -40,6 +40,21 @@ async def _get_http_client() -> httpx.AsyncClient:
     if _http_client is None:
         _http_client = httpx.AsyncClient(timeout=_TIMEOUT)
     return _http_client
+
+
+def _build_semantic_query(
+    query: str,
+    must_match_terms: list[str] | None = None,
+    domain_terms: list[str] | None = None,
+) -> str:
+    """Compose a Semantic Scholar query that preserves specific user terms."""
+    must_match_terms = [str(term).strip() for term in (must_match_terms or []) if str(term).strip()]
+    domain_terms = [str(term).strip() for term in (domain_terms or []) if str(term).strip()]
+    if not must_match_terms:
+        return query
+    parts = [f'"{term}"' for term in must_match_terms[:3]]
+    parts.extend(domain_terms[:2])
+    return " ".join(parts).strip()
 
 
 def _cache_key(query: str) -> str:
@@ -54,6 +69,9 @@ async def _search_with_retry(query: str) -> dict | None:
 
     Uses production infrastructure: retry with exponential backoff, rate limiting.
     Returns parsed JSON dict on success, None on any failure (per AGENTS.md Rule 4).
+
+    retry_with_backoff never raises — it catches all exceptions internally and returns None.
+    Callers must check the return value rather than catching exceptions from this function.
     """
 
     async def _fetch() -> dict:
@@ -75,16 +93,24 @@ async def _search_with_retry(query: str) -> dict | None:
         response.raise_for_status()
         return response.json()
 
-    # Wrap in rate limiter + retry
-    result = await retry_with_backoff(
-        lambda: rate_limited_call(
+    async def _rate_limited_fetch() -> dict:
+        """Named wrapper so retry logs emit func=_rate_limited_fetch, not func=<lambda>."""
+        return await rate_limited_call(
             semantic_scholar_limiter,
             "semantic_scholar",
             _fetch,
-        ),
+        )
+
+    # Wrap in rate limiter + retry.
+    # 4xx errors (except 429) are permanent — skip retries immediately.
+    # A 403 with no API key or an expired key must not burn 1s+2s of backoff sleep.
+    # retry_with_backoff logs non-retryable errors at retry.non_retryable_http_error.
+    result = await retry_with_backoff(
+        _rate_limited_fetch,
         max_attempts=3,
         base_delay=1.0,
         max_delay=8.0,
+        non_retryable_statuses=frozenset({400, 401, 403, 404, 410, 422}),
     )
     return result
 
@@ -94,29 +120,15 @@ async def _search_impl(query: str) -> list[dict]:
     Internal implementation of Semantic Scholar search (without cache/circuit breaker).
 
     Fetches from Semantic Scholar API and normalizes results into consistent dict format.
+
+    retry_with_backoff never raises — all error handling happens inside it and the result
+    is None on failure. Metrics are only labelled "success" when data is actually returned.
     """
     start_time = time.perf_counter()
     try:
         data = await _search_with_retry(query)
-        api_calls_total.labels(api_name="semantic_scholar", status="success").inc()
-    except httpx.HTTPStatusError as exc:
-        api_calls_total.labels(api_name="semantic_scholar", status="error").inc()
-        logger.error(
-            "search_semantic_scholar.http_error",
-            status_code=exc.response.status_code,
-            response_preview=exc.response.text[:200] if exc.response.text else "",
-            query_preview=query[:80],
-        )
-        return []
-    except httpx.TimeoutException:
-        api_calls_total.labels(api_name="semantic_scholar", status="timeout").inc()
-        logger.warning(
-            "search_semantic_scholar.timeout",
-            timeout=_TIMEOUT,
-            query_preview=query[:80],
-        )
-        return []
     except Exception:
+        # Defensive catch — retry_with_backoff should never raise, but guard anyway.
         api_calls_total.labels(api_name="semantic_scholar", status="error").inc()
         logger.exception("search_semantic_scholar.unexpected_error", query_preview=query[:80])
         return []
@@ -125,8 +137,12 @@ async def _search_impl(query: str) -> list[dict]:
         api_call_duration_seconds.labels(api_name="semantic_scholar").observe(duration)
 
     if data is None:
+        # retry_with_backoff returned None — all attempts failed (logged inside retry)
+        api_calls_total.labels(api_name="semantic_scholar", status="error").inc()
         logger.warning("search_semantic_scholar.no_data", query_preview=query[:80])
         return []
+
+    api_calls_total.labels(api_name="semantic_scholar", status="success").inc()
 
     papers = data.get("data", [])
     if not papers or not isinstance(papers, list):
@@ -201,7 +217,13 @@ async def _search_semantic_scholar_impl(query: str, cache_key: str) -> list[dict
     return result
 
 
-async def search_semantic_scholar(query: str) -> list[dict]:
+async def search_semantic_scholar(
+    query: str,
+    *,
+    must_match_terms: list[str] | None = None,
+    domain_terms: list[str] | None = None,
+    query_specificity: str | None = None,
+) -> list[dict]:
     """
     Search academic papers using Semantic Scholar API with the given query string.
 
@@ -241,15 +263,22 @@ async def search_semantic_scholar(query: str) -> list[dict]:
         logger.warning("search_semantic_scholar.query_too_long", original_length=len(query))
         query = query[:1000]
 
-    logger.info("search_semantic_scholar.start", query_preview=query[:80])
+    effective_query = _build_semantic_query(query, must_match_terms, domain_terms)
+    if str(query_specificity or "").lower() == "specific" and must_match_terms:
+        logger.info(
+            "search_semantic_scholar.specific_query",
+            must_match_terms=must_match_terms[:3],
+            effective_query=effective_query[:120],
+        )
+    logger.info("search_semantic_scholar.start", query_preview=effective_query[:80])
 
     # Generate cache key (used for both dedup and cache)
-    cache_key = _cache_key(query)
+    cache_key = _cache_key(effective_query)
 
     # Deduplicate concurrent identical requests
     result = await deduplicate_request(
         cache_key,
-        lambda: _search_semantic_scholar_impl(query, cache_key),
+        lambda: _search_semantic_scholar_impl(effective_query, cache_key),
     )
 
     logger.info("search_semantic_scholar.complete", result_count=len(result))

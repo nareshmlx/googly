@@ -11,10 +11,13 @@ Discover and project management remain available once a project is selected.
 
 import uuid
 from datetime import datetime, timezone
+from html import escape
 from pathlib import Path
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 import _api
 from agent import get_database
@@ -291,36 +294,69 @@ def _render_create_project_form(
                 cfg.get("refresh_strategy", "once")
             ),
         )
-        st.caption("Data Sources")
-        col_t, col_i, col_o = st.columns(3)
-        with col_t:
-            tiktok_enabled = st.checkbox("TikTok", value=cfg.get("tiktok_enabled", True))
-        with col_i:
-            instagram_enabled = st.checkbox("Instagram", value=cfg.get("instagram_enabled", True))
-        with col_o:
-            openalex_enabled = st.checkbox(
-                "OpenAlex Papers", value=cfg.get("openalex_enabled", True)
+        st.markdown("**Data Sources**")
+
+        col_s1, col_s2 = st.columns(2)
+        with col_s1:
+            st.markdown("*Social*")
+            tiktok_enabled = st.checkbox(
+                "TikTok", value=cfg.get("tiktok_enabled", True)
             )
+            instagram_enabled = st.checkbox(
+                "Instagram", value=cfg.get("instagram_enabled", True)
+            )
+
+        with col_s2:
+            st.markdown("*Research*")
+            papers_enabled = st.checkbox(
+                "Papers", value=cfg.get("papers_enabled", True)
+            )
+            patents_enabled = st.checkbox(
+                "Patents", value=cfg.get("patents_enabled", True)
+            )
+
+        col_d1, col_d2, col_d3 = st.columns(3)
+        with col_d1:
+            st.markdown("*Discovery*")
+            perigon_enabled = st.checkbox(
+                "News", value=cfg.get("perigon_enabled", True)
+            )
+        with col_d2:
+            st.markdown("&nbsp;", unsafe_allow_html=True)
+            tavily_enabled = st.checkbox(
+                "Web (Tavily)", value=cfg.get("tavily_enabled", True)
+            )
+        with col_d3:
+            st.markdown("&nbsp;", unsafe_allow_html=True)
+            exa_enabled = st.checkbox("Web (Exa)", value=cfg.get("exa_enabled", True))
+
         submitted = st.form_submit_button(submit_label, use_container_width=True)
 
     if not submitted:
         return
 
-    if not title.strip():
+    title_value = (title or "").strip()
+    description_value = (description or "").strip()
+
+    if not title_value:
         st.error("Title is required.")
         return
-    if len(description.strip()) < 10:
+    if len(description_value) < 10:
         st.error("Description must be at least 10 characters.")
         return
 
     with st.spinner("Creating project..."):
         result, create_error = _api.create_project(
-            title.strip(),
-            description.strip(),
+            title_value,
+            description_value,
             refresh_strategy,
             tiktok_enabled=tiktok_enabled,
             instagram_enabled=instagram_enabled,
-            openalex_enabled=openalex_enabled,
+            papers_enabled=papers_enabled,
+            patents_enabled=patents_enabled,
+            perigon_enabled=perigon_enabled,
+            tavily_enabled=tavily_enabled,
+            exa_enabled=exa_enabled,
         )
 
     if result:
@@ -376,7 +412,9 @@ else:
             index=nav_options.index(st.session_state.current_page),
             label_visibility="collapsed",
         )
-        st.session_state.current_page = page
+        if page != st.session_state.current_page:
+            st.session_state.current_page = page
+            st.rerun()
 
         st.divider()
 
@@ -469,8 +507,10 @@ if st.session_state.current_page == "Home":
     total_projects = len(projects)
     kb_ready_count = sum(1 for p in projects if (p.get("kb_chunk_count") or 0) > 0)
     total_chunks = sum(int(p.get("kb_chunk_count") or 0) for p in projects)
-    openalex_projects = sum(1 for p in projects if p.get("openalex_enabled", True))
-    refresh_values = [p.get("last_refreshed_at") for p in projects if p.get("last_refreshed_at")]
+    papers_projects = sum(1 for p in projects if p.get("papers_enabled", True))
+    refresh_values = [
+        p.get("last_refreshed_at") for p in projects if p.get("last_refreshed_at")
+    ]
     latest_refresh = _short_date(max(refresh_values)) if refresh_values else "—"
 
     col_s1, col_s2, col_s3 = st.columns(3)
@@ -512,7 +552,7 @@ if st.session_state.current_page == "Home":
             <div class="home-signal-chips">
                 <span class="home-signal-chip">Latest refresh: {latest_refresh}</span>
                 <span class="home-signal-chip">KB Ready: {kb_ready_count}</span>
-                <span class="home-signal-chip">OpenAlex enabled: {openalex_projects}</span>
+                <span class="home-signal-chip">Papers enabled: {papers_projects}</span>
             </div>
         </div>
         """,
@@ -563,8 +603,16 @@ if st.session_state.current_page == "Home":
                 source_tags.append("Instagram")
             if proj.get("tiktok_enabled", True):
                 source_tags.append("TikTok")
-            if proj.get("openalex_enabled", True):
-                source_tags.append("OpenAlex")
+            if proj.get("papers_enabled", True):
+                source_tags.append("Papers")
+            if proj.get("patents_enabled", True):
+                source_tags.append("Patents")
+            if proj.get("perigon_enabled", True):
+                source_tags.append("News")
+            if proj.get("tavily_enabled", True):
+                source_tags.append("Web (Tavily)")
+            if proj.get("exa_enabled", True):
+                source_tags.append("Web (Exa)")
             if not source_tags:
                 source_tags.append("No Sources")
             tags_html = "".join(
@@ -579,12 +627,12 @@ if st.session_state.current_page == "Home":
                 st.markdown(
                     f"""
                     <div class="project-card">
-                        <div class="project-card-title">{proj['title']}</div>
+                        <div class="project-card-title">{proj["title"]}</div>
                         <div class="project-card-meta">
-                            Strategy: {proj['refresh_strategy']} · Chunks: {proj.get('kb_chunk_count', 0)}
+                            Strategy: {proj["refresh_strategy"]} · Chunks: {proj.get("kb_chunk_count", 0)}
                         </div>
                         <div class="project-tags">{tags_html}</div>
-                        <div class="project-card-desc">{(proj.get('description') or '')[:160]}</div>
+                        <div class="project-card-desc">{(proj.get("description") or "")[:160]}</div>
                         <div class="project-card-foot">
                             <span>KB: {kb_status}</span>
                             <span>Refreshed: {refreshed_at}</span>
@@ -596,7 +644,9 @@ if st.session_state.current_page == "Home":
                 )
                 c1, c2, c3 = st.columns(3)
                 with c1:
-                    if st.button("Open Chat", key=f"home_chat_{pid}", use_container_width=True):
+                    if st.button(
+                        "Open Chat", key=f"home_chat_{pid}", use_container_width=True
+                    ):
                         st.session_state.selected_project_id = pid
                         st.session_state.current_page = "Chat"
                         st.rerun()
@@ -755,82 +805,282 @@ elif st.session_state.current_page == "Chat":
             st.rerun()
 
 
+def _normalize_discover_source(source: str | None) -> str:
+    """Normalize backend source names into UI tab categories."""
+    raw = (source or "").strip().lower()
+    return {
+        "social_tiktok": "tiktok",
+        "social_instagram": "instagram",
+        "web": "search",
+    }.get(raw, raw)
+
+
+def _to_discover_item(item: dict) -> dict:
+    """Return a normalized discover item with safe defaults."""
+    normalized = dict(item)
+    normalized["source"] = _normalize_discover_source(item.get("source"))
+    normalized["title"] = item.get("title") or "Untitled"
+    normalized["summary"] = item.get("summary") or ""
+    normalized["metadata"] = item.get("metadata") or {}
+    normalized["author"] = (
+        item.get("author") or normalized["metadata"].get("author") or ""
+    )
+    normalized["url"] = item.get("url") or normalized["metadata"].get("url")
+    normalized["video_url"] = normalized["metadata"].get("video_url") or ""
+    normalized["cover_url"] = (
+        item.get("cover_url")
+        or normalized["metadata"].get("cover_url")
+        or normalized["metadata"].get("thumbnail_url")
+        or normalized["metadata"].get("image_url")
+        or ""
+    )
+    return normalized
+
+
+def _discover_source_label(item: dict) -> str:
+    """Human-friendly source labels for discover cards."""
+    labels = {
+        "instagram": "Instagram",
+        "tiktok": "TikTok",
+        "paper": "Research Paper",
+        "patent": "Patent",
+        "news": "News",
+        "search": "Web",
+    }
+    return labels.get(item.get("source", ""), "Discover")
+
+
+def _discover_meta_line(item: dict) -> str:
+    """Return compact source-specific metadata line."""
+    metadata = item.get("metadata") or {}
+    source = item.get("source")
+    if source in {"paper", "patent"}:
+        venue = metadata.get("venue") or metadata.get("assignee") or ""
+        year = metadata.get("year") or ""
+        citations = metadata.get("citation_count")
+        parts = [str(part) for part in (venue, year) if part]
+        if citations is not None:
+            parts.append(f"{citations:,} citations")
+        return " • ".join(parts)
+    if source == "news":
+        source_name = metadata.get("source_name") or metadata.get("source") or ""
+        published = str(item.get("published_at") or "")[:10]
+        return " • ".join([part for part in (source_name, published) if part])
+    if source == "search":
+        url = item.get("url") or ""
+        return urlparse(url).netloc if url else ""
+    if source in {"instagram", "tiktok"}:
+        likes = int(metadata.get("likes") or 0)
+        views = int(metadata.get("views") or 0)
+        social_stats = []
+        if likes > 0:
+            social_stats.append(f"{likes:,} likes")
+        if views > 0:
+            social_stats.append(f"{views:,} views")
+        return " • ".join(social_stats)
+    return ""
+
+
+def _render_social_tile_media(item: dict) -> None:
+    """Render fixed-height social media area for video/image cards."""
+    video_url = item.get("video_url")
+    cover_url = item.get("cover_url")
+    if video_url:
+        poster_attr = f' poster="{escape(cover_url)}"' if cover_url else ""
+        components.html(
+            f"""
+            <div style="height:228px;border-radius:12px;overflow:hidden;background:#eef2f7;">
+                <video controls preload="metadata"{poster_attr}
+                       style="width:100%;height:228px;object-fit:cover;display:block;background:#000;">
+                    <source src="{escape(video_url)}" type="video/mp4">
+                </video>
+            </div>
+            """,
+            height=236,
+            scrolling=False,
+        )
+        return
+    if cover_url:
+        st.markdown(
+            f"""
+            <div class="discover-media-wrap">
+                <img class="discover-media-image" src="{escape(cover_url)}" />
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
+    st.markdown(
+        '<div class="discover-media-wrap discover-media-empty">No media</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _render_discover_card(item: dict) -> None:
+    """Render one compact discover card tile."""
+    source_label = _discover_source_label(item)
+    title = escape(item.get("title") or "Untitled")
+    url = item.get("url")
+    title_html = f'<a href="{escape(url)}" target="_blank">{title}</a>' if url else title
+    summary = escape((item.get("summary") or "")[:220])
+    meta_line = escape(_discover_meta_line(item))
+    author = escape(item.get("author") or "")
+
+    st.markdown('<div class="discover-card">', unsafe_allow_html=True)
+    if item.get("source") in {"instagram", "tiktok"}:
+        _render_social_tile_media(item)
+    elif item.get("cover_url"):
+        st.markdown(
+            f"""
+            <div class="discover-media-wrap">
+                <img class="discover-media-image" src="{escape(item['cover_url'])}" />
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    st.markdown(
+        f"""
+        <div class="discover-card-body">
+            <div class="discover-source-pill">{escape(source_label)}</div>
+            <div class="discover-card-title">{title_html}</div>
+            <div class="discover-card-summary">{summary}</div>
+            <div class="discover-card-meta">{author}{' • ' if author and meta_line else ''}{meta_line}</div>
+        </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_discover_grid(items: list[dict], *, empty_msg: str) -> None:
+    """Render compact, mixed discover tiles in backend-ranked order."""
+    if not items:
+        st.info(empty_msg)
+        return
+
+    column_count = 1 if len(items) == 1 else 3
+    columns = st.columns(column_count)
+    for idx, item in enumerate(items):
+        with columns[idx % column_count]:
+            _render_discover_card(item)
+
+
+def _render_ingest_status(status_payload: dict | None) -> None:
+    """Show project ingest lifecycle status in Discover."""
+    if not status_payload:
+        return
+
+    status = str(status_payload.get("status") or "").strip().lower()
+    message = str(status_payload.get("message") or "").strip()
+    total_chunks = status_payload.get("total_chunks")
+    source_counts = status_payload.get("source_counts") or {}
+
+    counts_line = ""
+    if isinstance(source_counts, dict) and source_counts:
+        non_zero = [f"{k}:{v}" for k, v in source_counts.items() if int(v or 0) > 0]
+        if non_zero:
+            counts_line = " | Sources: " + ", ".join(non_zero)
+
+    tail = ""
+    if total_chunks is not None:
+        tail = f" | Chunks: {total_chunks}"
+    details = f"{message}{tail}{counts_line}".strip()
+
+    if status in {"queued", "running"}:
+        st.info(f"Ingestion {status}. {details}".strip())
+    elif status == "failed":
+        st.error(f"Ingestion failed. {details}".strip())
+    elif status == "empty":
+        st.warning(f"Ingestion finished with no new documents. {details}".strip())
+    elif status == "ready":
+        st.success(f"Ingestion complete. {details}".strip())
+
+
 # ----------------------------------------------------------------
 # DISCOVER PAGE
 # ----------------------------------------------------------------
-elif st.session_state.current_page == "Discover":
+if st.session_state.current_page == "Discover":
     st.header("🔍 Discover")
 
     project_id = st.session_state.selected_project_id
 
     if project_id:
-        # Project mode — show social content from KB
         proj_name = project_id
         for p in st.session_state.projects:
             if p["id"] == project_id:
                 proj_name = p["title"]
                 break
 
-        st.caption(f"Social content ingested for **{proj_name}**")
+        st.caption(f"Discover feed for **{proj_name}**")
 
         col_refresh, col_sort = st.columns([1, 4])
         with col_refresh:
             if st.button("🔄 Refresh Feed"):
                 st.rerun()
         with col_sort:
-            st.caption("Sorted by engagement × recency")
+            st.caption("Sorted by backend relevance score")
 
-        items = _api.get_discover_feed(project_id)
+        ingest_status = _api.get_ingest_status(project_id)
+        _render_ingest_status(ingest_status)
+
+        raw_items = _api.get_discover_feed(project_id)
+        items = [_to_discover_item(item) for item in raw_items]
 
         if items:
-            tab_all, tab_tiktok, tab_instagram = st.tabs(["All", "TikTok", "Instagram"])
+            social_items = [
+                item for item in items if item.get("source") in ("tiktok", "instagram")
+            ]
+            paper_items = [item for item in items if item.get("source") == "paper"]
+            patent_items = [item for item in items if item.get("source") == "patent"]
+            news_items = [item for item in items if item.get("source") == "news"]
+            web_items = [item for item in items if item.get("source") == "search"]
 
-            def _render_feed(feed_items: list[dict]) -> None:
-                """Render a list of discover items in a 3-column grid."""
-                if not feed_items:
-                    st.info("No content for this platform yet.")
-                    return
-                cols = st.columns(3)
-                for i, item in enumerate(feed_items):
-                    with cols[i % 3]:
-                        with st.container():
-                            platform_icon = (
-                                "🎵" if item.get("platform") == "tiktok" else "📸"
-                            )
-                            st.markdown(f"**{platform_icon} {item.get('author', '')}**")
-                            video_url = item.get("url")
-                            cover_url = item.get("cover_url")
-                            if video_url:
-                                try:
-                                    st.video(video_url)
-                                except Exception:
-                                    # st.video raises if the URL format is unrecognised;
-                                    # fall back to thumbnail + link
-                                    if cover_url:
-                                        st.image(cover_url)
-                                    st.markdown(f"[Watch]({video_url})")
-                            elif cover_url:
-                                st.image(cover_url)
-                                if item.get("url"):
-                                    st.markdown(f"[View]({item['url']})")
-                            st.caption((item.get("caption") or "")[:120] + "...")
-                            st.write(
-                                f"❤️ {item.get('likes', 0):,} | 👀 {item.get('views', 0):,}"
-                            )
-                            st.divider()
+            tab_all, tab_social, tab_papers, tab_patents, tab_news, tab_web = st.tabs(
+                [
+                    f"All ({len(items)})",
+                    f"Social ({len(social_items)})",
+                    f"Papers ({len(paper_items)})",
+                    f"Patents ({len(patent_items)})",
+                    f"News ({len(news_items)})",
+                    f"Web ({len(web_items)})",
+                ]
+            )
 
             with tab_all:
-                _render_feed(items)
+                _render_discover_grid(items, empty_msg="No discover items yet.")
 
-            with tab_tiktok:
-                _render_feed([x for x in items if x.get("platform") == "tiktok"])
+            with tab_social:
+                _render_discover_grid(
+                    social_items,
+                    empty_msg="No social content yet.",
+                )
 
-            with tab_instagram:
-                _render_feed([x for x in items if x.get("platform") == "instagram"])
+            with tab_papers:
+                _render_discover_grid(
+                    paper_items,
+                    empty_msg="No papers found yet.",
+                )
+
+            with tab_patents:
+                _render_discover_grid(
+                    patent_items,
+                    empty_msg="No patents found yet.",
+                )
+
+            with tab_news:
+                _render_discover_grid(
+                    news_items,
+                    empty_msg="No news articles yet.",
+                )
+
+            with tab_web:
+                _render_discover_grid(
+                    web_items,
+                    empty_msg="No web results yet.",
+                )
         else:
             st.info(
-                "No social content yet. Ingest is running in the background — "
-                "check back shortly or refresh."
+                "No discover items yet. Ingest may still be running in the background."
             )
     else:
         st.info("Select a project from Home to open Discover.")

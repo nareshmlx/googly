@@ -3,7 +3,7 @@
 All public functions return list[dict] on success, [] on any failure — never raise.
 The agent layer must never see exceptions from tools.
 
-Perigon provides news aggregation with sentiment analysis and story threading.
+Perigon provides news aggregation with source filtering and relevance ranking.
 Plus plan: 4 req/sec, $0.011 per request (50k req/mo = $550).
 
 Integrated with production infrastructure: rate limiting, circuit breaker, caching, retry.
@@ -33,13 +33,36 @@ _CATEGORIES = "Business,Tech,Lifestyle"
 _DAYS_LOOKBACK = 30
 
 
+def _build_perigon_query(
+    query: str,
+    must_match_terms: list[str] | None = None,
+    domain_terms: list[str] | None = None,
+) -> str:
+    """Compose Perigon query preserving specific entities while adding context."""
+    must_match_terms = [str(term).strip() for term in (must_match_terms or []) if str(term).strip()]
+    domain_terms = [str(term).strip() for term in (domain_terms or []) if str(term).strip()]
+    if must_match_terms:
+        parts = [f'"{term}"' for term in must_match_terms[:3]]
+        parts.extend(domain_terms[:2])
+        return " ".join(parts).strip()
+    return query
+
+
+def _build_perigon_categories(domain_terms: list[str] | None) -> str:
+    """Choose Perigon categories dynamically for better topical precision."""
+    terms = {str(term).lower().strip() for term in (domain_terms or []) if str(term).strip()}
+    if terms & {"skincare", "dermatology", "cosmetics", "fragrance"}:
+        return "Health,Lifestyle,Business"
+    return _CATEGORIES
+
+
 def _cache_key(query: str) -> str:
     """Generate deterministic cache key for a query."""
     query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()[:16]
     return f"{CacheKeys.NEWS_PERIGON}:{query_hash}"
 
 
-async def _search_with_retry(query: str) -> dict | None:
+async def _search_with_retry(query: str, category: str) -> dict | None:
     """
     Internal GET helper for the Perigon /v1/all endpoint with retry logic.
 
@@ -59,7 +82,7 @@ async def _search_with_retry(query: str) -> dict | None:
                     "sortBy": "relevance",
                     "showReprints": "false",
                     "showNumResults": "true",
-                    "category": _CATEGORIES,
+                    "category": category,
                     "from": from_date,
                 },
             )
@@ -80,7 +103,7 @@ async def _search_with_retry(query: str) -> dict | None:
     return result
 
 
-async def _search_impl(query: str) -> list[dict]:
+async def _search_impl(query: str, category: str) -> list[dict]:
     """
     Internal implementation of Perigon news search (without cache/circuit breaker).
 
@@ -88,8 +111,7 @@ async def _search_impl(query: str) -> list[dict]:
     """
     start_time = time.perf_counter()
     try:
-        data = await _search_with_retry(query)
-        api_calls_total.labels(api_name="perigon", status="success").inc()
+        data = await _search_with_retry(query, category)
     except httpx.HTTPStatusError as exc:
         api_calls_total.labels(api_name="perigon", status="error").inc()
         logger.error(
@@ -116,8 +138,11 @@ async def _search_impl(query: str) -> list[dict]:
         api_call_duration_seconds.labels(api_name="perigon").observe(duration)
 
     if data is None:
+        api_calls_total.labels(api_name="perigon", status="error").inc()
         logger.warning("news_perigon.no_data", query_preview=query[:80])
         return []
+
+    api_calls_total.labels(api_name="perigon", status="success").inc()
 
     articles = data.get("articles", [])
     if not articles or not isinstance(articles, list):
@@ -128,10 +153,10 @@ async def _search_impl(query: str) -> list[dict]:
     normalized = []
     for article in articles:
         try:
-            # Extract source name safely
+            # Extract source name safely — Perigon uses "domain" not "name"
             source_name = ""
             if isinstance(article.get("source"), dict):
-                source_name = article["source"].get("name", "")
+                source_name = article["source"].get("domain", "")
 
             normalized.append(
                 {
@@ -141,9 +166,6 @@ async def _search_impl(query: str) -> list[dict]:
                     "source": "perigon",
                     "published_date": article.get("pubDate"),
                     "source_name": source_name,
-                    "sentiment": article.get("sentiment"),  # Unique to Perigon
-                    "entities": article.get("entities", []),  # Unique to Perigon
-                    "story_id": article.get("storyId"),  # For threading (Phase 3)
                 }
             )
         except Exception:
@@ -154,7 +176,7 @@ async def _search_impl(query: str) -> list[dict]:
     return normalized
 
 
-async def _search_perigon_impl(query: str, cache_key: str) -> list[dict]:
+async def _search_perigon_impl(query: str, cache_key: str, category: str) -> list[dict]:
     """
     Internal implementation (called by dedup layer).
 
@@ -174,7 +196,7 @@ async def _search_perigon_impl(query: str, cache_key: str) -> list[dict]:
 
     # Wrap entire search operation in circuit breaker
     async def _fetch_impl() -> list[dict]:
-        return await _search_impl(query)
+        return await _search_impl(query, category)
 
     result = await call_with_circuit_breaker(
         perigon_breaker,
@@ -192,7 +214,13 @@ async def _search_perigon_impl(query: str, cache_key: str) -> list[dict]:
     return result
 
 
-async def search_perigon(query: str) -> list[dict]:
+async def search_perigon(
+    query: str,
+    *,
+    must_match_terms: list[str] | None = None,
+    domain_terms: list[str] | None = None,
+    query_specificity: str | None = None,
+) -> list[dict]:
     """
     Search news articles using Perigon API with the given query string.
 
@@ -203,7 +231,7 @@ async def search_perigon(query: str) -> list[dict]:
     - Rate limiting (4 req/sec for Plus plan)
     - Retry with exponential backoff
 
-    Perigon provides news aggregation with sentiment analysis and story threading.
+    Perigon provides news aggregation with source filtering and relevance ranking.
     Plus plan: 4 req/sec, $0.011 per request (50k req/mo = $550).
 
     Request deduplication prevents thundering herd when multiple users
@@ -218,9 +246,6 @@ async def search_perigon(query: str) -> list[dict]:
       - source (str):         Always "perigon"
       - published_date (str): Publication date (ISO format)
       - source_name (str):    Original news source (e.g., "TechCrunch")
-      - sentiment (dict):     Sentiment analysis (Perigon feature)
-      - entities (list):      Extracted entities (Perigon feature)
-      - story_id (str):       Story thread ID for related articles
 
     Returns [] on timeout, HTTP error, empty results, or any unexpected failure.
     Never raises.
@@ -239,15 +264,24 @@ async def search_perigon(query: str) -> list[dict]:
         logger.warning("news_perigon.query_too_long", original_length=len(query))
         query = query[:1000]
 
-    logger.info("news_perigon.start", query_preview=query[:80])
+    effective_query = _build_perigon_query(query, must_match_terms, domain_terms)
+    category = _build_perigon_categories(domain_terms)
+    if str(query_specificity or "").lower() == "specific" and must_match_terms:
+        logger.info(
+            "news_perigon.specific_query",
+            must_match_terms=must_match_terms[:3],
+            category=category,
+        )
+
+    logger.info("news_perigon.start", query_preview=effective_query[:80], category=category)
 
     # Generate cache key (used for both dedup and cache)
-    cache_key = _cache_key(query)
+    cache_key = _cache_key(f"{effective_query}|{category}")
 
     # Deduplicate concurrent identical requests
     result = await deduplicate_request(
         cache_key,
-        lambda: _search_perigon_impl(query, cache_key),
+        lambda: _search_perigon_impl(effective_query, cache_key, category),
     )
 
     logger.info("news_perigon.complete", result_count=len(result))

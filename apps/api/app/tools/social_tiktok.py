@@ -81,8 +81,16 @@ def _fetch_hashtag_sync(tag: str) -> list[dict]:
             return []
 
         return [_map_video(v) for v in raw_items if isinstance(v, dict)]
-    except Exception:
-        logger.exception("social_tiktok.hashtag_fetch.failed", tag=tag)
+    except Exception as exc:
+        try:
+            logger.exception("social_tiktok.hashtag_fetch.failed", tag=tag)
+        except Exception:
+            logger.error(
+                "social_tiktok.hashtag_fetch.failed_fallback",
+                tag=str(tag).encode("ascii", "ignore").decode("ascii"),
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
         return []
 
 

@@ -33,7 +33,7 @@ logger = structlog.get_logger(__name__)
 _SEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 _SUMMARY_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
 _TIMEOUT = 15.0  # seconds (per request, 2 requests total)
-_MAX_RESULTS = 10
+_MAX_RESULTS = 20
 
 # Module-level HTTP client pool (reused across requests to prevent memory leak)
 _http_client: httpx.AsyncClient | None = None
@@ -45,6 +45,24 @@ async def _get_http_client() -> httpx.AsyncClient:
     if _http_client is None:
         _http_client = httpx.AsyncClient(timeout=_TIMEOUT)
     return _http_client
+
+
+def _build_pubmed_query(
+    query: str,
+    must_match_terms: list[str] | None = None,
+    domain_terms: list[str] | None = None,
+) -> str:
+    """Build PubMed query with Title/Abstract constraints for specific terms."""
+    must_match_terms = [str(term).strip() for term in (must_match_terms or []) if str(term).strip()]
+    domain_terms = [str(term).strip() for term in (domain_terms or []) if str(term).strip()]
+    if not must_match_terms:
+        return query
+    must_expr = " OR ".join(f'"{term}"[Title/Abstract]' for term in must_match_terms[:3])
+    must_clause = f"({must_expr})"
+    if not domain_terms:
+        return must_clause
+    domain_expr = " OR ".join(f'"{term}"[Title/Abstract]' for term in domain_terms[:2])
+    return f"{must_clause} AND ({domain_expr})"
 
 
 def _best_available_content(paper: dict, title: str, authors: list[str]) -> str:
@@ -292,7 +310,13 @@ async def _search_pubmed_impl(query: str, cache_key: str) -> list[dict]:
     return result
 
 
-async def search_pubmed(query: str) -> list[dict]:
+async def search_pubmed(
+    query: str,
+    *,
+    must_match_terms: list[str] | None = None,
+    domain_terms: list[str] | None = None,
+    query_specificity: str | None = None,
+) -> list[dict]:
     """
     Search PubMed for research papers with the given query string.
 
@@ -332,15 +356,22 @@ async def search_pubmed(query: str) -> list[dict]:
         logger.warning("search_pubmed.query_too_long", original_length=len(query))
         query = query[:1000]
 
-    logger.info("search_pubmed.start", query_preview=query[:80])
+    effective_query = _build_pubmed_query(query, must_match_terms, domain_terms)
+    if str(query_specificity or "").lower() == "specific" and must_match_terms:
+        logger.info(
+            "search_pubmed.specific_query",
+            must_match_terms=must_match_terms[:3],
+            effective_query=effective_query[:120],
+        )
+    logger.info("search_pubmed.start", query_preview=effective_query[:80])
 
     # Generate cache key (used for both dedup and cache)
-    cache_key = _cache_key(query)
+    cache_key = _cache_key(effective_query)
 
     # Deduplicate concurrent identical requests
     result = await deduplicate_request(
         cache_key,
-        lambda: _search_pubmed_impl(query, cache_key),
+        lambda: _search_pubmed_impl(effective_query, cache_key),
     )
 
     logger.info("search_pubmed.complete", result_count=len(result))

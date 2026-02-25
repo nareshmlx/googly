@@ -14,6 +14,8 @@ ENSEMBLE_API_TOKEN = os.getenv("ENSEMBLE_API_TOKEN")
 # FastAPI backend base URL — used for project CRUD, SSE chat, KB upload/status
 FASTAPI_URL = os.getenv("FASTAPI_URL", "http://localhost:8003")
 FASTAPI_CREATE_PROJECT_TIMEOUT = float(os.getenv("FASTAPI_CREATE_PROJECT_TIMEOUT", "60"))
+FASTAPI_DISCOVER_TIMEOUT = float(os.getenv("FASTAPI_DISCOVER_TIMEOUT", "20"))
+FASTAPI_KB_STATUS_TIMEOUT = float(os.getenv("FASTAPI_KB_STATUS_TIMEOUT", "20"))
 
 # OpenAlex polite-pool email (required by OpenAlex Terms of Service)
 OPENALEX_EMAIL = os.getenv("OPENALEX_EMAIL", "user@example.com")

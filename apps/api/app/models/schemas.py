@@ -54,7 +54,11 @@ class ProjectCreate(BaseModel):
     refresh_strategy: str = Field(default="once")
     tiktok_enabled: bool = True
     instagram_enabled: bool = True
-    openalex_enabled: bool = True
+    papers_enabled: bool = True
+    patents_enabled: bool = True
+    perigon_enabled: bool = True
+    tavily_enabled: bool = True
+    exa_enabled: bool = True
 
 
 class ProjectResponse(BaseModel):
@@ -64,11 +68,15 @@ class ProjectResponse(BaseModel):
     refresh_strategy: str
     structured_intent: dict = Field(default_factory=dict)
     kb_chunk_count: int = 0
-    tiktok_enabled: bool = True
-    instagram_enabled: bool = True
-    openalex_enabled: bool = True
+    tiktok_enabled: bool
+    instagram_enabled: bool
+    papers_enabled: bool
+    patents_enabled: bool
+    perigon_enabled: bool
+    tavily_enabled: bool
+    exa_enabled: bool
     last_refreshed_at: str | None = None
-    created_at: str | None = None
+    created_at: str
 
 
 # ---------------------------------------------------------------------------
@@ -90,20 +98,35 @@ class KBStatusResponse(BaseModel):
     status: str
 
 
+class IngestStatusResponse(BaseModel):
+    project_id: str
+    status: str
+    message: str | None = None
+    queued_at: str | None = None
+    started_at: str | None = None
+    updated_at: str | None = None
+    finished_at: str | None = None
+    job_id: str | None = None
+    total_chunks: int | None = None
+    source_counts: dict = Field(default_factory=dict)
+
+
 # ---------------------------------------------------------------------------
 # Discover
 # ---------------------------------------------------------------------------
 
 
 class DiscoverItem(BaseModel):
-    platform: Literal["tiktok", "instagram"]
-    video_id: str
+    source: Literal["tiktok", "instagram", "paper", "patent", "news", "search"]
+    item_id: str
+    title: str
+    summary: str
     url: str | None = None
     cover_url: str | None = None
-    caption: str
-    author: str
-    likes: int = 0
-    views: int = 0
+    author: str | None = None
+    published_at: str | None = None
+    score: float = 0.0
+    metadata: dict = Field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -117,13 +140,22 @@ class IntentResult(BaseModel):
     ``is_research_query`` gates whether the PatentAgent / OpenAlex pipeline
     is invoked downstream.  It must default to ``False`` so that trend /
     social queries never trigger the academic-paper retrieval path.
+
+    ``target_domain`` carries an optional domain filter extracted when the user
+    explicitly names a specific website or publication (e.g. "techcrunch.com").
+    None means no domain restriction — all web sources are searched.
     """
 
     domain: str
     query_type: Literal["trend", "research", "patent", "social", "general"]
     entities: list[str] = Field(default_factory=list)
+    must_match_terms: list[str] = Field(default_factory=list)
+    expanded_terms: list[str] = Field(default_factory=list)
+    domain_terms: list[str] = Field(default_factory=list)
+    query_specificity: Literal["specific", "broad"] = "broad"
     confidence: float = Field(ge=0.0, le=1.0)
     is_research_query: bool = False
+    target_domain: str | None = None
 
 
 # ---------------------------------------------------------------------------

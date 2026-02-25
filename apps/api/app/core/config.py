@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     APIFY_API_KEY: str | None = None  # For X/Twitter scraping
     PUBMED_API_KEY: str | None = None  # Optional - increases rate limit from 3 to 10 req/sec
     LENS_API_KEY: str | None = None  # Lens.org patent API - free tier 10k requests/month
+    PATENTSVIEW_API_KEY: str | None = (
+        None  # PatentsView Search API - register at patentsview.org/apis
+    )
 
     INSTAGRAM_ACCESS_TOKEN: str | None = None
     TIKTOK_CLIENT_KEY: str | None = None
@@ -69,6 +72,16 @@ class Settings(BaseSettings):
 
     # === Research Tool Optimization (Phase 3) ===
     EXA_FALLBACK_THRESHOLD: int = 5  # Min academic papers before skipping Exa
+    QUERY_ENTITY_MATCH_THRESHOLD: float = Field(
+        default=0.6,
+        ge=0.0,
+        le=1.0,
+        description="Minimum lexical entity coverage ratio for specific-query relevance gating.",
+    )
+    QUERY_ENABLE_PRE_INTENT_ENHANCER: bool = Field(
+        default=True,
+        description="Enable a lightweight LLM pass to normalize user query before intent extraction.",
+    )
 
     ENSEMBLE_API_TOKEN: str | None = None
     ENSEMBLE_API_BASE_URL: str = "https://api.ensembledata.com"
@@ -103,6 +116,18 @@ class Settings(BaseSettings):
 
     # === Agent Configuration ===
     AGENT_TIMEOUT: float = Field(default=30.0, description="Timeout for agent LLM calls in seconds")
+    PROJECT_CREATE_INTENT_TIMEOUT: float = Field(
+        default=12.0,
+        ge=1.0,
+        le=120.0,
+        description="Timeout for project-creation intent preparation steps (seconds).",
+    )
+    INGEST_SOURCE_TIMEOUT: float = Field(
+        default=30.0,
+        ge=5.0,
+        le=180.0,
+        description="Per-source timeout for ingest source calls (seconds).",
+    )
 
     # === Cache TTL Configuration ===
     CACHE_TTL_PAPERS: int = Field(
@@ -111,6 +136,12 @@ class Settings(BaseSettings):
     CACHE_TTL_PATENTS: int = Field(default=86400, description="Cache TTL for patents (24 hours)")
     CACHE_TTL_SEARCH: int = Field(default=3600, description="Cache TTL for search results (1 hour)")
     CACHE_TTL_NEWS: int = Field(default=1800, description="Cache TTL for news articles (30 min)")
+    INTENT_CACHE_TTL: int = Field(
+        default=3600,
+        ge=1,
+        description="Cache TTL for intent extraction results (1 hour). "
+        "Identical queries skip the LLM entirely on cache hit.",
+    )
 
     # === Routing Config (Query Type → API List) ===
     SEARCH_ROUTING: dict[str, list[str]] = {

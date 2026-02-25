@@ -24,9 +24,13 @@ async def insert_project(
     title: str,
     description: str,
     refresh_strategy: str,
-    tiktok_enabled: bool = True,
-    instagram_enabled: bool = True,
-    openalex_enabled: bool = True,
+    tiktok_enabled: bool,
+    instagram_enabled: bool,
+    papers_enabled: bool,
+    patents_enabled: bool,
+    perigon_enabled: bool,
+    tavily_enabled: bool,
+    exa_enabled: bool,
 ) -> dict:
     """
     Insert a new project row and return it as a dict.
@@ -42,13 +46,15 @@ async def insert_project(
             INSERT INTO projects
                 (id, user_id, title, description, refresh_strategy,
                  structured_intent, kb_chunk_count,
-                 tiktok_enabled, instagram_enabled, openalex_enabled,
+                 tiktok_enabled, instagram_enabled, papers_enabled,
+                 patents_enabled, perigon_enabled, tavily_enabled, exa_enabled,
                  created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6::jsonb, 0, $7, $8, $9, $10, $10)
+            VALUES ($1, $2, $3, $4, $5, $6::jsonb, 0, $7, $8, $9, $10, $11, $12, $13, $14, $14)
             RETURNING id::text, user_id, title, description,
                       refresh_strategy, structured_intent,
                       kb_chunk_count,
-                      tiktok_enabled, instagram_enabled, openalex_enabled,
+                      tiktok_enabled, instagram_enabled, papers_enabled,
+                      patents_enabled, perigon_enabled, tavily_enabled, exa_enabled,
                       created_at, updated_at,
                       last_refreshed_at
             """,
@@ -60,7 +66,11 @@ async def insert_project(
             json.dumps({}),
             tiktok_enabled,
             instagram_enabled,
-            openalex_enabled,
+            papers_enabled,
+            patents_enabled,
+            perigon_enabled,
+            tavily_enabled,
+            exa_enabled,
             now,
         )
     return dict(row)
@@ -82,7 +92,8 @@ async def fetch_project(
             """
             SELECT id::text, user_id, title, description,
                    refresh_strategy, structured_intent,
-                   kb_chunk_count, tiktok_enabled, instagram_enabled, openalex_enabled,
+                   kb_chunk_count, tiktok_enabled, instagram_enabled, papers_enabled,
+                   patents_enabled, perigon_enabled, tavily_enabled, exa_enabled,
                    created_at, updated_at, last_refreshed_at
             FROM projects
             WHERE id = $1::uuid AND user_id = $2
@@ -93,19 +104,40 @@ async def fetch_project(
     return dict(row) if row else None
 
 
-async def fetch_project_openalex_enabled(
+async def fetch_project_by_id(
+    pool: asyncpg.Pool,
+    project_id: str,
+) -> dict | None:
+    """Fetch a project by ID without user scoping (internal service use only)."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id::text, user_id, title, description,
+                   refresh_strategy, structured_intent,
+                   kb_chunk_count, tiktok_enabled, instagram_enabled, papers_enabled,
+                   patents_enabled, perigon_enabled, tavily_enabled, exa_enabled,
+                   created_at, updated_at, last_refreshed_at
+            FROM projects
+            WHERE id = $1::uuid
+            """,
+            project_id,
+        )
+    return dict(row) if row else None
+
+
+async def fetch_project_papers_enabled(
     pool: asyncpg.Pool,
     project_id: str,
 ) -> bool | None:
     """
-    Fetch openalex_enabled flag for one project.
+    Fetch papers_enabled flag for one project.
 
     Returns None when project does not exist.
     """
     async with pool.acquire() as conn:
         value = await conn.fetchval(
             """
-            SELECT openalex_enabled
+            SELECT papers_enabled
             FROM projects
             WHERE id = $1::uuid
             """,
@@ -128,7 +160,8 @@ async def list_projects(
             """
             SELECT id::text, user_id, title, description,
                    refresh_strategy, structured_intent,
-                   kb_chunk_count, tiktok_enabled, instagram_enabled, openalex_enabled,
+                   kb_chunk_count, tiktok_enabled, instagram_enabled, papers_enabled,
+                   patents_enabled, perigon_enabled, tavily_enabled, exa_enabled,
                    created_at, updated_at, last_refreshed_at
             FROM projects
             WHERE user_id = $1
@@ -167,83 +200,190 @@ async def fetch_discover_feed(
     project_id: str,
 ) -> list[dict]:
     """
-    Fetch social KB chunks for the discover feed for one project.
+    Retrieve Discover feed rows scored by relevance, recency, and quality.
 
-    Sets app.accessible_projects before querying knowledge_chunks so the query
-    follows the same RLS access policy as other KB reads.
+    Uses project intent embedding cosine similarity when available.
+    Falls back to recency-only ranking when no intent embedding exists.
+    Returns up to 100 rows across all supported sources.
     """
-    async with pool.acquire() as conn:
-        await conn.execute("SELECT set_config('app.accessible_projects', $1, true)", project_id)
+    async with pool.acquire() as conn, conn.transaction():
+        await conn.execute(
+            "SELECT set_config('app.accessible_projects', $1, true)", str(project_id)
+        )
         rows = await conn.fetch(
             """
-            WITH base_social AS (
-                SELECT source, source_id, title, content, metadata, created_at,
-                    coalesce(nullif(metadata->>'username', ''), nullif(title, ''), source_id) AS creator_key,
+            WITH project_embedding AS (
+                SELECT intent_embedding
+                FROM projects
+                WHERE id = $1::uuid
+            ),
+            scored AS (
+                SELECT
+                    kc.id::text AS item_id,
+                    kc.source,
+                    kc.title,
+                    kc.content AS summary,
+                    kc.metadata,
+                    kc.created_at,
                     CASE
-                        WHEN (metadata->>'timestamp') ~ '^[0-9]+(\\.[0-9]+)?$'
-                        THEN to_timestamp((metadata->>'timestamp')::double precision)
-                        ELSE created_at
-                    END AS content_ts,
-                    ln(
-                        1.0
-                        + COALESCE((metadata->>'likes')::numeric, (metadata->>'like_count')::numeric, 0)
-                        + COALESCE((metadata->>'views')::numeric, (metadata->>'view_count')::numeric, 0) / 10.0
-                    )
-                    * exp(
-                        -EXTRACT(EPOCH FROM (now() - (
+                        WHEN pe.intent_embedding IS NOT NULL
+                        THEN 1.0 - (kc.embedding <=> pe.intent_embedding)
+                        ELSE 0.5
+                    END AS relevance,
+                    EXP(
+                        -EXTRACT(EPOCH FROM (NOW() - kc.created_at)) / (30.0 * 86400)
+                    ) AS recency,
+                    CASE kc.source
+                        WHEN 'paper' THEN
+                            LEAST(
+                                1.0,
+                                LOG(
+                                    1
+                                    + GREATEST(
+                                        0,
+                                        CASE
+                                            WHEN (kc.metadata->>'citation_count') ~ '^-?[0-9]+$'
+                                            THEN (kc.metadata->>'citation_count')::int
+                                            ELSE 0
+                                        END
+                                    )
+                                ) / 10.0
+                            )
+                        WHEN 'patent' THEN
+                            EXP(
+                                -GREATEST(
+                                    0,
+                                    EXTRACT(YEAR FROM NOW()) - CASE
+                                        WHEN (kc.metadata->>'year') ~ '^[0-9]{4}$'
+                                        THEN (kc.metadata->>'year')::int
+                                        ELSE 2020
+                                    END
+                                ) / 5.0
+                            )
+                        WHEN 'social_tiktok' THEN
+                            LEAST(
+                                1.0,
+                                LOG(
+                                    1
+                                    + GREATEST(
+                                        0,
+                                        CASE
+                                            WHEN (kc.metadata->>'likes') ~ '^-?[0-9]+$'
+                                            THEN (kc.metadata->>'likes')::int
+                                            ELSE 0
+                                        END
+                                    )
+                                    + GREATEST(
+                                        0,
+                                        CASE
+                                            WHEN (kc.metadata->>'views') ~ '^-?[0-9]+$'
+                                            THEN (kc.metadata->>'views')::int
+                                            ELSE 0
+                                        END
+                                    )
+                                ) / 20.0
+                            )
+                        WHEN 'social_instagram' THEN
+                            LEAST(
+                                1.0,
+                                LOG(
+                                    1
+                                    + GREATEST(
+                                        0,
+                                        CASE
+                                            WHEN (kc.metadata->>'likes') ~ '^-?[0-9]+$'
+                                            THEN (kc.metadata->>'likes')::int
+                                            ELSE 0
+                                        END
+                                    )
+                                    + GREATEST(
+                                        0,
+                                        CASE
+                                            WHEN (kc.metadata->>'views') ~ '^-?[0-9]+$'
+                                            THEN (kc.metadata->>'views')::int
+                                            ELSE 0
+                                        END
+                                    )
+                                ) / 20.0
+                            )
+                        WHEN 'search' THEN
                             CASE
-                                WHEN (metadata->>'timestamp') ~ '^[0-9]+(\\.[0-9]+)?$'
-                                THEN to_timestamp((metadata->>'timestamp')::double precision)
-                                ELSE created_at
+                                WHEN (kc.metadata->>'score') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                                THEN (kc.metadata->>'score')::float
+                                ELSE 0.5
                             END
-                        ))) / (30.0 * 86400)
-                    ) AS _score
-                FROM knowledge_chunks
-                WHERE project_id = $1::uuid
-                  AND source IN ('social_tiktok', 'social_instagram')
-            ),
-            ig_ranked AS (
-                SELECT source, source_id, title, content, metadata, created_at, creator_key, content_ts, _score,
-                    row_number() OVER (PARTITION BY creator_key ORDER BY _score DESC) AS creator_rank
-                FROM base_social
-                WHERE source = 'social_instagram'
-            ),
-            ig_guaranteed AS (
-                SELECT source, source_id, title, content, metadata, created_at, content_ts, _score
-                FROM ig_ranked
-                WHERE creator_rank <= 2
-                ORDER BY _score DESC
-                LIMIT 15
-            ),
-            top_rest_candidates AS (
-                SELECT b.source, b.source_id, b.title, b.content, b.metadata, b.created_at, b.content_ts, b._score
-                FROM base_social b
-                LEFT JOIN ig_ranked ir ON ir.source = b.source AND ir.source_id = b.source_id
-                WHERE NOT EXISTS (
-                    SELECT 1
-                    FROM ig_guaranteed g
-                    WHERE g.source = b.source AND g.source_id = b.source_id
-                )
-                  AND (
-                      b.source = 'social_tiktok'
-                      OR (b.source = 'social_instagram' AND coalesce(ir.creator_rank, 999) <= 3)
+                        ELSE 0.5
+                    END AS quality
+                FROM knowledge_chunks AS kc
+                CROSS JOIN project_embedding AS pe
+                WHERE kc.project_id = $1::uuid
+                  AND kc.source IN (
+                      'social_tiktok',
+                      'social_instagram',
+                      'paper',
+                      'patent',
+                      'news',
+                      'search'
                   )
-            ),
-            top_rest AS (
-                SELECT source, source_id, title, content, metadata, created_at, content_ts, _score
-                FROM top_rest_candidates
-                ORDER BY _score DESC
-                LIMIT 60
             )
-            SELECT source, source_id, title, content, metadata, created_at
-            FROM ig_guaranteed
-            UNION ALL
-            SELECT source, source_id, title, content, metadata, created_at
-            FROM top_rest
+            SELECT
+                item_id,
+                source,
+                title,
+                summary,
+                metadata,
+                created_at,
+                relevance,
+                recency,
+                quality,
+                CASE
+                    WHEN EXISTS (
+                        SELECT 1 FROM projects p
+                        WHERE p.id = $1::uuid AND p.intent_embedding IS NOT NULL
+                    ) AND source = 'paper'
+                    THEN (relevance * 0.65 + quality * 0.30 + recency * 0.05)
+                    WHEN EXISTS (
+                        SELECT 1 FROM projects p
+                        WHERE p.id = $1::uuid AND p.intent_embedding IS NOT NULL
+                    ) AND source = 'patent'
+                    THEN (relevance * 0.60 + quality * 0.30 + recency * 0.10)
+                    WHEN EXISTS (
+                        SELECT 1 FROM projects p
+                        WHERE p.id = $1::uuid AND p.intent_embedding IS NOT NULL
+                    )
+                    THEN (relevance * 0.60 + recency * 0.25 + quality * 0.15)
+                    WHEN source = 'paper'
+                    THEN (quality * 0.85 + recency * 0.15)
+                    WHEN source = 'patent'
+                    THEN (quality * 0.80 + recency * 0.20)
+                    ELSE recency
+                END AS score
+            FROM scored
+            ORDER BY score DESC
+            LIMIT 100
             """,
             project_id,
         )
     return [dict(r) for r in rows]
+
+
+async def update_project_intent_embedding(
+    pool: asyncpg.Pool,
+    project_id: str,
+    embedding: list[float],
+) -> None:
+    """Store intent embedding vector for project-level discover scoring."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE projects
+            SET intent_embedding = $2::vector,
+                updated_at = NOW()
+            WHERE id = $1::uuid
+            """,
+            project_id,
+            str(embedding),
+        )
 
 
 async def update_project_intent(

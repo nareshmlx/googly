@@ -19,8 +19,13 @@ Schema:
   "domain": "<primary research domain, e.g. fashion_materials, cosmetics, sustainability>",
   "query_type": "<one of: trend | research | patent | social | general>",
   "entities": ["<key entity 1>", "<key entity 2>"],
+  "must_match_terms": ["<terms that must appear in relevant results>"],
+  "expanded_terms": ["<optional related terms for recall>"],
+  "domain_terms": ["<context terms that constrain domain relevance>"],
+  "query_specificity": "<specific | broad>",
   "confidence": <float 0.0–1.0>,
-  "is_research_query": <true | false>
+  "is_research_query": <true | false>,
+  "target_domain": "<domain like techcrunch.com if user explicitly names a specific website/publication, else null>"
 }
 
 Rules:
@@ -34,8 +39,13 @@ Rules:
   - "social": social media content, influencer posts, UGC, platform-specific queries
   - "general": everything else not matching above categories
 - entities: max 5, most important named things in the query
+- must_match_terms: max 5; include exact user-mentioned specific entities when present
+- expanded_terms: max 8 optional related terms to improve recall
+- domain_terms: max 4 concise terms to constrain topical domain relevance
+- query_specificity: "specific" when user mentions concrete named entities, else "broad"
 - confidence: how certain you are about the domain classification
 - is_research_query: true if the query is asking about research, academic papers, scientific studies, literature reviews, citations, or scholarly content; false otherwise
+- target_domain: set to the domain (e.g. "techcrunch.com") if the query explicitly names a specific website or publication (e.g. "what does TechCrunch say", "according to Vogue", "Forbes article about", "from the BBC"); use domain format (e.g. "techcrunch.com" not "TechCrunch"); set to null if no specific site is mentioned
 - Output ONLY the JSON object, nothing else
 """
 

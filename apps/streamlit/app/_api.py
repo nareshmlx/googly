@@ -134,7 +134,11 @@ def create_project(
     refresh_strategy: str = "once",
     tiktok_enabled: bool = True,
     instagram_enabled: bool = True,
-    openalex_enabled: bool = True,
+    papers_enabled: bool = True,
+    patents_enabled: bool = True,
+    perigon_enabled: bool = True,
+    tavily_enabled: bool = True,
+    exa_enabled: bool = True,
 ) -> tuple[dict | None, str | None]:
     """
     Create a project.
@@ -154,7 +158,11 @@ def create_project(
                     "refresh_strategy": refresh_strategy,
                     "tiktok_enabled": tiktok_enabled,
                     "instagram_enabled": instagram_enabled,
-                    "openalex_enabled": openalex_enabled,
+                    "papers_enabled": papers_enabled,
+                    "patents_enabled": patents_enabled,
+                    "perigon_enabled": perigon_enabled,
+                    "tavily_enabled": tavily_enabled,
+                    "exa_enabled": exa_enabled,
                 },
             )
             resp.raise_for_status()
@@ -173,7 +181,10 @@ def create_project(
             status_code=exc.response.status_code,
             detail=detail,
         )
-        return None, f"Project creation failed ({exc.response.status_code}): {detail or 'Unknown error'}"
+        return (
+            None,
+            f"Project creation failed ({exc.response.status_code}): {detail or 'Unknown error'}",
+        )
     except Exception as exc:
         logger.warning("_api.create_project.error", error=str(exc))
         return None, "Failed to reach backend while creating project."
@@ -194,12 +205,12 @@ def delete_project(project_id: str) -> bool:
 
 
 def get_discover_feed(project_id: str) -> list[dict]:
-    """Return social KB items (TikTok + Instagram) for the Discover feed.
+    """Return multi-source KB items for the Discover feed.
 
-    Returns an empty list on error or if the project has no social content yet.
+    Returns an empty list on error or if the project has no discover content yet.
     """
     try:
-        with httpx.Client(timeout=10.0) as client:
+        with httpx.Client(timeout=settings.FASTAPI_DISCOVER_TIMEOUT) as client:
             resp = client.get(
                 f"{settings.FASTAPI_URL}/api/v1/projects/{project_id}/discover",
                 headers=_headers(),
@@ -207,8 +218,33 @@ def get_discover_feed(project_id: str) -> list[dict]:
             resp.raise_for_status()
             return resp.json()
     except Exception as exc:
-        logger.warning("_api.get_discover_feed.error", error=str(exc))
+        logger.warning(
+            "_api.get_discover_feed.error",
+            project_id=project_id,
+            timeout_seconds=settings.FASTAPI_DISCOVER_TIMEOUT,
+            error=str(exc),
+        )
         return []
+
+
+def get_ingest_status(project_id: str) -> dict | None:
+    """Return current ingest lifecycle status for a project."""
+    try:
+        with httpx.Client(timeout=settings.FASTAPI_DISCOVER_TIMEOUT) as client:
+            resp = client.get(
+                f"{settings.FASTAPI_URL}/api/v1/projects/{project_id}/ingest-status",
+                headers=_headers(),
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as exc:
+        logger.warning(
+            "_api.get_ingest_status.error",
+            project_id=project_id,
+            timeout_seconds=settings.FASTAPI_DISCOVER_TIMEOUT,
+            error=str(exc),
+        )
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +255,7 @@ def get_discover_feed(project_id: str) -> list[dict]:
 def get_kb_status(project_id: str) -> dict | None:
     """Return KB status for a project, or None on error."""
     try:
-        with httpx.Client(timeout=10.0) as client:
+        with httpx.Client(timeout=settings.FASTAPI_KB_STATUS_TIMEOUT) as client:
             resp = client.get(
                 f"{settings.FASTAPI_URL}/api/v1/kb/{project_id}/status",
                 headers=_headers(),
@@ -227,7 +263,12 @@ def get_kb_status(project_id: str) -> dict | None:
             resp.raise_for_status()
             return resp.json()
     except Exception as exc:
-        logger.warning("_api.get_kb_status.error", error=str(exc))
+        logger.warning(
+            "_api.get_kb_status.error",
+            project_id=project_id,
+            timeout_seconds=settings.FASTAPI_KB_STATUS_TIMEOUT,
+            error=str(exc),
+        )
         return None
 
 

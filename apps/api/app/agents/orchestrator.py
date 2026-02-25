@@ -17,6 +17,7 @@ Called from ChatService. Yields SSE-formatted strings.
 """
 
 import asyncio
+import hashlib
 import json
 import math
 import re
@@ -30,6 +31,7 @@ from agno.run.agent import RunContentEvent
 from app.agents.intent import build_intent_agent
 from app.agents.patent import build_patent_agent
 from app.agents.project_relevance import build_project_relevance_agent
+from app.agents.query_enhancer import build_query_enhancer_agent
 from app.agents.research import build_research_agent
 from app.agents.search_fallback import build_search_fallback_agent
 from app.agents.synthesis import build_synthesis_agent
@@ -43,6 +45,12 @@ from app.core.metrics import (
     research_tool_calls_total,
 )
 from app.core.paper_schema import normalize_paper_schema
+from app.core.query_policy import (
+    build_query_policy,
+    build_source_query,
+    lexical_entity_coverage,
+)
+from app.core.redis import get_redis
 from app.kb.retriever import retrieve
 from app.tools.news_perigon import search_perigon
 from app.tools.papers_arxiv import search_arxiv
@@ -56,6 +64,7 @@ logger = structlog.get_logger(__name__)
 # Module-level singletons — initialised once, reused across all requests
 # (Agno agents are stateless per arun() call — safe to share across requests)
 _intent_agent = None
+_query_enhancer_agent = None
 _synthesis_agent = None
 _project_relevance_agent = None
 _search_fallback_agent = None
@@ -69,6 +78,13 @@ def _get_intent_agent():
     if _intent_agent is None:
         _intent_agent = build_intent_agent()
     return _intent_agent
+
+
+def _get_query_enhancer_agent():
+    global _query_enhancer_agent
+    if _query_enhancer_agent is None:
+        _query_enhancer_agent = build_query_enhancer_agent()
+    return _query_enhancer_agent
 
 
 def _get_synthesis_agent():
@@ -258,7 +274,7 @@ def _clean_openalex_query(query: str, intent: dict) -> str:
     # Strip meta-query terms the IntentAgent sometimes includes as entities
     # (e.g. "research papers", "latest studies") — these are query type descriptors,
     # not subject keywords, and will match off-topic academic papers.
-    _META_TERMS = frozenset(
+    meta_terms = frozenset(
         {
             "research papers",
             "research paper",
@@ -276,19 +292,24 @@ def _clean_openalex_query(query: str, intent: dict) -> str:
             "current",
         }
     )
+    entity_source = (intent.get("must_match_terms") or []) + (intent.get("entities") or [])
     entities: list[str] = [
         e.strip()
-        for e in (intent.get("entities") or [])
-        if isinstance(e, str) and e.strip() and e.strip().lower() not in _META_TERMS
+        for e in entity_source
+        if isinstance(e, str) and e.strip() and e.strip().lower() not in meta_terms
     ]
     if entities:
         text = " ".join(entities[:5])
         # Add domain boost if domain is beauty-adjacent and not already in entities
         lowered = text.lower()
         domain = str(intent.get("domain") or "").lower()
-        if domain in {"cosmetics", "beauty_market_intelligence", "fragrance", "skincare"}:
-            if not any(t in lowered for t in {"beauty", "cosmetics", "skincare", "fragrance"}):
-                text = f"{text} skincare cosmetics"
+        if domain in {
+            "cosmetics",
+            "beauty_market_intelligence",
+            "fragrance",
+            "skincare",
+        } and not any(t in lowered for t in {"beauty", "cosmetics", "skincare", "fragrance"}):
+            text = f"{text} skincare cosmetics"
         return re.sub(r"\s+", " ", text).strip()
 
     # ── 2. Fallback: strip question words and filler from raw query ───────────
@@ -365,12 +386,19 @@ def _format_search_fallback_context(results: list[dict]) -> str:
         if not content:
             continue
 
-        # Truncate content to max 600 chars per result
-        if len(content) > 600:
-            content = f"{content[:600]}..."
+        # Truncate content to max 1500 chars per result — preserves Exa's richer snippets
+        if len(content) > 1500:
+            content = f"{content[:1500]}..."
 
-        source_label = f"{title} ({source})" if title != "Untitled" else source
-        parts.append(f"[Source: {source_label}]\nURL: {url}\n{content}")
+        # Embed URL directly in the source header as a markdown link so the synthesis
+        # agent can copy it verbatim for inline citations without a separate URL: line.
+        if url and title != "Untitled":
+            source_header = f"[{title}]({url})"
+        elif url:
+            source_header = f"[{source}]({url})"
+        else:
+            source_header = f"[{title} ({source})]" if title != "Untitled" else f"[{source}]"
+        parts.append(f"{source_header}\n{content}")
 
     return "\n\n---\n\n".join(parts)
 
@@ -512,9 +540,92 @@ def _format_openalex_paper_list_answer(query: str, papers: list[dict]) -> str:
     return "\n".join(lines)
 
 
+async def _enhance_query_pre_intent(query: str) -> dict:
+    """Normalize raw query before intent extraction while preserving specific terms."""
+    default = {
+        "rewritten_query": str(query or "").strip(),
+        "must_match_terms": [],
+        "expanded_terms": [],
+        "domain_terms": [],
+        "query_specificity": "broad",
+    }
+    if not settings.QUERY_ENABLE_PRE_INTENT_ENHANCER:
+        return default
+    if not settings.OPENAI_API_KEY:
+        return default
+
+    try:
+        enhancer = _get_query_enhancer_agent()
+        result = await enhancer.arun(query)
+        text = result.content if result and result.content else ""
+        if not isinstance(text, str) or not text.strip():
+            return default
+        parsed = json.loads(text.strip())
+        rewritten_query = str(parsed.get("rewritten_query") or default["rewritten_query"]).strip()
+        must_terms = parsed.get("must_match_terms") or []
+        if not isinstance(must_terms, list):
+            must_terms = []
+        must_terms = [str(term).strip() for term in must_terms if str(term).strip()][:5]
+        expanded_terms = parsed.get("expanded_terms") or []
+        if not isinstance(expanded_terms, list):
+            expanded_terms = []
+        expanded_terms = [str(term).strip() for term in expanded_terms if str(term).strip()][:8]
+        domain_terms = parsed.get("domain_terms") or []
+        if not isinstance(domain_terms, list):
+            domain_terms = []
+        domain_terms = [str(term).strip() for term in domain_terms if str(term).strip()][:4]
+        specificity = str(parsed.get("query_specificity") or "broad").strip().lower()
+        if specificity not in {"specific", "broad"}:
+            specificity = "broad"
+        return {
+            "rewritten_query": rewritten_query or default["rewritten_query"],
+            "must_match_terms": must_terms,
+            "expanded_terms": expanded_terms,
+            "domain_terms": domain_terms,
+            "query_specificity": specificity,
+        }
+    except Exception:
+        logger.exception("orchestrator.query_enhancer_error")
+        return default
+
+
+def _max_coverage_for_kb(kb_results: list[dict], must_match_terms: list[str]) -> float:
+    """Compute best lexical entity coverage ratio across KB chunks."""
+    if not kb_results:
+        return 0.0
+    best = 0.0
+    for chunk in kb_results:
+        text = f"{chunk.get('title', '')} {chunk.get('content', '')}"
+        coverage = lexical_entity_coverage(text, must_match_terms)
+        if coverage > best:
+            best = coverage
+    return best
+
+
+def _filter_papers_by_entity_coverage(papers: list[dict], must_match_terms: list[str]) -> list[dict]:
+    """Keep papers with sufficient lexical coverage for specific queries."""
+    if not papers or not must_match_terms:
+        return papers
+    threshold = settings.QUERY_ENTITY_MATCH_THRESHOLD
+    scored: list[tuple[float, dict]] = []
+    for paper in papers:
+        text = f"{paper.get('title', '')} {paper.get('content', '')} {paper.get('abstract', '')}"
+        coverage = lexical_entity_coverage(text, must_match_terms)
+        scored.append((coverage, paper))
+    kept = [paper for coverage, paper in scored if coverage >= threshold]
+    if kept:
+        return kept
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [paper for _, paper in scored[: max(1, min(5, len(scored)))]]
+
+
 async def _extract_intent(query: str) -> dict:
     """
     Run IntentAgent and parse the JSON response.
+
+    Results are cached in Redis for 1 hour keyed on the normalised query.
+    Identical queries (e.g. repeated user searches) skip the LLM entirely,
+    saving ~7.5 s per cache hit.
 
     Returns a default intent dict on any failure — never raises — so a bad
     intent classification degrades gracefully instead of crashing the pipeline.
@@ -523,16 +634,105 @@ async def _extract_intent(query: str) -> dict:
         "domain": "general",
         "query_type": "general",
         "entities": [],
+        "must_match_terms": [],
+        "expanded_terms": [],
+        "domain_terms": [],
+        "query_specificity": "broad",
         "confidence": 0.5,
         "is_research_query": False,
     }
+
+    # Normalise query for cache key (lowercase + strip whitespace)
+    query_normalised = query.lower().strip()
+    cache_key = f"intent:{hashlib.sha256(query_normalised.encode()).hexdigest()}"
+
+    # --- Cache read ---
+    redis = None
     try:
+        redis = await get_redis()
+        cached_raw = await redis.get(cache_key)
+        if cached_raw:
+            cached = json.loads(cached_raw)
+            logger.info("orchestrator.intent.cache_hit", cache_key=cache_key)
+            return cached
+    except Exception:
+        # Redis miss or failure — fall through to LLM call
+        logger.warning("orchestrator.intent.cache_read_error", cache_key=cache_key, exc_info=True)
+
+    # --- LLM call ---
+    try:
+        enhanced = await _enhance_query_pre_intent(query)
+        intent_query = str(enhanced.get("rewritten_query") or query).strip() or query
         agent = _get_intent_agent()
-        result = await agent.arun(query)
+        result = await agent.arun(intent_query)
         text = result.content if result and result.content else ""
         if isinstance(text, str) and text.strip():
             parsed = json.loads(text.strip())
-            return {**default, **parsed}
+            intent = {**default, **parsed}
+            # Merge pre-intent enhancer constraints as a guardrail against
+            # losing specific user entities during intent extraction.
+            enhancer_terms = enhanced.get("must_match_terms") or []
+            if enhancer_terms and isinstance(enhancer_terms, list):
+                merged = []
+                for term in enhancer_terms + (intent.get("must_match_terms") or []):
+                    value = str(term).strip()
+                    if value:
+                        merged.append(value)
+                seen: set[str] = set()
+                deduped: list[str] = []
+                for value in merged:
+                    key = value.lower()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    deduped.append(value)
+                intent["must_match_terms"] = deduped[:5]
+            enhancer_expanded = enhanced.get("expanded_terms") or []
+            if isinstance(enhancer_expanded, list):
+                merged_expanded = []
+                for term in enhancer_expanded + (intent.get("expanded_terms") or []):
+                    value = str(term).strip()
+                    if value:
+                        merged_expanded.append(value)
+                seen_expanded: set[str] = set()
+                deduped_expanded: list[str] = []
+                for value in merged_expanded:
+                    key = value.lower()
+                    if key in seen_expanded:
+                        continue
+                    seen_expanded.add(key)
+                    deduped_expanded.append(value)
+                intent["expanded_terms"] = deduped_expanded[:8]
+            enhancer_domain_terms = enhanced.get("domain_terms") or []
+            if isinstance(enhancer_domain_terms, list):
+                deduped_domain_terms = []
+                seen_domain: set[str] = set()
+                for term in enhancer_domain_terms:
+                    value = str(term).strip()
+                    key = value.lower()
+                    if not value or key in seen_domain:
+                        continue
+                    seen_domain.add(key)
+                    deduped_domain_terms.append(value)
+                if deduped_domain_terms:
+                    intent["domain_terms"] = deduped_domain_terms[:4]
+            if str(intent.get("query_specificity") or "").lower() not in {"specific", "broad"}:
+                intent["query_specificity"] = str(
+                    enhanced.get("query_specificity") or "broad"
+                ).lower()
+
+            # --- Cache write (only if Redis is available) ---
+            if redis is not None:
+                try:
+                    await redis.setex(cache_key, settings.INTENT_CACHE_TTL, json.dumps(intent))
+                    logger.info("orchestrator.intent.cache_write", cache_key=cache_key)
+                except Exception:
+                    # Cache write failure is non-fatal — result still returned to caller
+                    logger.warning(
+                        "orchestrator.intent.cache_write_error", cache_key=cache_key, exc_info=True
+                    )
+
+            return intent
     except json.JSONDecodeError:
         logger.warning("orchestrator.intent_parse_error", query_preview=query[:60])
     except Exception:
@@ -633,18 +833,41 @@ async def run_query(
         cleaned_query
     )
     exclude_papers = not openalex_enabled or not is_research_query
+
+    # Extract optional domain filter from intent (set when user names a specific
+    # website or publication, e.g. "what does TechCrunch say about retinol?").
+    # Only applied to general web search tools (Tavily, Exa web fallback) — never
+    # to academic tools (arXiv, PubMed, Semantic Scholar) which don't support it.
+    target_domain: str | None = intent.get("target_domain")
+    include_domains: list[str] | None = [target_domain] if target_domain else None
+
     logger.info(
         "orchestrator.intent_and_relevance",
         domain=intent.get("domain"),
         query_type=query_type,
         entities=intent.get("entities"),
+        must_match_terms=intent.get("must_match_terms"),
+        query_specificity=intent.get("query_specificity"),
         is_research_query=is_research_query,
         exclude_papers=exclude_papers,
         relevant_project_ids=relevant_project_ids,
+        target_domain=target_domain,
+    )
+    query_policy = build_query_policy(cleaned_query, intent)
+    logger.info(
+        "orchestrator.query_policy",
+        must_match_terms=query_policy.must_match_terms,
+        optional_terms=query_policy.optional_terms,
+        domain_terms=query_policy.domain_terms,
+        is_specific=query_policy.is_specific,
     )
 
-    # Step 1a: Route to specialized agents based on intent
-    if query_type == "trend":
+    # Step 1a: Route to specialized agents based on intent.
+    # Skip specialized routing when target_domain is set — the user wants content
+    # from a specific site (e.g. Fragrantica), so domain-filtered web search via
+    # Tavily/Exa is more appropriate than Perigon or PatentsView which cannot
+    # filter by domain.
+    if query_type == "trend" and not target_domain:
         # Route to TrendAgent for trend analysis
         logger.info("orchestrator.routing_to_trend_agent", query=cleaned_query[:80])
         try:
@@ -665,7 +888,7 @@ async def run_query(
             logger.exception("orchestrator.trend_agent_error")
             # Fall through to normal KB flow on error
 
-    elif query_type == "patent":
+    elif query_type == "patent" and not target_domain:
         # Route to PatentAgent for patent search
         logger.info("orchestrator.routing_to_patent_agent", query=cleaned_query[:80])
         try:
@@ -688,28 +911,134 @@ async def run_query(
             logger.exception("orchestrator.patent_agent_error")
             # Fall through to normal KB flow on error
 
-    # Step 3: KB retrieval across all relevant projects
-    # (relevant_project_ids already computed in parallel with intent in Step 1)
-    kb_results = await retrieve(
-        query=cleaned_query, project_ids=relevant_project_ids, exclude_papers=exclude_papers
-    )
+    # Step 3: KB retrieval + academic tools (research queries) started concurrently.
+    #
+    # For research queries we know we'll need academic papers if KB returns nothing,
+    # so we fire the academic tool gather as an asyncio.Task at the same time as KB
+    # retrieval — saving ~200 ms of sequential wait time.
+    # If KB already has a paper for this query, we cancel the academic task immediately.
+    academic_task: asyncio.Task | None = None
+    research_query: str = ""
+    if openalex_enabled and is_research_query:
+        research_query = build_source_query(query_policy, "openalex") or _clean_openalex_query(
+            cleaned_query, intent
+        )
+        logger.info(
+            "orchestrator.research.query_cleaned",
+            cleaned_query_preview=cleaned_query[:80],
+            research_query=research_query,
+            intent_entities=intent.get("entities"),
+        )
+
+        async def _run_academic_tools() -> tuple:
+            semantic_query = build_source_query(query_policy, "semantic_scholar")
+            arxiv_query = build_source_query(query_policy, "arxiv")
+            pubmed_query = build_source_query(query_policy, "pubmed")
+            return await asyncio.gather(
+                search_semantic_scholar(
+                    semantic_query,
+                    must_match_terms=query_policy.must_match_terms,
+                    domain_terms=query_policy.domain_terms,
+                    query_specificity=query_policy.query_specificity,
+                ),
+                search_arxiv(
+                    arxiv_query,
+                    must_match_terms=query_policy.must_match_terms,
+                    domain_terms=query_policy.domain_terms,
+                    query_specificity=query_policy.query_specificity,
+                ),
+                search_pubmed(
+                    pubmed_query,
+                    must_match_terms=query_policy.must_match_terms,
+                    domain_terms=query_policy.domain_terms,
+                    query_specificity=query_policy.query_specificity,
+                ),
+                return_exceptions=True,
+            )
+
+        academic_task = asyncio.create_task(_run_academic_tools())
+        logger.info(
+            "orchestrator.research.academic_tools_started_concurrently",
+            query_preview=research_query[:80],
+        )
+
+    try:
+        kb_results = await retrieve(
+            query=cleaned_query, project_ids=relevant_project_ids, exclude_papers=exclude_papers
+        )
+    except Exception:
+        # Cancel academic_task before propagating — otherwise the pending Task is
+        # garbage-collected and Python logs "Task was destroyed but it is pending!".
+        if academic_task is not None:
+            academic_task.cancel()
+            academic_task = None
+        logger.exception("orchestrator.kb_retrieve_error", query_preview=cleaned_query[:80])
+        raise
+
+    # When the user names a specific site (target_domain is set), the intent is
+    # "fetch live content from that site" — KB content is irrelevant regardless of
+    # its cosine score.  Force kb_results = None so the search fallback always fires
+    # with include_domains, guaranteeing specific page URLs in the synthesis context.
+    if target_domain and kb_results is not None:
+        logger.info(
+            "orchestrator.kb_bypassed_for_target_domain",
+            target_domain=target_domain,
+            kb_chunk_count=len(kb_results),
+        )
+        kb_results = None
+
+    # For specific queries, force fallback when KB lexical entity coverage is weak
+    # even if cosine similarity crossed threshold.
+    if (
+        kb_results is not None
+        and query_policy.is_specific
+        and query_policy.must_match_terms
+        and not target_domain
+    ):
+        kb_coverage = _max_coverage_for_kb(kb_results, query_policy.must_match_terms)
+        if kb_coverage < settings.QUERY_ENTITY_MATCH_THRESHOLD:
+            logger.info(
+                "orchestrator.kb_entity_coverage_below_threshold",
+                coverage=round(kb_coverage, 3),
+                threshold=settings.QUERY_ENTITY_MATCH_THRESHOLD,
+                must_match_terms=query_policy.must_match_terms,
+            )
+            kb_results = None
 
     kb_has_paper = any(chunk.get("source") == "paper" for chunk in (kb_results or []))
     openalex_papers: list[dict] = []
 
+    # If KB already has a paper, cancel academic task — its results are not needed
+    if kb_has_paper and academic_task is not None:
+        academic_task.cancel()
+        academic_task = None
+        logger.info("orchestrator.research.academic_task_cancelled_kb_has_paper")
+
     # Step 3a: KB fallback — parallel search tool calls when KB score < 0.70
     # Task 2.2 improvement: 24.8s → 8.5s (16.3s savings)
     search_fallback_results: str = ""
-    if kb_results is None:
+    skip_general_fallback = bool(openalex_enabled and is_research_query)
+    if kb_results is None and not skip_general_fallback:
         logger.info(
             "kb_score_below_threshold_triggering_fallback", query_preview=cleaned_query[:80]
         )
         try:
             # Call all 3 search tools in parallel with fault tolerance
             search_results = await asyncio.gather(
-                search_tavily(cleaned_query),
-                search_exa(cleaned_query),
-                search_perigon(cleaned_query),
+                search_tavily(
+                    build_source_query(query_policy, "tavily"),
+                    include_domains=include_domains,
+                ),
+                search_exa(
+                    build_source_query(query_policy, "exa"),
+                    include_domains=include_domains,
+                ),
+                search_perigon(
+                    build_source_query(query_policy, "perigon"),
+                    must_match_terms=query_policy.must_match_terms,
+                    domain_terms=query_policy.domain_terms,
+                    query_specificity=query_policy.query_specificity,
+                ),
                 return_exceptions=True,
             )
 
@@ -754,32 +1083,28 @@ async def run_query(
         except Exception:
             logger.exception("orchestrator.search_fallback_error")
             search_fallback_results = ""
-
-    # Step 3b: Research fallback — parallel tool calls with Exa fallback strategy (Phase 3)
-    research_papers: list[dict] = []
-    if openalex_enabled and is_research_query and not kb_has_paper:
-        research_query = _clean_openalex_query(cleaned_query, intent)
-        stage_start = time.perf_counter()
+    elif kb_results is None and skip_general_fallback:
         logger.info(
-            "orchestrator.research.query_cleaned",
-            cleaned_query_preview=cleaned_query[:80],
-            research_query=research_query,
-            intent_entities=intent.get("entities"),
+            "orchestrator.search_fallback_skipped_for_research_query",
+            query_preview=cleaned_query[:80],
         )
 
+    # Step 3b: Research fallback — parallel tool calls with Exa fallback strategy (Phase 3)
+    # academic_task was started concurrently with KB retrieval above (when is_research_query=True).
+    # It is None if kb_has_paper was True (task was cancelled) or query is not a research query.
+    research_papers: list[dict] = []
+    if openalex_enabled and is_research_query and not kb_has_paper and academic_task is not None:
+        stage_start = time.perf_counter()
+
         try:
-            # Phase 3.1: Call academic tools first (Semantic Scholar, arXiv, PubMed) in parallel
+            # Await the pre-started academic task (already running since KB retrieval started)
             logger.info(
-                "orchestrator.research.academic_tools_start", query_preview=research_query[:80]
+                "orchestrator.research.academic_tools_await", query_preview=research_query[:80]
             )
 
-            # Call academic tools in parallel (return_exceptions=True to handle individual failures)
-            academic_results = await asyncio.gather(
-                search_semantic_scholar(research_query),
-                search_arxiv(research_query),
-                search_pubmed(research_query),
-                return_exceptions=True,
-            )
+            # academic_task returns a tuple from asyncio.gather with return_exceptions=True
+            academic_results = await academic_task
+            academic_task = None  # Consumed
 
             # Extract results (tools return [] on failure, never raise)
             semantic_scholar_papers = (
@@ -820,7 +1145,7 @@ async def run_query(
                     threshold=settings.EXA_FALLBACK_THRESHOLD,
                 )
                 try:
-                    exa_papers = await search_exa(research_query)
+                    exa_papers = await search_exa(build_source_query(query_policy, "exa"))
                     if exa_papers:
                         research_tool_calls_total.labels(tool="exa").inc()
                         exa_called = True
@@ -853,6 +1178,11 @@ async def run_query(
                 # consistent fields (publication_year, cited_by_count, doi, paper_id)
                 # regardless of which tool produced each paper.
                 research_papers = normalize_paper_schema(research_papers)
+                if query_policy.is_specific:
+                    research_papers = _filter_papers_by_entity_coverage(
+                        research_papers,
+                        query_policy.must_match_terms,
+                    )
 
                 # Track deduplication metrics
                 deduped_count = len(research_papers)
@@ -927,9 +1257,18 @@ async def run_query(
                     f"{chunk['content']}"
                 )
             else:
-                context_parts.append(
-                    f"[Source: {title} ({source}, relevance: {score:.2f})]\n{chunk['content']}"
-                )
+                # Surface any URL stored at ingest time so the synthesis agent can
+                # cite specific pages rather than falling back to homepage guesses.
+                chunk_url = (
+                    metadata.get("url") or metadata.get("source_url") or metadata.get("link") or ""
+                ).strip()
+                if chunk_url and title != "Untitled":
+                    source_header = f"[{title}]({chunk_url}) ({source}, relevance: {score:.2f})"
+                elif chunk_url:
+                    source_header = f"[{source}]({chunk_url}) (relevance: {score:.2f})"
+                else:
+                    source_header = f"[Source: {title} ({source}, relevance: {score:.2f})]"
+                context_parts.append(f"{source_header}\n{chunk['content']}")
         if openalex_papers:
             context_parts.append(_format_openalex_context(openalex_papers))
         context = "\n\n---\n\n".join(context_parts)
@@ -955,21 +1294,39 @@ async def run_query(
                 "Structured Social Insights (precomputed from retrieved social evidence):\n"
                 f"{json.dumps(social_insights, ensure_ascii=True)}\n\n"
             )
+        # Build requirements dynamically — only instruct the LLM to include a section
+        # when the underlying data actually exists, preventing hallucinated empty sections.
+        req_parts = ["1) Start with a concise answer tailored to the query."]
+        req_num = 2
+        if openalex_papers:
+            req_parts.append(
+                f"{req_num}) Include a 'Latest Papers' section with 6-8 distinct papers. "
+                "For each paper include: title, publication year, and DOI or OpenAlex link."
+            )
+            req_num += 1
+        if is_social_like_query or social_insights:
+            req_parts.append(
+                f"{req_num}) Include a 'Social Insights' section grounded in the provided metrics."
+            )
+            req_num += 1
+        req_parts.append(
+            "Cite sources inline using [title](url) markdown link format — "
+            "do not add a separate 'Evidence' section or a 'Confidence / Gaps' section."
+        )
+        if query_policy.is_specific and query_policy.must_match_terms:
+            req_parts.append(
+                "For specific-entity queries, prioritize evidence that explicitly mentions: "
+                + ", ".join(query_policy.must_match_terms)
+                + "."
+            )
+        req_parts.append("Do not include irrelevant general information.")
+
         synthesis_prompt = (
             f"Research Query: {cleaned_query}\n\n"
             f"Domain: {intent.get('domain', 'general')}\n\n"
             f"{social_block}"
             f"Relevant Knowledge Base Context:\n{context}\n\n"
-            "Response requirements:\n"
-            "1) Start with a concise answer tailored to the query.\n"
-            "2) If paper sources are present, include a 'Latest Papers' section "
-            "with 6-8 distinct papers when available.\n"
-            "For each paper include: title, publication year, and DOI or OpenAlex link.\n"
-            "3) If social evidence is present, include a 'Social Insights' section "
-            "grounded in the provided metrics.\n"
-            "4) Include an 'Evidence' section with specific sources used.\n"
-            "5) If evidence is thin, include a brief 'Confidence / Gaps' note.\n"
-            "Do not include irrelevant general information."
+            f"Response requirements:\n" + "\n".join(req_parts)
         )
     else:
         synthesis_prompt = (
