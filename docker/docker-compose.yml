@@ -1,16 +1,72 @@
 services:
   db:
     image: agnohq/pgvector:16
-    container_name: agentos-db
+    container_name: googly-db
     restart: always
     environment:
-      POSTGRES_USER: ai
-      POSTGRES_PASSWORD: ai
-      POSTGRES_DB: ai
+      POSTGRES_USER: googly
+      POSTGRES_PASSWORD: googly
+      POSTGRES_DB: googly
     ports:
       - "5432:5432"
     volumes:
-      - agentos_pgdata:/var/lib/postgresql/data
+      - googly_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U googly"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7.4-alpine
+    container_name: googly-redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - googly_redisdata:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  worker:
+    image: ghcr.io/astral-sh/uv:python3.11-bookworm
+    container_name: googly-worker
+    working_dir: /app
+    volumes:
+      - ../apps/api:/app
+      # Shadow .venv with a named Docker volume so the Linux venv is never
+      # written into the Windows source tree (prevents corrupted lib64 symlink).
+      - worker_venv:/app/.venv
+      - uv_cache:/root/.cache/uv
+    command: uv run arq app.tasks.worker.WorkerSettings
+    env_file:
+      - ../.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://googly:googly@db:5432/googly
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - default
 
 volumes:
-  agentos_pgdata:
+  googly_pgdata:
+    external: true
+    name: googly_googly_pgdata
+  googly_redisdata:
+    external: true
+    name: googly_googly_redisdata
+  uv_cache:
+  worker_venv:
+
+networks:
+  default:
+    name: googly-network

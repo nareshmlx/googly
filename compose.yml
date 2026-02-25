@@ -1,0 +1,5 @@
+# compose.yml — repo root
+# Allows `docker compose up` without -f flag.
+# All service definitions live in docker/docker-compose.yml.
+include:
+  - docker/docker-compose.yml
