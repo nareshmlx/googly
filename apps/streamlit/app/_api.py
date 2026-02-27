@@ -134,6 +134,9 @@ def create_project(
     refresh_strategy: str = "once",
     tiktok_enabled: bool = True,
     instagram_enabled: bool = True,
+    youtube_enabled: bool = True,
+    reddit_enabled: bool = True,
+    x_enabled: bool = True,
     papers_enabled: bool = True,
     patents_enabled: bool = True,
     perigon_enabled: bool = True,
@@ -158,6 +161,9 @@ def create_project(
                     "refresh_strategy": refresh_strategy,
                     "tiktok_enabled": tiktok_enabled,
                     "instagram_enabled": instagram_enabled,
+                    "youtube_enabled": youtube_enabled,
+                    "reddit_enabled": reddit_enabled,
+                    "x_enabled": x_enabled,
                     "papers_enabled": papers_enabled,
                     "patents_enabled": patents_enabled,
                     "perigon_enabled": perigon_enabled,
@@ -240,6 +246,48 @@ def get_ingest_status(project_id: str) -> dict | None:
     except Exception as exc:
         logger.warning(
             "_api.get_ingest_status.error",
+            project_id=project_id,
+            timeout_seconds=settings.FASTAPI_DISCOVER_TIMEOUT,
+            error=str(exc),
+        )
+        return None
+
+
+def bootstrap_project(project_id: str, upload_ids: list[str]) -> dict | None:
+    """Trigger project bootstrap with optional uploaded document IDs."""
+    try:
+        with httpx.Client(timeout=settings.FASTAPI_DISCOVER_TIMEOUT) as client:
+            resp = client.post(
+                f"{settings.FASTAPI_URL}/api/v1/projects/{project_id}/bootstrap",
+                headers={**_headers(), "Content-Type": "application/json"},
+                json={"upload_ids": upload_ids},
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as exc:
+        logger.warning(
+            "_api.bootstrap_project.error",
+            project_id=project_id,
+            upload_count=len(upload_ids),
+            timeout_seconds=settings.FASTAPI_DISCOVER_TIMEOUT,
+            error=str(exc),
+        )
+        return None
+
+
+def get_setup_status(project_id: str) -> dict | None:
+    """Return project setup/bootstrap status for progress polling."""
+    try:
+        with httpx.Client(timeout=settings.FASTAPI_DISCOVER_TIMEOUT) as client:
+            resp = client.get(
+                f"{settings.FASTAPI_URL}/api/v1/projects/{project_id}/setup-status",
+                headers=_headers(),
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as exc:
+        logger.warning(
+            "_api.get_setup_status.error",
             project_id=project_id,
             timeout_seconds=settings.FASTAPI_DISCOVER_TIMEOUT,
             error=str(exc),

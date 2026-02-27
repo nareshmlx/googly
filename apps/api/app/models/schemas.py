@@ -54,6 +54,9 @@ class ProjectCreate(BaseModel):
     refresh_strategy: str = Field(default="once")
     tiktok_enabled: bool = True
     instagram_enabled: bool = True
+    youtube_enabled: bool = True
+    reddit_enabled: bool = True
+    x_enabled: bool = True
     papers_enabled: bool = True
     patents_enabled: bool = True
     perigon_enabled: bool = True
@@ -70,6 +73,9 @@ class ProjectResponse(BaseModel):
     kb_chunk_count: int = 0
     tiktok_enabled: bool
     instagram_enabled: bool
+    youtube_enabled: bool
+    reddit_enabled: bool
+    x_enabled: bool
     papers_enabled: bool
     patents_enabled: bool
     perigon_enabled: bool
@@ -77,6 +83,23 @@ class ProjectResponse(BaseModel):
     exa_enabled: bool
     last_refreshed_at: str | None = None
     created_at: str
+
+
+class ProjectBootstrapRequest(BaseModel):
+    upload_ids: list[str] = Field(default_factory=list)
+
+
+class ProjectSetupStatusResponse(BaseModel):
+    project_id: str
+    status: str
+    phase: str
+    progress_percent: int = Field(default=0, ge=0, le=100)
+    message: str | None = None
+    updated_at: str | None = None
+    error: str | None = None
+    upload_ids: list[str] = Field(default_factory=list)
+    upload_signature: str = ""
+    job_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +132,9 @@ class IngestStatusResponse(BaseModel):
     job_id: str | None = None
     total_chunks: int | None = None
     source_counts: dict = Field(default_factory=dict)
+    source_diagnostics: dict = Field(default_factory=dict)
+    fulltext_enqueued: int = 0
+    enrichment: dict = Field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +143,17 @@ class IngestStatusResponse(BaseModel):
 
 
 class DiscoverItem(BaseModel):
-    source: Literal["tiktok", "instagram", "paper", "patent", "news", "search"]
+    source: Literal[
+        "tiktok",
+        "instagram",
+        "youtube",
+        "reddit",
+        "x",
+        "paper",
+        "patent",
+        "news",
+        "search",
+    ]
     item_id: str
     title: str
     summary: str

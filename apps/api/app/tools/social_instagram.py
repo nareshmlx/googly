@@ -14,11 +14,27 @@ import asyncio
 
 import httpx
 import structlog
-from ensembledata.api import EDClient
+
+try:
+    from ensembledata.api import EDClient
+except ImportError:  # pragma: no cover - environment-dependent optional dependency
+    EDClient = None  # type: ignore[assignment]
 
 from app.core.config import settings
 
 logger = structlog.get_logger(__name__)
+_SDK_WARNED = False
+
+
+def _sdk_available() -> bool:
+    """Return whether EnsembleData SDK is importable in this runtime."""
+    global _SDK_WARNED
+    if EDClient is None:
+        if not _SDK_WARNED:
+            logger.warning("social_instagram.sdk_missing")
+            _SDK_WARNED = True
+        return False
+    return True
 
 
 def _as_int(value: object) -> int:
@@ -56,6 +72,8 @@ async def instagram_search(text: str) -> list[dict]:
     """
     if not settings.ENSEMBLE_API_TOKEN:
         logger.warning("social_instagram.no_token")
+        return []
+    if not _sdk_available():
         return []
 
     logger.info("social_instagram.search.start", text_preview=text[:60])
@@ -143,6 +161,8 @@ async def instagram_user_posts(
     if not settings.ENSEMBLE_API_TOKEN:
         logger.warning("social_instagram.no_token")
         return []
+    if not _sdk_available():
+        return []
 
     logger.info("social_instagram.posts.start", user_id=user_id, depth=depth)
     try:
@@ -219,6 +239,8 @@ async def instagram_user_reels(
     """
     if not settings.ENSEMBLE_API_TOKEN:
         logger.warning("social_instagram.no_token")
+        return []
+    if not _sdk_available():
         return []
 
     logger.info("social_instagram.reels.start", user_id=user_id, depth=depth)
@@ -311,6 +333,8 @@ async def instagram_user_basic_stats(user_id: int) -> dict:
     if not settings.ENSEMBLE_API_TOKEN:
         logger.warning("social_instagram.no_token")
         return {}
+    if not _sdk_available():
+        return {}
 
     logger.info("social_instagram.basic_stats.start", user_id=user_id)
     try:
@@ -355,6 +379,8 @@ async def instagram_post_info(code: str) -> dict:
     """
     if not settings.ENSEMBLE_API_TOKEN:
         logger.warning("social_instagram.no_token")
+        return {}
+    if not _sdk_available():
         return {}
 
     if not code:
@@ -496,12 +522,19 @@ async def instagram_hashtag_posts(
 
     for endpoint in endpoints:
         try:
-            async with httpx.AsyncClient(timeout=20.0) as client:
+            async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.get(endpoint, params=params)
                 response.raise_for_status()
                 payload = response.json()
 
             raw_posts, next_cursor = _extract_hashtag_posts_payload(payload)
+            if not raw_posts and next_cursor is not None:
+                logger.info(
+                    "social_instagram.hashtag_posts.empty_page_with_cursor",
+                    hashtag=tag,
+                    endpoint=endpoint,
+                )
+                continue
             if not raw_posts and next_cursor is None:
                 logger.warning(
                     "social_instagram.hashtag_posts.unexpected_shape",

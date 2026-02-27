@@ -63,7 +63,7 @@ def _build_patentsview_query(
     """Build PatentsView boolean query across title and abstract fields."""
     must_match_terms = [str(term).strip() for term in (must_match_terms or []) if str(term).strip()]
     domain_terms = [str(term).strip() for term in (domain_terms or []) if str(term).strip()]
-    terms = must_match_terms[:3]
+    terms = must_match_terms
     if not terms:
         terms = [query]
     and_clauses: list[dict] = []
@@ -79,9 +79,9 @@ def _build_patentsview_query(
     if domain_terms:
         domain_clause = {
             "_or": [
-                {"_text_all": {"patent_title": term}} for term in domain_terms[:2]
+                {"_text_all": {"patent_title": term}} for term in domain_terms
             ]
-            + [{"_text_all": {"patent_abstract": term}} for term in domain_terms[:2]]
+            + [{"_text_all": {"patent_abstract": term}} for term in domain_terms]
         }
         and_clauses.append(domain_clause)
     if len(and_clauses) == 1:
@@ -304,7 +304,7 @@ async def search_patentsview(
     if str(query_specificity or "").lower() == "specific" and must_match_terms:
         logger.info(
             "patents_patentsview.specific_query",
-            must_match_terms=must_match_terms[:3],
+            must_match_terms=must_match_terms,
         )
     logger.info("patents_patentsview.start", query_preview=query[:80])
 

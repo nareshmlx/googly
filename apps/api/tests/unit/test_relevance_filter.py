@@ -8,9 +8,11 @@ from app.tasks.ingest_project import (
     _filter_relevance,
     _filter_stage1_embedding,
     _filter_stage2_llm,
+    _project_anchor_terms,
     _query_for_papers,
     _query_for_patents,
     _query_for_social,
+    _social_must_terms,
 )
 
 
@@ -30,18 +32,30 @@ async def test_stage1_drops_bottom_40_percent() -> None:
 
 
 @pytest.mark.asyncio
-async def test_filter_relevance_skips_social() -> None:
-    """Top-level filter bypasses both stages for social sources."""
-    items = [{"title": "Video", "content": "Beauty trend"}]
+async def test_filter_relevance_applies_strict_social_gate() -> None:
+    """Social sources require lexical must-match + similarity threshold in strict mode."""
+    items = [
+        {"title": "Retinol review", "content": "Retinol night routine for acne marks"},
+        {"title": "Makeup hacks", "content": "Lipstick hacks and contour routine"},
+    ]
+    intent_text = '{"must_match_terms":["retinol"],"query_specificity":"specific"}'
+    intent_vec = [1.0, 0.0, 0.0]
+    item_vecs = [
+        [0.95, 0.05, 0.0],
+    ]
 
-    result = await _filter_relevance(
-        items=items,
-        intent_text="beauty",
-        source="social_tiktok",
-        redis=None,
-    )
+    with patch("app.tasks.ingest_project.embed_texts", new=AsyncMock()) as embed_texts_mock:
+        embed_texts_mock.side_effect = [[intent_vec], item_vecs]
+        result = await _filter_relevance(
+            items=items,
+            intent_text=intent_text,
+            source="social_tiktok",
+            redis=None,
+            must_match_terms=["retinol"],
+        )
 
-    assert result == items
+    assert len(result) == 1
+    assert result[0]["title"] == "Retinol review"
 
 
 @pytest.mark.asyncio
@@ -61,10 +75,10 @@ async def test_stage2_drops_irrelevant_by_llm_response() -> None:
         )
     ]
 
-    with patch("app.tasks.ingest_project.AsyncOpenAI") as openai_cls:
+    with patch("app.tasks.ingest_project.get_openai_client") as get_client:
         mock_client = AsyncMock()
         mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
-        openai_cls.return_value = mock_client
+        get_client.return_value = mock_client
 
         result = await _filter_stage2_llm(
             items=items, intent_text="luxury fragrance", source="paper"
@@ -138,3 +152,80 @@ def test_query_for_social_uses_keywords_before_project_context() -> None:
     )
 
     assert query == "glass skin hydrating essence"
+
+
+def test_query_for_social_keeps_specific_terms_beyond_first_four_keywords() -> None:
+    """Social query should not drop later specific terms like retinol."""
+    query = _query_for_social(
+        {
+            "search_filters": {},
+            "must_match_terms": ["retinol"],
+            "keywords": [
+                "skincare",
+                "barrier",
+                "sensitive",
+                "night",
+                "retinol",
+                "encapsulation",
+            ],
+            "entities": [],
+            "domain_terms": ["cosmetics"],
+        },
+        project_title="Retinol project",
+        project_description="Retinol stabilization",
+    )
+
+    lowered = query.lower()
+    assert "retinol" in lowered
+    assert "encapsulation" in lowered
+
+
+def test_social_must_terms_uses_specific_non_broad_keywords_when_explicit_terms_missing() -> None:
+    """Specific social queries should derive strict terms from entities/keywords."""
+    terms = _social_must_terms(
+        {
+            "query_specificity": "specific",
+            "must_match_terms": [],
+            "entities": ["retinol"],
+            "keywords": ["skincare", "encapsulation", "beauty"],
+        },
+        query_terms=["beauty", "retinol", "encapsulation"],
+    )
+    assert "retinol" in terms
+    assert "encapsulation" in terms
+    assert "beauty" not in terms
+
+
+def test_project_anchor_terms_prioritizes_project_description_specific_terms() -> None:
+    """Anchor extraction should include project-specific ingredient/process terms."""
+    anchors = _project_anchor_terms(
+        {
+            "keywords": ["retinol", "encapsulation"],
+            "entities": ["retinoid"],
+        },
+        social_filter="#retinol #skincare",
+        project_title="Retinol stabilization",
+        project_description="Research microencapsulation and oxidation stability for retinol serums.",
+    )
+    assert "retinol" in anchors
+    assert "encapsulation" in anchors or "microencapsulation" in anchors
+    assert "skincare" not in anchors
+
+
+def test_social_query_terms_excludes_generic_project_words() -> None:
+    """Social query construction should drop generic control words from fallback intent."""
+    query = _query_for_social(
+        {
+            "search_filters": {"social": "#find #highly #relevant #social #retinol"},
+            "keywords": ["find", "highly", "relevant", "retinol", "niacinamide", "stability"],
+            "entities": [],
+        },
+        project_title="Find highly relevant social evidence",
+        project_description="Track retinol niacinamide stability and compatibility",
+    )
+    lowered = query.lower()
+    assert "retinol" in lowered
+    assert "niacinamide" in lowered or "stability" in lowered
+    assert "find" not in lowered
+    assert "highly" not in lowered
+    assert "relevant" not in lowered

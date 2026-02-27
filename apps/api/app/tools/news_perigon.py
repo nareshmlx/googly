@@ -42,8 +42,8 @@ def _build_perigon_query(
     must_match_terms = [str(term).strip() for term in (must_match_terms or []) if str(term).strip()]
     domain_terms = [str(term).strip() for term in (domain_terms or []) if str(term).strip()]
     if must_match_terms:
-        parts = [f'"{term}"' for term in must_match_terms[:3]]
-        parts.extend(domain_terms[:2])
+        parts = [f'"{term}"' for term in must_match_terms]
+        parts.extend(domain_terms)
         return " ".join(parts).strip()
     return query
 
@@ -269,7 +269,7 @@ async def search_perigon(
     if str(query_specificity or "").lower() == "specific" and must_match_terms:
         logger.info(
             "news_perigon.specific_query",
-            must_match_terms=must_match_terms[:3],
+            must_match_terms=must_match_terms,
             category=category,
         )
 

@@ -41,40 +41,6 @@ _LATEST_QUERY_TERMS: set[str] = {
     "today",
 }
 
-_BEAUTY_SCOPE_TERMS: set[str] = {
-    "beauty",
-    "cosmetic",
-    "cosmetics",
-    "skincare",
-    "makeup",
-    "fragrance",
-    "perfume",
-    "haircare",
-    "sunscreen",
-    "moisturizer",
-    "retinol",
-    "niacinamide",
-    "lip",
-    "lipbalm",
-    "concealer",
-}
-
-_COSMETIC_CORE_TERMS: set[str] = {
-    "cosmetic",
-    "cosmetics",
-    "skincare",
-    "skin",
-    "makeup",
-    "fragrance",
-    "perfume",
-    "haircare",
-    "sunscreen",
-    "moisturizer",
-    "retinol",
-    "niacinamide",
-    "concealer",
-}
-
 _QUERY_STOPWORDS: set[str] = {
     "get",
     "give",
@@ -108,9 +74,6 @@ _QUERY_STOPWORDS: set[str] = {
 }
 
 _GENERIC_QUERY_TERMS: set[str] = {
-    "beauty",
-    "cosmetic",
-    "cosmetics",
     "latest",
     "recent",
     "newest",
@@ -194,9 +157,6 @@ def _build_query_variants(query: str) -> list[str]:
     if expanded_variant:
         variants.append(expanded_variant)
 
-    # Add one beauty-domain fallback to avoid under-fetching on narrow phrasing.
-    variants.append("beauty cosmetics skincare haircare personal care")
-
     seen: set[str] = set()
     out: list[str] = []
     for v in variants:
@@ -210,21 +170,20 @@ def _build_query_variants(query: str) -> list[str]:
 
 
 def _paper_relevance_score(
-    paper: dict, query_tokens: set[str], specific_query_terms: set[str], beauty_query: bool
-) -> tuple[int, int, int, int, int]:
+    paper: dict, query_tokens: set[str], specific_query_terms: set[str]
+) -> tuple[int, int, int, int]:
     """Compute lexical relevance score and overlap signals for ranking."""
     text = f"{paper.get('title', '')} {paper.get('abstract', '')}".strip()
     text_tokens = _tokenize(text)
     if not text_tokens:
-        return 0, 0, 0, 0, 0
+        return 0, 0, 0, 0
     query_overlap = len(text_tokens & query_tokens)
     specific_overlap = len(text_tokens & specific_query_terms) if specific_query_terms else 0
-    beauty_overlap = len(text_tokens & _BEAUTY_SCOPE_TERMS)
-    core_overlap = len(text_tokens & _COSMETIC_CORE_TERMS)
-    score = (query_overlap * 3) + (specific_overlap * 4) + (beauty_overlap * 2)
-    if beauty_query and beauty_overlap == 0 and query_overlap == 0:
-        return 0, beauty_overlap, query_overlap, core_overlap, specific_overlap
-    return score, beauty_overlap, query_overlap, core_overlap, specific_overlap
+    phrase_bonus = 0
+    if len(specific_query_terms) >= 2 and specific_overlap >= 2:
+        phrase_bonus = 2
+    score = (query_overlap * 3) + (specific_overlap * 4) + phrase_bonus
+    return score, query_overlap, specific_overlap, phrase_bonus
 
 
 def _is_promotional_title(title: str) -> bool:
@@ -527,12 +486,20 @@ async def _fetch_papers_impl(query: str) -> list[dict]:
             source = (
                 (primary_location.get("source") or {}) if isinstance(primary_location, dict) else {}
             )
+            best_oa_location = work.get("best_oa_location") or {}
+            open_access = work.get("open_access") or {}
             paper: dict = {
                 "paper_id": work.get("id", ""),
                 "title": title,
                 "abstract": abstract,
                 "publication_year": work.get("publication_year") or 0,
                 "doi": doi,
+                "url": primary_location.get("landing_page_url") if isinstance(primary_location, dict) else "",
+                "pdf_url": primary_location.get("pdf_url") if isinstance(primary_location, dict) else "",
+                "open_access_url": (
+                    best_oa_location.get("pdf_url") if isinstance(best_oa_location, dict) else ""
+                ),
+                "is_open_access": bool(open_access.get("is_oa")) if isinstance(open_access, dict) else False,
                 "cited_by_count": cited_by_count,
                 "type": work_type,
                 "source_name": source.get("display_name") if isinstance(source, dict) else "",
@@ -548,25 +515,21 @@ async def _fetch_papers_impl(query: str) -> list[dict]:
             continue
 
     query_tokens = _tokenize(query)
-    beauty_query = bool(query_tokens & _BEAUTY_SCOPE_TERMS)
     specific_terms = _specific_query_terms(query_tokens)
-    ranked: list[tuple[int, int, int, int, int, dict]] = []
+    ranked: list[tuple[int, int, int, int, dict]] = []
     for paper in papers:
-        score, beauty_overlap, query_overlap, core_overlap, specific_overlap = (
-            _paper_relevance_score(
-                paper,
-                query_tokens,
-                specific_terms,
-                beauty_query,
-            )
+        score, query_overlap, specific_overlap, phrase_bonus = _paper_relevance_score(
+            paper,
+            query_tokens,
+            specific_terms,
         )
-        ranked.append((score, beauty_overlap, query_overlap, core_overlap, specific_overlap, paper))
+        ranked.append((score, query_overlap, specific_overlap, phrase_bonus, paper))
 
     pre_positive_count = len([item for item in ranked if item[0] > 0])
     strict_ranked = [
         item
         for item in ranked
-        if item[0] > 0 and (not beauty_query or item[3] > 0) and (not specific_terms or item[4] > 0)
+        if item[0] > 0 and (not specific_terms or item[2] > 0)
     ]
     positive_ranked = [item for item in ranked if item[0] > 0]
     if len(strict_ranked) >= _TARGET_PAPER_COUNT:
@@ -579,16 +542,16 @@ async def _fetch_papers_impl(query: str) -> list[dict]:
     ranked_pool.sort(
         key=lambda item: (
             item[0],
-            item[4],
-            item[3],
-            int(item[5].get("publication_year") or 0),
-            int(item[5].get("cited_by_count") or 0),
+            item[2],
+            item[1],
+            int(item[4].get("publication_year") or 0),
+            int(item[4].get("cited_by_count") or 0),
         ),
         reverse=True,
     )
 
     selected = (
-        [paper for _, _, _, _, _, paper in ranked_pool[:_TARGET_PAPER_COUNT]]
+        [paper for _, _, _, _, paper in ranked_pool[:_TARGET_PAPER_COUNT]]
         if ranked_pool
         else papers[:_TARGET_PAPER_COUNT]
     )
@@ -596,13 +559,12 @@ async def _fetch_papers_impl(query: str) -> list[dict]:
     filtered_out = [item for item in ranked if item not in ranked_pool][:10]
     filtered_out_samples = [
         {
-            "title": str(item[5].get("title") or "")[:90],
-            "year": int(item[5].get("publication_year") or 0),
+            "title": str(item[4].get("title") or "")[:90],
+            "year": int(item[4].get("publication_year") or 0),
             "score": int(item[0]),
-            "beauty_overlap": int(item[1]),
-            "query_overlap": int(item[2]),
-            "core_overlap": int(item[3]),
-            "specific_overlap": int(item[4]),
+            "query_overlap": int(item[1]),
+            "specific_overlap": int(item[2]),
+            "phrase_bonus": int(item[3]),
         }
         for item in filtered_out[:5]
     ]

@@ -45,11 +45,7 @@ from app.core.metrics import (
     research_tool_calls_total,
 )
 from app.core.paper_schema import normalize_paper_schema
-from app.core.query_policy import (
-    build_query_policy,
-    build_source_query,
-    lexical_entity_coverage,
-)
+from app.core.query_policy import lexical_entity_coverage
 from app.core.redis import get_redis
 from app.kb.retriever import retrieve
 from app.tools.news_perigon import search_perigon
@@ -155,12 +151,21 @@ def _extract_social_insights(kb_results: list[dict]) -> dict:
     This gives synthesis a grounded structure instead of raw caption-only context.
     """
     social_chunks = [
-        c for c in kb_results if c.get("source") in {"social_instagram", "social_tiktok"}
+        c
+        for c in kb_results
+        if c.get("source")
+        in {"social_instagram", "social_tiktok", "social_youtube", "social_reddit", "social_x"}
     ]
     if not social_chunks:
         return {}
 
-    platform_counts: dict[str, int] = {"instagram": 0, "tiktok": 0}
+    platform_counts: dict[str, int] = {
+        "instagram": 0,
+        "tiktok": 0,
+        "youtube": 0,
+        "reddit": 0,
+        "x": 0,
+    }
     creator_counts: dict[str, int] = {}
     top_posts: list[dict] = []
     newest_ts: int | None = None
@@ -169,7 +174,17 @@ def _extract_social_insights(kb_results: list[dict]) -> dict:
     for chunk in social_chunks:
         metadata = chunk.get("metadata") or {}
         source = chunk.get("source")
-        platform = "instagram" if source == "social_instagram" else "tiktok"
+        platform = (
+            "instagram"
+            if source == "social_instagram"
+            else "tiktok"
+            if source == "social_tiktok"
+            else "youtube"
+            if source == "social_youtube"
+            else "reddit"
+            if source == "social_reddit"
+            else "x"
+        )
         platform_counts[platform] += 1
 
         author = (
@@ -252,28 +267,9 @@ def _format_openalex_context(papers: list[dict]) -> str:
     return "\n\n---\n\n".join(parts)
 
 
-def _clean_openalex_query(query: str, intent: dict) -> str:
-    """Build a focused keyword query for academic search APIs from intent or raw query.
-
-    Academic APIs (arXiv, PubMed, Semantic Scholar) do keyword matching, not
-    natural-language understanding.  Sending a full English question sentence like
-    "What are the latest research papers on peptide anti-aging?" causes false-positive
-    matches on stop-words ("research", "papers", "latest") returning completely
-    off-topic results.
-
-    Strategy (in priority order):
-    1. Use intent["entities"] when available — the IntentAgent already extracted the
-       key terms, so "peptide anti-aging" is far cleaner than the full sentence.
-    2. Fall back to stripping question words and common filler from the raw query.
-    3. Append domain-specific boost terms when the domain is beauty/cosmetics and
-       no beauty keywords are present in the query.
-    """
+def _build_academic_query(query: str, intent: dict) -> str:
+    """Build a focused OpenAlex query while stripping meta/filler phrasing."""
     intent = intent or {}
-
-    # ── 1. Use intent entities (primary path) ────────────────────────────────
-    # Strip meta-query terms the IntentAgent sometimes includes as entities
-    # (e.g. "research papers", "latest studies") — these are query type descriptors,
-    # not subject keywords, and will match off-topic academic papers.
     meta_terms = frozenset(
         {
             "research papers",
@@ -292,6 +288,7 @@ def _clean_openalex_query(query: str, intent: dict) -> str:
             "current",
         }
     )
+
     entity_source = (intent.get("must_match_terms") or []) + (intent.get("entities") or [])
     entities: list[str] = [
         e.strip()
@@ -300,7 +297,6 @@ def _clean_openalex_query(query: str, intent: dict) -> str:
     ]
     if entities:
         text = " ".join(entities[:5])
-        # Add domain boost if domain is beauty-adjacent and not already in entities
         lowered = text.lower()
         domain = str(intent.get("domain") or "").lower()
         if domain in {
@@ -312,38 +308,28 @@ def _clean_openalex_query(query: str, intent: dict) -> str:
             text = f"{text} skincare cosmetics"
         return re.sub(r"\s+", " ", text).strip()
 
-    # ── 2. Fallback: strip question words and filler from raw query ───────────
     text = str(query or "")
-    # Remove prompt-injection markers (prior assistant output leaked in)
     for marker in ("\n\nAnswer", "\nAnswer", "\n\nEvidence", "\nEvidence"):
         idx = text.find(marker)
         if idx > 0:
             text = text[:idx]
             break
-
-    # Remove question starters ("What are the", "Tell me about", etc.)
     text = re.sub(
-        r"^(what|which|who|where|when|how|why|tell me|show me|find|list|give me)"
-        r"\s+(are|is|do|does|were|was|the|me|a|an)?\s*",
+        r"^(what|which|who|where|when|how|why|tell me|show me|find|list|give me)",
         "",
         text,
         flags=re.IGNORECASE,
     ).strip()
-
-    # Remove research-query filler that matches off-topic papers via keyword overlap
     text = re.sub(
-        r"\b(latest|recent|newest|current|research\s+papers?|papers?|studies|study"
-        r"|about|regarding|on|for|from|in|a|the)\b\s*",
+        r"\b(are|is|do|does|latest|recent|newest|current|research|papers|paper|studies|study|about|on|for)\b",
         " ",
         text,
         flags=re.IGNORECASE,
-    ).strip()
-
+    )
     text = re.sub(r"\s+", " ", text).strip()
     if len(text) > 220:
         text = text[:220].rstrip()
 
-    # Add domain boost if applicable and not already present
     lowered = text.lower()
     if not any(
         term in lowered for term in {"beauty", "cosmetics", "skincare", "makeup", "fragrance"}
@@ -351,8 +337,17 @@ def _clean_openalex_query(query: str, intent: dict) -> str:
         domain = str(intent.get("domain") or "").lower()
         if domain in {"cosmetics", "beauty_market_intelligence", "fragrance", "skincare"}:
             text = f"{text} skincare cosmetics".strip()
-
     return text
+
+
+def _clean_openalex_query(query: str, intent: dict) -> str:
+    """Compatibility alias for legacy tests/callers."""
+    return _build_academic_query(query, intent)
+
+
+def build_academic_query(query: str, intent: dict) -> str:
+    """Canonical academic query builder used by orchestrator retrieval."""
+    return _build_academic_query(query, intent)
 
 
 def _clean_user_query(query: str) -> str:
@@ -853,23 +848,19 @@ async def run_query(
         relevant_project_ids=relevant_project_ids,
         target_domain=target_domain,
     )
-    query_policy = build_query_policy(cleaned_query, intent)
-    logger.info(
-        "orchestrator.query_policy",
-        must_match_terms=query_policy.must_match_terms,
-        optional_terms=query_policy.optional_terms,
-        domain_terms=query_policy.domain_terms,
-        is_specific=query_policy.is_specific,
-    )
 
     # Step 1a: Route to specialized agents based on intent.
     # Skip specialized routing when target_domain is set — the user wants content
     # from a specific site (e.g. Fragrantica), so domain-filtered web search via
     # Tavily/Exa is more appropriate than Perigon or PatentsView which cannot
     # filter by domain.
-    if query_type == "trend" and not target_domain:
-        # Route to TrendAgent for trend analysis
-        logger.info("orchestrator.routing_to_trend_agent", query=cleaned_query[:80])
+    if query_type in {"trend", "social"} and not target_domain:
+        # Route trend/social queries to TrendAgent for tool-driven analysis.
+        logger.info(
+            "orchestrator.routing_to_trend_agent",
+            query=cleaned_query[:80],
+            query_type=query_type,
+        )
         try:
             trend_agent = _get_trend_agent()
             trend_result = await trend_agent.arun(cleaned_query)
@@ -920,9 +911,7 @@ async def run_query(
     academic_task: asyncio.Task | None = None
     research_query: str = ""
     if openalex_enabled and is_research_query:
-        research_query = build_source_query(query_policy, "openalex") or _clean_openalex_query(
-            cleaned_query, intent
-        )
+        research_query = build_academic_query(cleaned_query, intent)
         logger.info(
             "orchestrator.research.query_cleaned",
             cleaned_query_preview=cleaned_query[:80],
@@ -931,27 +920,25 @@ async def run_query(
         )
 
         async def _run_academic_tools() -> tuple:
-            semantic_query = build_source_query(query_policy, "semantic_scholar")
-            arxiv_query = build_source_query(query_policy, "arxiv")
-            pubmed_query = build_source_query(query_policy, "pubmed")
+            # Use cleaned query directly - no query_policy transformation needed
             return await asyncio.gather(
                 search_semantic_scholar(
-                    semantic_query,
-                    must_match_terms=query_policy.must_match_terms,
-                    domain_terms=query_policy.domain_terms,
-                    query_specificity=query_policy.query_specificity,
+                    research_query,
+                    must_match_terms=intent.get("must_match_terms", []),
+                    domain_terms=intent.get("domain_terms", []),
+                    query_specificity=intent.get("query_specificity", "broad"),
                 ),
                 search_arxiv(
-                    arxiv_query,
-                    must_match_terms=query_policy.must_match_terms,
-                    domain_terms=query_policy.domain_terms,
-                    query_specificity=query_policy.query_specificity,
+                    research_query,
+                    must_match_terms=intent.get("must_match_terms", []),
+                    domain_terms=intent.get("domain_terms", []),
+                    query_specificity=intent.get("query_specificity", "broad"),
                 ),
                 search_pubmed(
-                    pubmed_query,
-                    must_match_terms=query_policy.must_match_terms,
-                    domain_terms=query_policy.domain_terms,
-                    query_specificity=query_policy.query_specificity,
+                    research_query,
+                    must_match_terms=intent.get("must_match_terms", []),
+                    domain_terms=intent.get("domain_terms", []),
+                    query_specificity=intent.get("query_specificity", "broad"),
                 ),
                 return_exceptions=True,
             )
@@ -987,21 +974,23 @@ async def run_query(
         )
         kb_results = None
 
-    # For specific queries, force fallback when KB lexical entity coverage is weak
+    # For specific queries, use intent-based entity matching to force fallback when KB lexical coverage is weak
     # even if cosine similarity crossed threshold.
+    is_specific_query = intent.get("query_specificity") == "specific"
+    must_match_terms = intent.get("must_match_terms", [])
     if (
         kb_results is not None
-        and query_policy.is_specific
-        and query_policy.must_match_terms
+        and is_specific_query
+        and must_match_terms
         and not target_domain
     ):
-        kb_coverage = _max_coverage_for_kb(kb_results, query_policy.must_match_terms)
+        kb_coverage = _max_coverage_for_kb(kb_results, must_match_terms)
         if kb_coverage < settings.QUERY_ENTITY_MATCH_THRESHOLD:
             logger.info(
                 "orchestrator.kb_entity_coverage_below_threshold",
                 coverage=round(kb_coverage, 3),
                 threshold=settings.QUERY_ENTITY_MATCH_THRESHOLD,
-                must_match_terms=query_policy.must_match_terms,
+                must_match_terms=must_match_terms,
             )
             kb_results = None
 
@@ -1026,18 +1015,18 @@ async def run_query(
             # Call all 3 search tools in parallel with fault tolerance
             search_results = await asyncio.gather(
                 search_tavily(
-                    build_source_query(query_policy, "tavily"),
+                    cleaned_query,
                     include_domains=include_domains,
                 ),
                 search_exa(
-                    build_source_query(query_policy, "exa"),
+                    cleaned_query,
                     include_domains=include_domains,
                 ),
                 search_perigon(
-                    build_source_query(query_policy, "perigon"),
-                    must_match_terms=query_policy.must_match_terms,
-                    domain_terms=query_policy.domain_terms,
-                    query_specificity=query_policy.query_specificity,
+                    cleaned_query,
+                    must_match_terms=intent.get("must_match_terms", []),
+                    domain_terms=intent.get("domain_terms", []),
+                    query_specificity=intent.get("query_specificity", "broad"),
                 ),
                 return_exceptions=True,
             )
@@ -1145,7 +1134,7 @@ async def run_query(
                     threshold=settings.EXA_FALLBACK_THRESHOLD,
                 )
                 try:
-                    exa_papers = await search_exa(build_source_query(query_policy, "exa"))
+                    exa_papers = await search_exa(research_query)
                     if exa_papers:
                         research_tool_calls_total.labels(tool="exa").inc()
                         exa_called = True
@@ -1178,10 +1167,10 @@ async def run_query(
                 # consistent fields (publication_year, cited_by_count, doi, paper_id)
                 # regardless of which tool produced each paper.
                 research_papers = normalize_paper_schema(research_papers)
-                if query_policy.is_specific:
+                if is_specific_query:
                     research_papers = _filter_papers_by_entity_coverage(
                         research_papers,
-                        query_policy.must_match_terms,
+                        must_match_terms,
                     )
 
                 # Track deduplication metrics
@@ -1243,7 +1232,13 @@ async def run_query(
             source = chunk.get("source", "unknown")
             score = chunk.get("score", 0)
             metadata = chunk.get("metadata") or {}
-            if source in {"social_instagram", "social_tiktok"}:
+            if source in {
+                "social_instagram",
+                "social_tiktok",
+                "social_youtube",
+                "social_reddit",
+                "social_x",
+            }:
                 likes = _safe_int(metadata.get("like_count") or metadata.get("likes"))
                 views = _safe_int(metadata.get("view_count") or metadata.get("views"))
                 author = (
@@ -1313,10 +1308,10 @@ async def run_query(
             "Cite sources inline using [title](url) markdown link format — "
             "do not add a separate 'Evidence' section or a 'Confidence / Gaps' section."
         )
-        if query_policy.is_specific and query_policy.must_match_terms:
+        if is_specific_query and must_match_terms:
             req_parts.append(
                 "For specific-entity queries, prioritize evidence that explicitly mentions: "
-                + ", ".join(query_policy.must_match_terms)
+                + ", ".join(must_match_terms)
                 + "."
             )
         req_parts.append("Do not include irrelevant general information.")

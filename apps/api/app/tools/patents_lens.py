@@ -97,6 +97,13 @@ async def _search_with_retry(query: str) -> dict | None:
             "sort": [{"date_published": "desc"}],
         }
 
+        # NOTE: Removed restrictive cosmetic-only filter (was lines 100-114).
+        # Previous filter: classification.cpc:A61K8* OR classification.cpc:A61Q*
+        # This was limiting results to cosmetic patents only, missing pharmaceutical,
+        # chemical engineering, and drug delivery patents relevant to queries like
+        # "retinol stabilization encapsulation" which span multiple IPC/CPC classes.
+        # The query terms themselves provide sufficient filtering relevance.
+
         response = await client.post(_BASE_URL, json=payload, headers=headers)
         response.raise_for_status()
         return response.json()

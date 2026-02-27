@@ -120,22 +120,35 @@ footer {
 
 /* Video cards */
 .video-card {
-    background: var(--panel);
+    background: #ffffff !important;
     border-radius: 12px;
     padding: 1rem;
     margin-bottom: 1rem;
     border: 1px solid rgba(132, 102, 136, 0.2);
+    color: #0f172a !important;
+}
+
+.video-card * {
+    color: #0f172a !important;
 }
 
 .paper-card,
 .patent-card,
 .news-card,
 .web-card {
-    background: var(--panel);
+    background: #ffffff !important;
     border: 1px solid rgba(132, 102, 136, 0.2);
     border-radius: 12px;
     padding: 1rem 1.1rem;
     margin-bottom: 0.85rem;
+    color: #0f172a !important;
+}
+
+.paper-card *,
+.patent-card *,
+.news-card *,
+.web-card * {
+    color: #0f172a !important;
 }
 
 .paper-card,
@@ -198,9 +211,10 @@ footer {
     border: 1px solid #e4e8ef;
     border-radius: 14px;
     overflow: hidden;
-    background: #ffffff;
+    background: #ffffff !important;
     margin-bottom: 0.95rem;
     box-shadow: 0 6px 16px rgba(17, 24, 39, 0.06);
+    color: #0f172a !important;
 }
 
 .discover-media-wrap {
@@ -227,13 +241,25 @@ footer {
 
 .discover-card-body {
     padding: 0.75rem 0.8rem 0.82rem;
+    color: #0f172a !important;
+}
+
+.discover-card-body * {
+    color: inherit;
+}
+
+.discover-card p,
+.discover-card span,
+.discover-card small,
+.discover-card strong {
+    color: inherit !important;
 }
 
 .discover-source-pill {
     display: inline-flex;
     align-items: center;
-    background: #f3f7ff;
-    color: #334e75;
+    background: #e8f0ff !important;
+    color: #1e3a5f !important;
     border: 1px solid #d9e5ff;
     border-radius: 999px;
     padding: 0.14rem 0.5rem;
@@ -245,7 +271,7 @@ footer {
 }
 
 .discover-card-title {
-    color: #0f172a;
+    color: #0f172a !important;
     font-size: 0.92rem;
     font-weight: 700;
     line-height: 1.3;
@@ -253,7 +279,7 @@ footer {
 }
 
 .discover-card-title a {
-    color: inherit;
+    color: #0f172a !important;
     text-decoration: none;
 }
 
@@ -263,15 +289,20 @@ footer {
 }
 
 .discover-card-summary {
-    color: #334155;
+    color: #334155 !important;
     font-size: 0.83rem;
     line-height: 1.4;
     margin-bottom: 0.38rem;
 }
 
 .discover-card-meta {
-    color: #64748b;
+    color: #64748b !important;
     font-size: 0.76rem;
+}
+
+.discover-card a,
+.discover-card a:visited {
+    color: #0f172a !important;
 }
 
 .home-topbar {
@@ -703,15 +734,15 @@ footer {
     }
 
     .discover-card-title {
-        color: #0f172a;
+        color: #0f172a !important;
     }
 
     .discover-card-summary {
-        color: #334155;
+        color: #334155 !important;
     }
 
     .discover-card-meta {
-        color: #64748b;
+        color: #64748b !important;
     }
 }
 

@@ -1,5 +1,3 @@
-import logging
-import logging.config
 from contextlib import asynccontextmanager
 
 import structlog
@@ -10,62 +8,11 @@ from app.core.arq import close_arq_pool
 from app.core.auth import verify_internal_token
 from app.core.config import settings
 from app.core.db import close_db_pools, get_db_pool
+from app.core.logging_setup import configure_logging
 from app.core.middleware import RequestIDMiddleware
 from app.core.redis import close_redis, get_redis
 
-# Shared processors used by both structlog and the stdlib logging bridge.
-# Defined once so both pipelines produce identical JSON output.
-_SHARED_PROCESSORS: list = [
-    structlog.contextvars.merge_contextvars,
-    structlog.stdlib.add_log_level,
-    structlog.stdlib.add_logger_name,
-    structlog.processors.TimeStamper(fmt="iso"),
-]
-
-structlog.configure(
-    processors=[
-        *_SHARED_PROCESSORS,
-        structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
-    ],
-    logger_factory=structlog.stdlib.LoggerFactory(),
-    wrapper_class=structlog.stdlib.BoundLogger,
-    cache_logger_on_first_use=True,
-)
-
-# Route ALL stdlib loggers (uvicorn, arq, httpx, asyncpg, …) through structlog
-# so every log line is JSON with the same shape as structlog output.
-logging.config.dictConfig(
-    {
-        "version": 1,
-        "disable_existing_loggers": False,
-        "formatters": {
-            "json": {
-                "()": structlog.stdlib.ProcessorFormatter,
-                "processors": [
-                    structlog.stdlib.ProcessorFormatter.remove_processors_meta,
-                    structlog.processors.JSONRenderer(),
-                ],
-                "foreign_pre_chain": _SHARED_PROCESSORS,
-            }
-        },
-        "handlers": {
-            "default": {
-                "class": "logging.StreamHandler",
-                "formatter": "json",
-            }
-        },
-        "root": {
-            "handlers": ["default"],
-            "level": settings.LOG_LEVEL,
-        },
-        # Silence chatty libs that spam debug logs at INFO level
-        "loggers": {
-            "uvicorn.access": {"level": "INFO"},
-            "uvicorn.error": {"level": "INFO"},
-            "asyncpg": {"level": "WARNING"},
-        },
-    }
-)
+configure_logging(settings.LOG_LEVEL)
 
 logger = structlog.get_logger(__name__)
 

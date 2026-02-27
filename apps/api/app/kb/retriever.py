@@ -101,6 +101,12 @@ async def retrieve(
         # When exclude_papers=True an extra pre-filter clause is added so rows with
         # source = 'paper' are pruned before the KNN scan, not after.
         paper_filter = "AND source != 'paper'" if exclude_papers else ""
+        preference_order = ""
+        if settings.ENABLE_FULLTEXT_RETRIEVAL_PREFERENCE:
+            preference_order = (
+                "CASE WHEN COALESCE(metadata->>'content_level', 'abstract') = 'fulltext' "
+                "THEN 0 ELSE 1 END,"
+            )
         rows = await conn.fetch(
             f"""
             SELECT
@@ -114,7 +120,7 @@ async def retrieve(
             FROM knowledge_chunks
             WHERE project_id = ANY($2::uuid[])
             {paper_filter}
-            ORDER BY embedding <=> $1::vector
+            ORDER BY {preference_order} embedding <=> $1::vector
             LIMIT $3
             """,
             str(query_vector),
@@ -167,5 +173,6 @@ async def retrieve(
         best_score=round(best_score, 3),
         project_count=len(project_ids),
         exclude_papers=exclude_papers,
+        fulltext_preference=settings.ENABLE_FULLTEXT_RETRIEVAL_PREFERENCE,
     )
     return results

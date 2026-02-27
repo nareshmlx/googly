@@ -2,6 +2,7 @@
 
 import asyncio
 from uuid import UUID
+
 from app.core.db import get_db_pool
 
 

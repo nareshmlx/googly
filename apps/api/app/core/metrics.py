@@ -106,3 +106,41 @@ exa_usage_rate = Histogram(
     "Percentage of research queries that triggered Exa (0.0-1.0)",
     buckets=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
 )
+
+# Fulltext enrichment metrics
+fulltext_resolve_total = Counter(
+    "fulltext_resolve_total",
+    "Total fulltext URL resolution attempts",
+    ["source", "status"],  # source: paper|patent, status: success|blocked|failed
+)
+
+fulltext_fetch_total = Counter(
+    "fulltext_fetch_total",
+    "Total fulltext source fetch attempts",
+    ["source", "status"],  # success|timeout|blocked|failed
+)
+
+fulltext_fetch_duration_seconds = Histogram(
+    "fulltext_fetch_duration_seconds",
+    "Fulltext source fetch duration in seconds",
+    ["source"],
+    buckets=[0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0],
+)
+
+fulltext_extract_total = Counter(
+    "fulltext_extract_total",
+    "Total fulltext extraction attempts",
+    ["source", "status"],  # success|empty|unsupported|failed
+)
+
+fulltext_embed_total = Counter(
+    "fulltext_embed_total",
+    "Total fulltext embedding pipeline attempts",
+    ["source", "status"],  # success|failed
+)
+
+fulltext_upsert_total = Counter(
+    "fulltext_upsert_total",
+    "Total fulltext chunk upsert attempts",
+    ["source", "status"],  # success|failed
+)

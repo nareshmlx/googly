@@ -24,6 +24,28 @@ from app.kb.embedder import embed_texts
 logger = structlog.get_logger(__name__)
 
 
+def _normalize_chunk_metadata(metadata: dict, *, chunk_index: int) -> dict:
+    """Normalize chunk metadata contract for abstract/fulltext retrieval/ranking."""
+    normalized = dict(metadata or {})
+    content_level = str(normalized.get("content_level") or "abstract").strip().lower()
+    if content_level not in {"abstract", "fulltext"}:
+        content_level = "abstract"
+    normalized["content_level"] = content_level
+    normalized.setdefault("asset_id", None)
+    normalized.setdefault("section", "document")
+    normalized.setdefault("source_fetcher", str(normalized.get("tool") or "metadata_ingest"))
+
+    page_start = normalized.get("page_start")
+    page_end = normalized.get("page_end")
+    if isinstance(page_start, int) and isinstance(page_end, int):
+        normalized["page_start"] = page_start
+        normalized["page_end"] = page_end
+    else:
+        normalized["page_start"] = chunk_index + 1 if content_level == "fulltext" else None
+        normalized["page_end"] = chunk_index + 1 if content_level == "fulltext" else None
+    return normalized
+
+
 @dataclass
 class RawDocument:
     """One source document to be chunked and ingested into a project KB."""
@@ -59,6 +81,7 @@ async def ingest_documents(documents: list[RawDocument]) -> int:
         for i, chunk in enumerate(chunks):
             # For multi-chunk docs, suffix source_id so the unique constraint works
             chunk_source_id = f"{doc.source_id}:{i}" if doc.source_id else None
+            chunk_metadata = _normalize_chunk_metadata(doc.metadata, chunk_index=i)
             all_chunks.append(
                 (
                     doc.project_id,
@@ -67,7 +90,7 @@ async def ingest_documents(documents: list[RawDocument]) -> int:
                     chunk_source_id,
                     doc.title,
                     chunk,
-                    doc.metadata,
+                    chunk_metadata,
                 )
             )
 

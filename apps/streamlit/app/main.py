@@ -17,7 +17,6 @@ from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import streamlit as st
-import streamlit.components.v1 as components
 
 import _api
 from agent import get_database
@@ -214,6 +213,8 @@ if "projects_loaded" not in st.session_state:
     st.session_state.projects_loaded = False
 if "project_history_loaded" not in st.session_state:
     st.session_state.project_history_loaded = set()
+if "setup_status_last" not in st.session_state:
+    st.session_state.setup_status_last = {}
 
 _apply_theme("Rose Glow")
 
@@ -305,6 +306,15 @@ def _render_create_project_form(
             instagram_enabled = st.checkbox(
                 "Instagram", value=cfg.get("instagram_enabled", True)
             )
+            youtube_enabled = st.checkbox(
+                "YouTube", value=cfg.get("youtube_enabled", True)
+            )
+            reddit_enabled = st.checkbox(
+                "Reddit", value=cfg.get("reddit_enabled", True)
+            )
+            x_enabled = st.checkbox(
+                "X", value=cfg.get("x_enabled", True)
+            )
 
         with col_s2:
             st.markdown("*Research*")
@@ -330,6 +340,13 @@ def _render_create_project_form(
             st.markdown("&nbsp;", unsafe_allow_html=True)
             exa_enabled = st.checkbox("Web (Exa)", value=cfg.get("exa_enabled", True))
 
+        bootstrap_files = st.file_uploader(
+            "Optional bootstrap docs (pdf/docx/txt/md)",
+            type=["pdf", "docx", "txt", "md"],
+            accept_multiple_files=True,
+            key=f"{form_key}_bootstrap_files",
+        )
+
         submitted = st.form_submit_button(submit_label, use_container_width=True)
 
     if not submitted:
@@ -352,6 +369,9 @@ def _render_create_project_form(
             refresh_strategy,
             tiktok_enabled=tiktok_enabled,
             instagram_enabled=instagram_enabled,
+            youtube_enabled=youtube_enabled,
+            reddit_enabled=reddit_enabled,
+            x_enabled=x_enabled,
             papers_enabled=papers_enabled,
             patents_enabled=patents_enabled,
             perigon_enabled=perigon_enabled,
@@ -360,6 +380,17 @@ def _render_create_project_form(
         )
 
     if result:
+        upload_ids: list[str] = []
+        for upload_file in bootstrap_files or []:
+            upload_result = _api.upload_document(
+                result["id"], upload_file.name, upload_file.read()
+            )
+            if upload_result and upload_result.get("upload_id"):
+                upload_ids.append(upload_result["upload_id"])
+
+        with st.spinner("Starting project setup..."):
+            _api.bootstrap_project(result["id"], upload_ids)
+
         st.session_state.selected_project_id = result["id"]
         st.session_state.current_page = "Chat"
         reload_projects()
@@ -603,6 +634,12 @@ if st.session_state.current_page == "Home":
                 source_tags.append("Instagram")
             if proj.get("tiktok_enabled", True):
                 source_tags.append("TikTok")
+            if proj.get("youtube_enabled", True):
+                source_tags.append("YouTube")
+            if proj.get("reddit_enabled", True):
+                source_tags.append("Reddit")
+            if proj.get("x_enabled", True):
+                source_tags.append("X")
             if proj.get("papers_enabled", True):
                 source_tags.append("Papers")
             if proj.get("patents_enabled", True):
@@ -811,6 +848,9 @@ def _normalize_discover_source(source: str | None) -> str:
     return {
         "social_tiktok": "tiktok",
         "social_instagram": "instagram",
+        "social_youtube": "youtube",
+        "social_reddit": "reddit",
+        "social_x": "x",
         "web": "search",
     }.get(raw, raw)
 
@@ -842,6 +882,9 @@ def _discover_source_label(item: dict) -> str:
     labels = {
         "instagram": "Instagram",
         "tiktok": "TikTok",
+        "youtube": "YouTube",
+        "reddit": "Reddit",
+        "x": "X",
         "paper": "Research Paper",
         "patent": "Patent",
         "news": "News",
@@ -854,9 +897,17 @@ def _discover_meta_line(item: dict) -> str:
     """Return compact source-specific metadata line."""
     metadata = item.get("metadata") or {}
     source = item.get("source")
+    published_raw = (
+        item.get("published_at")
+        or metadata.get("published_at")
+        or metadata.get("published_date")
+        or metadata.get("pubDate")
+        or metadata.get("year")
+    )
+    published = str(published_raw)[:10] if published_raw else ""
     if source in {"paper", "patent"}:
         venue = metadata.get("venue") or metadata.get("assignee") or ""
-        year = metadata.get("year") or ""
+        year = metadata.get("year") or published
         citations = metadata.get("citation_count")
         parts = [str(part) for part in (venue, year) if part]
         if citations is not None:
@@ -864,12 +915,12 @@ def _discover_meta_line(item: dict) -> str:
         return " • ".join(parts)
     if source == "news":
         source_name = metadata.get("source_name") or metadata.get("source") or ""
-        published = str(item.get("published_at") or "")[:10]
         return " • ".join([part for part in (source_name, published) if part])
     if source == "search":
         url = item.get("url") or ""
-        return urlparse(url).netloc if url else ""
-    if source in {"instagram", "tiktok"}:
+        domain = urlparse(url).netloc if url else ""
+        return " • ".join([part for part in (domain, published) if part])
+    if source in {"instagram", "tiktok", "youtube"}:
         likes = int(metadata.get("likes") or 0)
         views = int(metadata.get("views") or 0)
         social_stats = []
@@ -877,43 +928,57 @@ def _discover_meta_line(item: dict) -> str:
             social_stats.append(f"{likes:,} likes")
         if views > 0:
             social_stats.append(f"{views:,} views")
+        if published:
+            social_stats.append(published)
         return " • ".join(social_stats)
-    return ""
+    if source == "reddit":
+        score = int(metadata.get("score") or 0)
+        comments = int(metadata.get("comments") or 0)
+        parts = []
+        if score > 0:
+            parts.append(f"{score:,} score")
+        if comments > 0:
+            parts.append(f"{comments:,} comments")
+        if published:
+            parts.append(published)
+        return " • ".join(parts)
+    if source == "x":
+        likes = int(metadata.get("likes") or 0)
+        retweets = int(metadata.get("retweets") or 0)
+        parts = []
+        if likes > 0:
+            parts.append(f"{likes:,} likes")
+        if retweets > 0:
+            parts.append(f"{retweets:,} reposts")
+        if published:
+            parts.append(published)
+        return " • ".join(parts)
+    return published
 
 
-def _render_social_tile_media(item: dict) -> None:
-    """Render fixed-height social media area for video/image cards."""
+def _social_tile_media_html(item: dict) -> str:
+    """Build fixed-height social media HTML so media stays inside the same card block."""
     video_url = item.get("video_url")
     cover_url = item.get("cover_url")
     if video_url:
-        poster_attr = f' poster="{escape(cover_url)}"' if cover_url else ""
-        components.html(
-            f"""
-            <div style="height:228px;border-radius:12px;overflow:hidden;background:#eef2f7;">
-                <video controls preload="metadata"{poster_attr}
-                       style="width:100%;height:228px;object-fit:cover;display:block;background:#000;">
-                    <source src="{escape(video_url)}" type="video/mp4">
-                </video>
-            </div>
-            """,
-            height=236,
-            scrolling=False,
-        )
-        return
+        safe_video_url = escape(video_url)
+        safe_cover_url = escape(cover_url) if cover_url else ""
+        poster_attr = f' poster="{safe_cover_url}"' if safe_cover_url else ""
+        return f"""
+        <div class="discover-media-wrap">
+            <video controls preload="metadata"{poster_attr}
+                   style="width:100%;height:228px;object-fit:cover;display:block;background:#000;">
+                <source src="{safe_video_url}" type="video/mp4">
+            </video>
+        </div>
+        """
     if cover_url:
-        st.markdown(
-            f"""
-            <div class="discover-media-wrap">
-                <img class="discover-media-image" src="{escape(cover_url)}" />
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        return
-    st.markdown(
-        '<div class="discover-media-wrap discover-media-empty">No media</div>',
-        unsafe_allow_html=True,
-    )
+        return f"""
+        <div class="discover-media-wrap">
+            <img class="discover-media-image" src="{escape(cover_url)}" />
+        </div>
+        """
+    return '<div class="discover-media-wrap discover-media-empty">No media</div>'
 
 
 def _render_discover_card(item: dict) -> None:
@@ -921,35 +986,35 @@ def _render_discover_card(item: dict) -> None:
     source_label = _discover_source_label(item)
     title = escape(item.get("title") or "Untitled")
     url = item.get("url")
-    title_html = f'<a href="{escape(url)}" target="_blank">{title}</a>' if url else title
+    title_html = (
+        f'<a href="{escape(url)}" target="_blank" style="color:#0f172a;text-decoration:none;">{title}</a>'
+        if url
+        else title
+    )
     summary = escape((item.get("summary") or "")[:220])
     meta_line = escape(_discover_meta_line(item))
     author = escape(item.get("author") or "")
-
-    st.markdown('<div class="discover-card">', unsafe_allow_html=True)
-    if item.get("source") in {"instagram", "tiktok"}:
-        _render_social_tile_media(item)
+    media_html = ""
+    if item.get("source") in {"instagram", "tiktok", "youtube"}:
+        media_html = _social_tile_media_html(item)
     elif item.get("cover_url"):
-        st.markdown(
-            f"""
-            <div class="discover-media-wrap">
-                <img class="discover-media-image" src="{escape(item['cover_url'])}" />
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    st.markdown(
-        f"""
-        <div class="discover-card-body">
-            <div class="discover-source-pill">{escape(source_label)}</div>
-            <div class="discover-card-title">{title_html}</div>
-            <div class="discover-card-summary">{summary}</div>
-            <div class="discover-card-meta">{author}{' • ' if author and meta_line else ''}{meta_line}</div>
+        media_html = f"""
+        <div class="discover-media-wrap">
+            <img class="discover-media-image" src="{escape(item['cover_url'])}" />
         </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+        """
+    html = (
+        '<div class="discover-card">'
+        f"{media_html}"
+        '<div class="discover-card-body" style="background:#ffffff;color:#0f172a;">'
+        f'<div class="discover-source-pill" style="background:#e8f0ff;color:#1e3a5f;border:1px solid #d9e5ff;">{escape(source_label)}</div>'
+        f'<div class="discover-card-title" style="color:#0f172a;">{title_html}</div>'
+        f'<div class="discover-card-summary" style="color:#334155;">{summary}</div>'
+        f'<div class="discover-card-meta" style="color:#64748b;">{author}{" • " if author and meta_line else ""}{meta_line}</div>'
+        "</div>"
+        "</div>"
     )
+    st.markdown(html, unsafe_allow_html=True)
 
 
 def _render_discover_grid(items: list[dict], *, empty_msg: str) -> None:
@@ -996,6 +1061,22 @@ def _render_ingest_status(status_payload: dict | None) -> None:
         st.success(f"Ingestion complete. {details}".strip())
 
 
+def _maybe_auto_refresh_discover(project_id: str, discover_item_count: int) -> None:
+    """Track discover warm-up conditions without forcing blocking reruns."""
+    setup = _api.get_setup_status(project_id)
+    if setup:
+        st.session_state.setup_status_last[project_id] = setup
+    else:
+        setup = st.session_state.setup_status_last.get(project_id)
+    if not setup:
+        return
+
+    status = str(setup.get("status") or "unknown").strip().lower()
+    non_terminal = {"queued", "running", "pending", "processing"}
+    should_auto_refresh = (discover_item_count == 0) or (status in non_terminal)
+    st.session_state[f"discover_auto_refresh_needed_{project_id}"] = should_auto_refresh
+
+
 # ----------------------------------------------------------------
 # DISCOVER PAGE
 # ----------------------------------------------------------------
@@ -1020,25 +1101,47 @@ if st.session_state.current_page == "Discover":
         with col_sort:
             st.caption("Sorted by backend relevance score")
 
-        ingest_status = _api.get_ingest_status(project_id)
-        _render_ingest_status(ingest_status)
-
         raw_items = _api.get_discover_feed(project_id)
         items = [_to_discover_item(item) for item in raw_items]
 
+        _maybe_auto_refresh_discover(project_id, len(items))
+
+        ingest_status = _api.get_ingest_status(project_id)
+        _render_ingest_status(ingest_status)
+
         if items:
-            social_items = [
-                item for item in items if item.get("source") in ("tiktok", "instagram")
-            ]
+            tiktok_items = [item for item in items if item.get("source") == "tiktok"]
+            instagram_items = [item for item in items if item.get("source") == "instagram"]
+            youtube_items = [item for item in items if item.get("source") == "youtube"]
+            reddit_items = [item for item in items if item.get("source") == "reddit"]
+            x_items = [item for item in items if item.get("source") == "x"]
+            social_items = tiktok_items + instagram_items + youtube_items + reddit_items + x_items
             paper_items = [item for item in items if item.get("source") == "paper"]
             patent_items = [item for item in items if item.get("source") == "patent"]
             news_items = [item for item in items if item.get("source") == "news"]
             web_items = [item for item in items if item.get("source") == "search"]
 
-            tab_all, tab_social, tab_papers, tab_patents, tab_news, tab_web = st.tabs(
+            (
+                tab_all,
+                tab_social,
+                tab_tiktok,
+                tab_instagram,
+                tab_youtube,
+                tab_reddit,
+                tab_x,
+                tab_papers,
+                tab_patents,
+                tab_news,
+                tab_web,
+            ) = st.tabs(
                 [
                     f"All ({len(items)})",
                     f"Social ({len(social_items)})",
+                    f"TikTok ({len(tiktok_items)})",
+                    f"Instagram ({len(instagram_items)})",
+                    f"YouTube ({len(youtube_items)})",
+                    f"Reddit ({len(reddit_items)})",
+                    f"X ({len(x_items)})",
                     f"Papers ({len(paper_items)})",
                     f"Patents ({len(patent_items)})",
                     f"News ({len(news_items)})",
@@ -1054,6 +1157,21 @@ if st.session_state.current_page == "Discover":
                     social_items,
                     empty_msg="No social content yet.",
                 )
+
+            with tab_tiktok:
+                _render_discover_grid(tiktok_items, empty_msg="No TikTok content yet.")
+
+            with tab_instagram:
+                _render_discover_grid(instagram_items, empty_msg="No Instagram content yet.")
+
+            with tab_youtube:
+                _render_discover_grid(youtube_items, empty_msg="No YouTube content yet.")
+
+            with tab_reddit:
+                _render_discover_grid(reddit_items, empty_msg="No Reddit content yet.")
+
+            with tab_x:
+                _render_discover_grid(x_items, empty_msg="No X content yet.")
 
             with tab_papers:
                 _render_discover_grid(

@@ -137,8 +137,8 @@ def _entity_candidates_from_query(query: str) -> list[str]:
 
     raw_tokens = _tokenize(query)
     compact = [tok for tok in raw_tokens if tok not in _QUERY_STOPWORDS and len(tok) >= 3]
-    # Preserve top terms only — avoid flooding must-match with broad language.
-    token_candidates = compact[:3]
+    # Use all token candidates — avoid flooding must-match with broad language.
+    token_candidates = compact
     return _dedupe_keep_order(quoted + token_candidates)
 
 
@@ -193,7 +193,7 @@ def build_query_policy(query: str, intent: dict | None = None) -> QueryPolicy:
         if isinstance(value, str):
             intent_domain_terms.append(_normalize_phrase(value))
     intent_domain_terms = _dedupe_keep_order(intent_domain_terms)
-    domain_terms = intent_domain_terms[:4] if intent_domain_terms else _DOMAIN_CONTEXT_TERMS.get(domain, [])[:3]
+    domain_terms = intent_domain_terms if intent_domain_terms else _DOMAIN_CONTEXT_TERMS.get(domain, [])
     query_type = str(intent.get("query_type") or "general").strip().lower()
     explicit_specific_signals = bool(entity_terms or explicit_must_terms or re.search(r'"[^"]+"', normalized_query))
     query_specificity = _specificity_from_query(normalized_query, intent, explicit_specific_signals)
@@ -201,7 +201,7 @@ def build_query_policy(query: str, intent: dict | None = None) -> QueryPolicy:
     return QueryPolicy(
         original_query=str(query or ""),
         normalized_query=normalized_query,
-        must_match_terms=must_match_terms[:5],
+        must_match_terms=must_match_terms,
         optional_terms=optional_terms,
         domain_terms=domain_terms,
         query_type=query_type or "general",
@@ -212,9 +212,9 @@ def build_query_policy(query: str, intent: dict | None = None) -> QueryPolicy:
 def build_source_query(policy: QueryPolicy, source: str) -> str:
     """Build source-specific query text from a normalized query policy."""
     source_key = str(source or "").strip().lower()
-    must_terms = policy.must_match_terms[:3]
-    optional = policy.optional_terms[:4]
-    domain_terms = policy.domain_terms[:2]
+    must_terms = policy.must_match_terms
+    optional = policy.optional_terms
+    domain_terms = policy.domain_terms
 
     if source_key == "pubmed":
         must_clause = ""

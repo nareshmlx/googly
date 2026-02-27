@@ -22,6 +22,12 @@ class RedisKeys:
     PROJECT_CACHE_VERSION = "cache_version:{project_id}"
     PROJECTS_SUMMARY = "projects_summary:{user_id}"
     PROJECT_INGEST_STATUS = "ingest_status:{project_id}"
+    PROJECT_SETUP_STATUS = "setup_status:{project_id}"
+    FULLTEXT_ASSET_LOCK = "fulltext:asset:lock:{asset_id}"
+    FULLTEXT_ASSET_STATUS = "fulltext:asset:status:{asset_id}"
+    FULLTEXT_ASSET_DEDUP = "fulltext:asset:dedup:{project_id}:{source}:{source_id}:{url_hash}"
+    FULLTEXT_BACKFILL_CURSOR = "fulltext:backfill:cursor:{scope}"
+    FULLTEXT_BACKFILL_PAUSE = "fulltext:backfill:pause"
 
     # Search API cache keys (project-scoped, deterministic SHA256)
     SEARCH_CACHE = "search:cache:{project_id}:{api}:{query_type}:{hash}"
@@ -44,6 +50,11 @@ class RedisTTL(Enum):
     UPLOAD_STAGING = 3600  # 1 hour
     PROJECTS_SUMMARY = 300  # 5 minutes
     PROJECT_INGEST_STATUS = 86400  # 24 hours
+    PROJECT_SETUP_STATUS = 86400  # 24 hours
+    FULLTEXT_ASSET_LOCK = 900  # 15 minutes
+    FULLTEXT_ASSET_STATUS = 86400  # 24 hours
+    FULLTEXT_ASSET_DEDUP = 604800  # 7 days
+    FULLTEXT_BACKFILL_CURSOR = 604800  # 7 days
 
     # Search API cache TTLs (query type-specific for freshness)
     SEARCH_CACHE_NEWS = 3600  # 1 hour (news changes frequently)

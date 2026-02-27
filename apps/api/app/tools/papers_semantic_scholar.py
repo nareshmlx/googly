@@ -52,8 +52,9 @@ def _build_semantic_query(
     domain_terms = [str(term).strip() for term in (domain_terms or []) if str(term).strip()]
     if not must_match_terms:
         return query
-    parts = [f'"{term}"' for term in must_match_terms[:3]]
-    parts.extend(domain_terms[:2])
+    # Use all must_match_terms with OR logic (no limit)
+    parts = [f'"{term}"' for term in must_match_terms]
+    parts.extend(f'"{term}"' for term in domain_terms)
     return " ".join(parts).strip()
 
 
@@ -255,7 +256,7 @@ async def search_semantic_scholar(
         logger.debug("search_semantic_scholar.no_api_key", message="Using free tier limits")
 
     # Sanitize and normalize query BEFORE cache key generation (prevents cache key collision)
-    query = query.strip().lower()
+    query = query.strip()
     if not query:
         logger.warning("search_semantic_scholar.empty_query")
         return []

@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     Column,
@@ -58,10 +59,14 @@ class Project(Base):
     kb_chunk_count = Column(Integer, nullable=False, server_default="0")
     tiktok_enabled = Column(Boolean, nullable=False, server_default="true")
     instagram_enabled = Column(Boolean, nullable=False, server_default="true")
+    youtube_enabled = Column(Boolean, nullable=False, server_default="true")
+    reddit_enabled = Column(Boolean, nullable=False, server_default="true")
+    x_enabled = Column(Boolean, nullable=False, server_default="true")
     papers_enabled = Column(Boolean, nullable=False, server_default="true")
     perigon_enabled = Column(Boolean, nullable=False, server_default="true")
     tavily_enabled = Column(Boolean, nullable=False, server_default="true")
     exa_enabled = Column(Boolean, nullable=False, server_default="true")
+    metadata = Column(JSONB, nullable=False, server_default="{}")
     patents_enabled = Column(Boolean, nullable=False, server_default="true")
     intent_embedding = Column(Vector(dim=1536), nullable=True)  # type: ignore[var-annotated]
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False)
@@ -78,6 +83,9 @@ class Project(Base):
     )
     chat_messages = relationship(
         "ChatMessage", back_populates="project", cascade="all, delete-orphan"
+    )
+    source_assets = relationship(
+        "KnowledgeSourceAsset", back_populates="project", cascade="all, delete-orphan"
     )
 
     __table_args__ = (
@@ -150,4 +158,59 @@ class ChatMessage(Base):
         ),
         Index("ix_chat_messages_project_session_created", "project_id", "session_id", "created_at"),
         Index("ix_chat_messages_user_project_created", "user_id", "project_id", "created_at"),
+    )
+
+
+class KnowledgeSourceAsset(Base):
+    """Tracks fulltext asset fetch/extract lifecycle for paper/patent enrichment."""
+
+    __tablename__ = "knowledge_source_assets"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+    project_id = Column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id = Column(Text, nullable=False)
+    source = Column(String(50), nullable=False)
+    source_id = Column(Text, nullable=False)
+    title = Column(Text, nullable=False, server_default="")
+    source_url = Column(Text, nullable=False)
+    resolved_url = Column(Text, nullable=False)
+    canonical_url = Column(Text, nullable=False)
+    asset_type = Column(String(32), nullable=False, server_default="pdf")
+    mime_type = Column(String(255), nullable=False, server_default="")
+    blob_path = Column(Text, nullable=False, server_default="")
+    checksum_sha256 = Column(String(64), nullable=False, server_default="")
+    byte_size = Column(BigInteger, nullable=False, server_default="0")
+    fetch_status = Column(String(32), nullable=False, server_default="pending")
+    extract_status = Column(String(32), nullable=False, server_default="pending")
+    error_code = Column(String(128), nullable=True)
+    error_message = Column(Text, nullable=True)
+    attempt_count = Column(Integer, nullable=False, server_default="0")
+    next_attempt_at = Column(DateTime(timezone=True), nullable=True)
+    last_attempt_at = Column(DateTime(timezone=True), nullable=True)
+    extracted_chars = Column(Integer, nullable=False, server_default="0")
+    extracted_pages = Column(Integer, nullable=False, server_default="0")
+    metadata = Column(JSONB, nullable=False, server_default="{}")
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        nullable=False,
+    )
+
+    project = relationship("Project", back_populates="source_assets")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            "source",
+            "source_id",
+            "canonical_url",
+            name="uq_ksa_project_source_sourceid_canonical",
+        ),
+        Index("ix_ksa_fetch_status", "fetch_status"),
+        Index("ix_ksa_next_attempt_at", "next_attempt_at"),
+        Index("ix_ksa_project_source", "project_id", "source"),
     )

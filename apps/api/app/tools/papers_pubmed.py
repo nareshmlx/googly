@@ -57,11 +57,13 @@ def _build_pubmed_query(
     domain_terms = [str(term).strip() for term in (domain_terms or []) if str(term).strip()]
     if not must_match_terms:
         return query
-    must_expr = " OR ".join(f'"{term}"[Title/Abstract]' for term in must_match_terms[:3])
+    # Use all must_match_terms with OR logic (no limit)
+    must_expr = " OR ".join(f'"{term}"[Title/Abstract]' for term in must_match_terms)
     must_clause = f"({must_expr})"
     if not domain_terms:
         return must_clause
-    domain_expr = " OR ".join(f'"{term}"[Title/Abstract]' for term in domain_terms[:2])
+    # Use all domain_terms with OR logic (no limit)
+    domain_expr = " OR ".join(f'"{term}"[Title/Abstract]' for term in domain_terms)
     return f"{must_clause} AND ({domain_expr})"
 
 

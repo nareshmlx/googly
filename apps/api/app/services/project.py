@@ -7,19 +7,22 @@ the ARQ pool. Intent extraction goes through app.kb.intent_extractor.
 
 import asyncio
 import json
+import re
 from datetime import UTC, datetime
+from hashlib import sha256
 
 import structlog
 from arq import ArqRedis
-from openai import AsyncOpenAI
 
 from app.core.config import settings
 from app.core.constants import RedisKeys, RedisTTL
 from app.core.db import get_db_pool
+from app.core.openai_client import get_openai_client
 from app.core.redis import get_redis
 from app.kb.embedder import embed_texts
 from app.kb.intent_extractor import extract_intent
 from app.repositories import project as project_repo
+from app.repositories import source_asset as source_asset_repo
 
 logger = structlog.get_logger(__name__)
 
@@ -45,6 +48,8 @@ async def set_project_ingest_status(
     job_id: str | None = None,
     total_chunks: int | None = None,
     source_counts: dict | None = None,
+    source_diagnostics: dict | None = None,
+    fulltext_enqueued: int = 0,
 ) -> None:
     """Persist project ingest status in Redis for API/UI visibility."""
     payload = {
@@ -58,6 +63,8 @@ async def set_project_ingest_status(
         "job_id": job_id,
         "total_chunks": total_chunks,
         "source_counts": source_counts or {},
+        "source_diagnostics": source_diagnostics or {},
+        "fulltext_enqueued": int(fulltext_enqueued),
     }
     try:
         redis = await get_redis()
@@ -70,10 +77,11 @@ async def set_project_ingest_status(
 async def get_project_ingest_status(project_id: str) -> dict:
     """Read project ingest status from Redis with a DB-backed fallback."""
     redis_payload: dict | None = None
+    redis_client = None
+    status_key = RedisKeys.PROJECT_INGEST_STATUS.format(project_id=project_id)
     try:
-        redis = await get_redis()
-        key = RedisKeys.PROJECT_INGEST_STATUS.format(project_id=project_id)
-        raw = await redis.get(key)
+        redis_client = await get_redis()
+        raw = await redis_client.get(status_key)
         if raw:
             parsed = json.loads(raw)
             if isinstance(parsed, dict):
@@ -94,6 +102,7 @@ async def get_project_ingest_status(project_id: str) -> dict:
     kb_chunk_count = int(row.get("kb_chunk_count") or 0)
     refreshed = row.get("last_refreshed_at")
     refreshed_at = refreshed.isoformat() if refreshed else None
+    enrichment = await source_asset_repo.fetch_project_enrichment_counts(pool, project_id)
 
     if redis_payload:
         if kb_chunk_count > 0 and redis_payload.get("status") in {"queued", "running", "empty"}:
@@ -101,8 +110,40 @@ async def get_project_ingest_status(project_id: str) -> dict:
             redis_payload["total_chunks"] = kb_chunk_count
             redis_payload["finished_at"] = refreshed_at or redis_payload.get("finished_at")
             redis_payload["message"] = "Ingestion complete."
+        elif (
+            redis_payload.get("status") in {"queued", "running"}
+            and redis_client is not None
+            and str(redis_payload.get("job_id") or "").strip()
+        ):
+            job_id = str(redis_payload.get("job_id") or "").strip()
+            try:
+                if await redis_client.exists(f"arq:result:{job_id}"):
+                    now = datetime.now(UTC).isoformat()
+                    redis_payload["status"] = "empty"
+                    redis_payload["total_chunks"] = 0
+                    redis_payload["finished_at"] = (
+                        redis_payload.get("finished_at")
+                        or refreshed_at
+                        or now
+                    )
+                    redis_payload["updated_at"] = now
+                    redis_payload["message"] = (
+                        "Ingestion finished with no documents. Check source API connectivity/keys."
+                    )
+                    await redis_client.setex(
+                        status_key,
+                        RedisTTL.PROJECT_INGEST_STATUS.value,
+                        json.dumps(redis_payload),
+                    )
+            except Exception:
+                logger.warning(
+                    "project_service.ingest_status_arq_result_check_failed",
+                    project_id=project_id,
+                )
         redis_payload.setdefault("project_id", project_id)
         redis_payload.setdefault("source_counts", {})
+        redis_payload.setdefault("source_diagnostics", {})
+        redis_payload["enrichment"] = enrichment
         return redis_payload
 
     return {
@@ -116,7 +157,150 @@ async def get_project_ingest_status(project_id: str) -> dict:
         "job_id": None,
         "total_chunks": kb_chunk_count if kb_chunk_count > 0 else None,
         "source_counts": {},
+        "source_diagnostics": {},
+        "enrichment": enrichment,
     }
+
+
+def _canonicalize_upload_ids(upload_ids: list[str] | None) -> list[str]:
+    """Normalize upload IDs to deterministic sorted unique strings."""
+    values = [str(value).strip() for value in (upload_ids or []) if str(value).strip()]
+    return sorted(set(values))
+
+
+def _upload_signature(upload_ids: list[str]) -> str:
+    """Compute stable signature for idempotent bootstrap runs."""
+    if not upload_ids:
+        return ""
+    payload = "|".join(upload_ids)
+    return sha256(payload.encode("utf-8")).hexdigest()
+
+
+async def set_project_setup_status(
+    project_id: str,
+    *,
+    status: str,
+    phase: str,
+    progress_percent: int,
+    message: str | None = None,
+    error: str | None = None,
+    upload_ids: list[str] | None = None,
+    upload_signature: str = "",
+    job_id: str | None = None,
+) -> dict:
+    """Persist project bootstrap/setup status to Redis and project metadata."""
+    canonical_upload_ids = _canonicalize_upload_ids(upload_ids)
+    payload = {
+        "project_id": project_id,
+        "status": status,
+        "phase": phase,
+        "progress_percent": max(0, min(100, int(progress_percent))),
+        "message": message,
+        "updated_at": datetime.now(UTC).isoformat(),
+        "error": error,
+        "upload_ids": canonical_upload_ids,
+        "upload_signature": upload_signature,
+        "job_id": job_id,
+    }
+    try:
+        redis = await get_redis()
+        key = RedisKeys.PROJECT_SETUP_STATUS.format(project_id=project_id)
+        await redis.setex(key, RedisTTL.PROJECT_SETUP_STATUS.value, json.dumps(payload))
+    except Exception:
+        logger.warning("project_service.setup_status_set_redis_failed", project_id=project_id)
+
+    try:
+        pool = await get_db_pool()
+        await project_repo.update_project_setup_status_metadata(pool, project_id, payload)
+    except Exception:
+        logger.warning("project_service.setup_status_set_metadata_failed", project_id=project_id)
+    return payload
+
+
+async def get_project_setup_status(project_id: str) -> dict:
+    """Read project setup status from Redis with metadata fallback."""
+    try:
+        redis = await get_redis()
+        raw = await redis.get(RedisKeys.PROJECT_SETUP_STATUS.format(project_id=project_id))
+        if raw:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+    except Exception:
+        logger.warning("project_service.setup_status_get_redis_failed", project_id=project_id)
+
+    try:
+        pool = await get_db_pool()
+        row = await project_repo.fetch_project_by_id(pool, project_id)
+        if not row:
+            return {
+                "project_id": project_id,
+                "status": "not_found",
+                "phase": "unknown",
+                "progress_percent": 0,
+                "message": "Project not found",
+                "upload_ids": [],
+                "upload_signature": "",
+                "job_id": None,
+            }
+        metadata = row.get("metadata") or {}
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except json.JSONDecodeError:
+                metadata = {}
+        setup = metadata.get("setup_status") if isinstance(metadata, dict) else None
+        if isinstance(setup, dict):
+            return setup
+    except Exception:
+        logger.warning("project_service.setup_status_get_metadata_failed", project_id=project_id)
+
+    return {
+        "project_id": project_id,
+        "status": "unknown",
+        "phase": "pending",
+        "progress_percent": 0,
+        "message": "No setup status found.",
+        "upload_ids": [],
+        "upload_signature": "",
+        "job_id": None,
+    }
+
+
+async def enqueue_project_bootstrap(
+    *,
+    project_id: str,
+    user_id: str,
+    upload_ids: list[str] | None,
+    arq_pool: ArqRedis,
+) -> dict:
+    """Enqueue bootstrap setup task with idempotency for active runs."""
+    canonical_upload_ids = _canonicalize_upload_ids(upload_ids)
+    signature = _upload_signature(canonical_upload_ids)
+    current = await get_project_setup_status(project_id)
+    current_status = str(current.get("status") or "").lower()
+    current_signature = str(current.get("upload_signature") or "")
+
+    if current_status in {"queued", "running"} and current_signature == signature:
+        return current
+
+    job = await arq_pool.enqueue_job(
+        "bootstrap_project_setup",
+        project_id,
+        user_id,
+        canonical_upload_ids,
+    )
+    payload = await set_project_setup_status(
+        project_id,
+        status="queued",
+        phase="queued",
+        progress_percent=0,
+        message="Project setup queued.",
+        upload_ids=canonical_upload_ids,
+        upload_signature=signature,
+        job_id=str(getattr(job, "job_id", "") or ""),
+    )
+    return payload
 
 
 async def _expand_description(description: str) -> str:
@@ -126,7 +310,7 @@ async def _expand_description(description: str) -> str:
     Returns the original description when expansion fails, so project creation
     remains resilient.
     """
-    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    client = get_openai_client()
 
     try:
         response = await client.chat.completions.create(
@@ -178,6 +362,9 @@ async def create_project(
     arq_pool: ArqRedis,
     tiktok_enabled: bool = True,
     instagram_enabled: bool = True,
+    youtube_enabled: bool = True,
+    reddit_enabled: bool = True,
+    x_enabled: bool = True,
     papers_enabled: bool = True,
     patents_enabled: bool = True,
     perigon_enabled: bool = True,
@@ -211,6 +398,9 @@ async def create_project(
         refresh_strategy,
         tiktok_enabled=tiktok_enabled,
         instagram_enabled=instagram_enabled,
+        youtube_enabled=youtube_enabled,
+        reddit_enabled=reddit_enabled,
+        x_enabled=x_enabled,
         papers_enabled=papers_enabled,
         patents_enabled=patents_enabled,
         perigon_enabled=perigon_enabled,
@@ -246,16 +436,21 @@ async def create_project(
             timeout_seconds=settings.PROJECT_CREATE_INTENT_TIMEOUT,
         )
         fallback = description[:200]
+        fallback_terms = [token.lower() for token in re.findall(r"[a-zA-Z0-9]+", fallback) if len(token) >= 4]
+        fallback_terms = list(dict.fromkeys(fallback_terms))[:6]
+        fallback_tiktok = " ".join(f"#{token}" for token in fallback_terms[:4]).strip()
+        fallback_instagram = " ".join(fallback_terms[:3]).strip()
+        fallback_domain = "_".join(fallback_terms[:3]) or "general"
         intent = {
-            "domain": "beauty_market_intelligence",
+            "domain": fallback_domain,
             "keywords": [token for token in fallback.split()[:8] if token.strip()],
             "search_filters": {
                 "news": fallback,
                 "papers": fallback,
                 "patents": fallback,
-                "tiktok": "",
-                "social": "",
-                "instagram": "",
+                "tiktok": fallback_tiktok,
+                "social": fallback_tiktok,
+                "instagram": fallback_instagram,
             },
             "confidence": 0.0,
         }
@@ -338,6 +533,9 @@ async def get_discover_feed(project_id: str) -> list[dict]:
         total=len(rows),
         instagram=sum(1 for r in rows if r["source"] == "social_instagram"),
         tiktok=sum(1 for r in rows if r["source"] == "social_tiktok"),
+        youtube=sum(1 for r in rows if r["source"] == "social_youtube"),
+        reddit=sum(1 for r in rows if r["source"] == "social_reddit"),
+        x=sum(1 for r in rows if r["source"] == "social_x"),
     )
     return rows
 

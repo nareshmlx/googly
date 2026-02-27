@@ -4,7 +4,7 @@ Called immediately after project creation via ARQ enqueue.
 Also re-used by refresh_project for subsequent refreshes.
 
 Supports independently toggleable ingestion sources per project:
-  - Social: Instagram, TikTok
+  - Social: Instagram, TikTok, YouTube, Reddit, X
   - Papers: OpenAlex, Semantic Scholar, PubMed, arXiv
   - Patents: PatentsView, Lens
   - Discovery: Perigon news, Tavily web, Exa web
@@ -20,17 +20,20 @@ from datetime import UTC, datetime, timedelta
 
 import numpy as np
 import structlog
-from openai import AsyncOpenAI
 
 from app.core.cache_version import bump_project_cache_version
 from app.core.config import settings
 from app.core.constants import RedisKeys, RedisTTL
 from app.core.db import get_db_pool
-from app.core.query_policy import build_query_policy, build_source_query, lexical_entity_coverage
+from app.core.metrics import fulltext_resolve_total
+from app.core.openai_client import get_openai_client
+from app.core.query_policy import lexical_entity_coverage
 from app.core.redis import get_redis
 from app.kb.embedder import embed_texts
 from app.kb.ingester import RawDocument, ingest_documents
 from app.repositories import project as project_repo
+from app.repositories import source_asset as source_asset_repo
+from app.services.fulltext_resolver import resolve_fulltext_url
 from app.tools.news_perigon import search_perigon
 from app.tools.papers_arxiv import search_arxiv
 from app.tools.papers_openalex import fetch_papers
@@ -45,7 +48,10 @@ from app.tools.social_instagram import (
     instagram_search,
     instagram_user_reels,
 )
+from app.tools.social_reddit import search_reddit_posts
 from app.tools.social_tiktok import fetch_tiktok_posts
+from app.tools.social_x import search_x_posts
+from app.tools.social_youtube import search_youtube_videos
 
 logger = structlog.get_logger(__name__)
 
@@ -60,27 +66,157 @@ RELEVANCE_MIN_STAGE2_KEEP_BY_SOURCE: dict[str, int] = {
     "paper": 6,
     "patent": 4,
 }
-
+RELEVANCE_MIN_STAGE2_KEEP_SOCIAL = 6
+SOCIAL_SOURCES: frozenset[str] = frozenset(
+    {
+        "social_tiktok",
+        "social_instagram",
+        "social_youtube",
+        "social_reddit",
+        "social_x",
+    }
+)
 
 async def _noop() -> list[RawDocument]:
     """Return an empty source result for disabled gather slots."""
     return []
 
 
-async def _run_source_with_timeout(source: str, coro) -> list[RawDocument]:
+async def _run_source_with_timeout(
+    source: str,
+    coro,
+    *,
+    timeout_seconds: float | None = None,
+) -> list[RawDocument]:
     """Run one source ingest with timeout and fail-open behavior."""
+    timeout = float(timeout_seconds or settings.INGEST_SOURCE_TIMEOUT)
     try:
-        return await asyncio.wait_for(coro, timeout=settings.INGEST_SOURCE_TIMEOUT)
+        return await asyncio.wait_for(coro, timeout=timeout)
     except TimeoutError:
         logger.warning(
             "ingest_tool.timeout",
             source=source,
-            timeout_seconds=settings.INGEST_SOURCE_TIMEOUT,
+            timeout_seconds=timeout,
         )
         return []
     except Exception as exc:
         logger.warning("ingest_tool.failed", source=source, error=str(exc))
         return []
+
+
+def _dedupe_social_docs(docs: list[RawDocument]) -> list[RawDocument]:
+    """Deduplicate social documents by (source, source_id) while preserving order."""
+    out: list[RawDocument] = []
+    seen: set[tuple[str, str]] = set()
+    for doc in docs:
+        source = str(doc.source or "").strip()
+        source_id = str(doc.source_id or "").strip()
+        if not source_id:
+            continue
+        key = (source, source_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(doc)
+    return out
+
+
+def _social_web_domain_tokens(source: str) -> tuple[str, ...]:
+    """Return domain tokens used to validate web-fallback URLs per social source."""
+    return {
+        "social_youtube": ("youtube.com/", "youtu.be/"),
+        "social_reddit": ("reddit.com/r/", "reddit.com/comments/"),
+        "social_x": ("x.com/", "twitter.com/"),
+        "social_instagram": ("instagram.com/reel/", "instagram.com/p/"),
+        "social_tiktok": ("tiktok.com/",),
+    }.get(source, ())
+
+
+def _social_web_query(source: str, base_query: str) -> str:
+    """Build a site-constrained web query for social fallback retrieval."""
+    q = str(base_query or "").strip()
+    if source == "social_youtube":
+        return f"{q} site:youtube.com"
+    if source == "social_reddit":
+        return f"{q} site:reddit.com/r"
+    if source == "social_x":
+        return f"{q} (site:x.com OR site:twitter.com)"
+    if source == "social_instagram":
+        return f"{q} site:instagram.com/reel"
+    if source == "social_tiktok":
+        return f"{q} site:tiktok.com"
+    return q
+
+
+async def _social_web_fallback_docs(
+    *,
+    source: str,
+    project_id: str,
+    user_id: str,
+    query: str,
+    keep_limit: int,
+) -> list[RawDocument]:
+    """Fallback social ingestion from web search when native social APIs return no rows."""
+    constrained_query = _social_web_query(source, query)
+    if not constrained_query:
+        return []
+
+    candidates: list[dict] = []
+    try:
+        candidates.extend(await search_exa(constrained_query))
+    except Exception:
+        logger.exception("social_web_fallback.exa_failed", source=source, project_id=project_id)
+    try:
+        candidates.extend(await search_tavily(constrained_query))
+    except Exception:
+        logger.exception("social_web_fallback.tavily_failed", source=source, project_id=project_id)
+
+    domain_tokens = _social_web_domain_tokens(source)
+    docs: list[RawDocument] = []
+    seen_urls: set[str] = set()
+    for row in candidates:
+        url = str(row.get("url") or "").strip()
+        if not url:
+            continue
+        lowered_url = url.lower()
+        if domain_tokens and not any(token in lowered_url for token in domain_tokens):
+            continue
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+
+        title = str(row.get("title") or "").strip() or "Social result"
+        content = str(row.get("content") or row.get("snippet") or "").strip()
+        if not content:
+            continue
+        docs.append(
+            RawDocument(
+                project_id=project_id,
+                user_id=user_id,
+                source=source,
+                source_id=url,
+                title=title[:240],
+                content=content[:2000],
+                metadata={
+                    "platform": source.removeprefix("social_"),
+                    "url": url,
+                    "published_at": row.get("published_date") or "",
+                    "tool": f"{row.get('tool') or 'web'}_social_fallback",
+                },
+            )
+        )
+        if len(docs) >= max(1, keep_limit):
+            break
+
+    logger.info(
+        "social_web_fallback.done",
+        source=source,
+        project_id=project_id,
+        query_preview=constrained_query[:100],
+        candidate_count=len(candidates),
+        doc_count=len(docs),
+    )
+    return docs
 
 
 async def _set_ingest_status(
@@ -94,6 +230,8 @@ async def _set_ingest_status(
     updated_at: str | None = None,
     finished_at: str | None = None,
     source_counts: dict | None = None,
+    source_diagnostics: dict | None = None,
+    fulltext_enqueued: int = 0,
     total_chunks: int | None = None,
 ) -> None:
     """Persist ingest lifecycle status for API/UI visibility."""
@@ -106,6 +244,8 @@ async def _set_ingest_status(
         "updated_at": updated_at or datetime.now(UTC).isoformat(),
         "finished_at": finished_at,
         "source_counts": source_counts or {},
+        "source_diagnostics": source_diagnostics or {},
+        "fulltext_enqueued": int(fulltext_enqueued),
         "total_chunks": total_chunks,
     }
     try:
@@ -160,20 +300,170 @@ def _relevance_item_text(item: dict) -> str:
     return text or "untitled"
 
 
+def _clean_term_values(values: list[str] | None) -> list[str]:
+    """Normalize term strings while preserving order and uniqueness."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values or []:
+        cleaned = str(value or "").strip().lower()
+        if not cleaned:
+            continue
+        if cleaned in seen:
+            continue
+        seen.add(cleaned)
+        out.append(cleaned)
+    return out
+
+
+async def _filter_social_strict(
+    items: list[dict],
+    intent_text: str,
+    *,
+    source: str,
+    must_match_terms: list[str] | None = None,
+    social_match_terms: list[str] | None = None,
+) -> list[dict]:
+    """
+    Strict deterministic relevance gate for social content.
+
+    Rules:
+    - For specific queries (must_match_terms present), item text must pass lexical entity coverage.
+    - For all social queries, item text must pass minimum embedding similarity.
+    - If embedding fails, keep only lexical-pass items (never broad fail-open for social).
+    """
+    if not items:
+        return items
+
+    must_terms = _clean_term_values(must_match_terms)
+    if not must_terms:
+        must_terms = _clean_term_values(social_match_terms)
+    required_term_hits = _required_must_match_count(must_terms)
+    lexical_pass: list[dict] = []
+    min_coverage = 0.0
+    if must_terms:
+        min_coverage = required_term_hits / max(1, len(must_terms))
+    for item in items:
+        text = _relevance_item_text(item)
+        if must_terms:
+            coverage = lexical_entity_coverage(text, must_terms)
+            if coverage < min_coverage:
+                continue
+        lexical_pass.append(item)
+
+    if not lexical_pass:
+        logger.info(
+            "relevance_filter.social_lexical",
+            source=source,
+            kept=0,
+            total=len(items),
+            must_term_count=len(must_terms),
+        )
+        return []
+
+    try:
+        intent_embeddings = await embed_texts([intent_text])
+        if not intent_embeddings:
+            return lexical_pass
+        intent_arr = np.array(intent_embeddings[0], dtype=float)
+        intent_norm = float(np.linalg.norm(intent_arr))
+        if intent_norm <= 0:
+            return lexical_pass
+
+        texts = [_relevance_item_text(item) for item in lexical_pass]
+        item_embeddings = await embed_texts(texts)
+        if len(item_embeddings) != len(lexical_pass):
+            logger.warning(
+                "relevance_filter.social_embedding_mismatch",
+                source=source,
+                expected=len(lexical_pass),
+                actual=len(item_embeddings),
+            )
+            return lexical_pass
+
+        kept: list[dict] = []
+        for item, embedding in zip(lexical_pass, item_embeddings, strict=False):
+            item_arr = np.array(embedding, dtype=float)
+            denom = intent_norm * float(np.linalg.norm(item_arr))
+            if denom <= 0:
+                continue
+            score = float(np.dot(intent_arr, item_arr) / denom)
+            if score < settings.SOCIAL_RELEVANCE_MIN_SIMILARITY:
+                continue
+            item["_social_similarity"] = round(score, 6)
+            kept.append(item)
+
+        logger.info(
+            "relevance_filter.social_strict",
+            source=source,
+            kept=len(kept),
+            lexical_kept=len(lexical_pass),
+            total=len(items),
+            min_similarity=settings.SOCIAL_RELEVANCE_MIN_SIMILARITY,
+        )
+        if not kept:
+            fallback_keep = min(RELEVANCE_MIN_STAGE2_KEEP_SOCIAL, len(lexical_pass))
+            logger.info(
+                "relevance_filter.social_similarity_fallback",
+                source=source,
+                lexical_kept=len(lexical_pass),
+                fallback_keep=fallback_keep,
+                min_similarity=settings.SOCIAL_RELEVANCE_MIN_SIMILARITY,
+            )
+            return lexical_pass[:fallback_keep]
+        try:
+            stage2_social = await _filter_stage2_llm_social(
+                kept,
+                intent_text=intent_text,
+                source=source,
+                must_match_terms=must_terms,
+            )
+            min_keep = min(RELEVANCE_MIN_STAGE2_KEEP_SOCIAL, len(kept))
+            if len(stage2_social) < min_keep:
+                logger.info(
+                    "relevance_filter.stage2_social_min_fallback",
+                    source=source,
+                    llm_kept=len(stage2_social),
+                    min_keep=min_keep,
+                )
+                ranked_kept = sorted(
+                    kept,
+                    key=lambda item: float(item.get("_social_similarity", 0.0)),
+                    reverse=True,
+                )
+                return ranked_kept[:min_keep]
+            return stage2_social
+        except Exception:
+            logger.exception("relevance_filter.stage2_social_failed", source=source)
+            return kept
+    except Exception:
+        logger.exception(
+            "relevance_filter.social_embedding_failed",
+            source=source,
+            lexical_kept=len(lexical_pass),
+        )
+        return lexical_pass
+
+
 async def _filter_relevance(
     items: list[dict],
     intent_text: str,
     source: str,
     redis,
     must_match_terms: list[str] | None = None,
+    social_match_terms: list[str] | None = None,
 ) -> list[dict]:
     """Apply two-stage relevance filtering with fail-open behavior."""
     if not items:
         return items
 
-    if source in {"social_tiktok", "social_instagram"}:
-        logger.info("relevance_filter.skipped_social", source=source, total=len(items))
-        return items
+    if source in SOCIAL_SOURCES:
+        return await _filter_social_strict(
+            items,
+            intent_text,
+            source=source,
+            must_match_terms=must_match_terms,
+            social_match_terms=social_match_terms,
+        )
 
     filtered = items
     try:
@@ -279,7 +569,7 @@ async def _filter_stage2_llm(
     if not items:
         return items
 
-    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    client = get_openai_client()
     kept_items: list[dict] = []
 
     for batch_start in range(0, len(items), RELEVANCE_STAGE2_BATCH_SIZE):
@@ -358,8 +648,8 @@ async def _filter_stage2_llm(
                     continue
                 if must_terms:
                     text = f"{item.get('title', '')} {item.get('abstract', '')} {item.get('content', '')}"
-                    coverage = lexical_entity_coverage(text, must_terms)
-                    if coverage < settings.QUERY_ENTITY_MATCH_THRESHOLD:
+                    lexical_match = int(_match_count(text, set(_clean_term_values(must_terms))))
+                    if lexical_match < _required_must_match_count(must_terms):
                         continue
                 kept_items.append(item)
         except Exception:
@@ -372,6 +662,110 @@ async def _filter_stage2_llm(
             kept_items.extend(batch)
 
     logger.info("relevance_filter.stage2", source=source, kept=len(kept_items), total=len(items))
+    return kept_items
+
+
+async def _filter_stage2_llm_social(
+    items: list[dict],
+    *,
+    intent_text: str,
+    source: str,
+    must_match_terms: list[str] | None = None,
+) -> list[dict]:
+    """Use batched GPT-4o-mini relevance judging for social items."""
+    if not items:
+        return items
+    if not settings.INGEST_SOCIAL_LLM_FILTER_ENABLED:
+        return items
+    if not settings.OPENAI_API_KEY:
+        return items
+
+    ranked_items = sorted(
+        items,
+        key=lambda item: float(item.get("_social_similarity", 0.0)),
+        reverse=True,
+    )
+    capped = ranked_items[: max(1, settings.INGEST_SOCIAL_LLM_MAX_CANDIDATES)]
+    client = get_openai_client()
+    kept_items: list[dict] = []
+
+    for batch_start in range(0, len(capped), RELEVANCE_STAGE2_BATCH_SIZE):
+        batch = capped[batch_start : batch_start + RELEVANCE_STAGE2_BATCH_SIZE]
+        numbered: list[str] = []
+        for index, item in enumerate(batch):
+            title = str(item.get("title") or "Unknown title")
+            body_text = str(item.get("content") or item.get("abstract") or item.get("claims") or "")
+            numbered.append(f"{index}. Title: {title}\nContent: {body_text[:500]}")
+
+        must_terms = [str(term).strip() for term in (must_match_terms or []) if str(term).strip()]
+        must_terms_line = ""
+        if must_terms:
+            must_terms_line = (
+                "Specific query must-match terms: "
+                + ", ".join(must_terms[:5])
+                + ". Mark an item relevant=1 only if it explicitly contains at least one of these terms.\n\n"
+            )
+
+        prompt = (
+            f"Project intent:\n{intent_text[:1200]}\n\n"
+            f"Source type: {source}\n"
+            f"{must_terms_line}"
+            "For each item, return strict JSON in this shape: "
+            '{"items": [{"id": <number>, "relevant": 0 or 1}]}. '
+            "Mark relevant=1 only when clearly aligned with the project intent.\n\n"
+            + "\n\n".join(numbered)
+        )
+
+        try:
+            response = await client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a strict relevance classifier. Return JSON only.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.0,
+                max_tokens=300,
+                response_format={"type": "json_object"},
+            )
+            raw = response.choices[0].message.content or "{}"
+            parsed = json.loads(raw)
+            entries = parsed.get("items", parsed) if isinstance(parsed, dict) else parsed
+            if not isinstance(entries, list):
+                logger.warning(
+                    "relevance_filter.stage2_social_invalid_shape",
+                    source=source,
+                    batch_size=len(batch),
+                )
+                if settings.INGEST_SOCIAL_LLM_FAIL_OPEN:
+                    kept_items.extend(batch)
+                continue
+
+            relevant_ids: set[int] = set()
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    item_id = int(str(entry.get("id")))
+                except (TypeError, ValueError):
+                    continue
+                if int(str(entry.get("relevant", 0))) == 1:
+                    relevant_ids.add(item_id)
+
+            kept_items.extend(item for index, item in enumerate(batch) if index in relevant_ids)
+        except Exception:
+            logger.exception("relevance_filter.stage2_social_batch_failed", source=source)
+            if settings.INGEST_SOCIAL_LLM_FAIL_OPEN:
+                kept_items.extend(batch)
+
+    logger.info(
+        "relevance_filter.stage2_social",
+        source=source,
+        kept=len(kept_items),
+        total=len(capped),
+    )
     return kept_items
 
 
@@ -414,6 +808,48 @@ async def _invalidate_project_caches(project_id: str) -> None:
             "cache_invalidation.failed",
             project_id=project_id,
         )
+
+
+async def _schedule_fulltext_enrichment(ctx: dict, pool, documents: list[RawDocument]) -> int:
+    """Resolve/upsert fulltext assets and enqueue enrichment tasks for eligible docs."""
+    if not settings.ENABLE_FULLTEXT_ENRICHMENT:
+        return 0
+    redis = ctx.get("redis")
+    if redis is None:
+        logger.warning("fulltext_enrichment.redis_missing")
+        return 0
+
+    scheduled = 0
+    for doc in documents:
+        if doc.source not in {"paper", "patent"}:
+            continue
+        metadata = dict(doc.metadata or {})
+        if str(metadata.get("content_level") or "abstract") == "fulltext":
+            continue
+
+        resolved = resolve_fulltext_url(doc)
+        fulltext_resolve_total.labels(source=doc.source, status=resolved.status).inc()
+        if resolved.status != "success" or not resolved.resolved_url or not resolved.canonical_url:
+            continue
+
+        source_url = str(metadata.get("open_access_url") or metadata.get("pdf_url") or metadata.get("url") or resolved.resolved_url)
+        asset_id = await source_asset_repo.upsert_source_asset(
+            pool,
+            project_id=doc.project_id,
+            user_id=doc.user_id,
+            source=doc.source,
+            source_id=str(doc.source_id or ""),
+            title=str(doc.title or ""),
+            source_url=source_url,
+            resolved_url=resolved.resolved_url,
+            canonical_url=resolved.canonical_url,
+            source_fetcher=resolved.source_fetcher,
+        )
+        if not asset_id:
+            continue
+        await redis.enqueue_job("ingest_source_asset", asset_id, _job_id=f"fulltext:{asset_id}")
+        scheduled += 1
+    return scheduled
 
 
 ACCOUNT_RELEVANCE_WEIGHT = 6.0
@@ -473,6 +909,57 @@ _GENERIC_RELEVANCE_TERMS: set[str] = {
     "products",
     "news",
     "viral",
+}
+
+_SOCIAL_BROAD_TERMS: set[str] = {
+    "beauty",
+    "skincare",
+    "makeup",
+    "cosmetics",
+    "fragrance",
+    "viral",
+    "trend",
+    "trends",
+    "news",
+}
+
+_PROJECT_TEXT_STOPWORDS: set[str] = {
+    "the",
+    "and",
+    "for",
+    "with",
+    "from",
+    "this",
+    "that",
+    "into",
+    "about",
+    "project",
+    "research",
+    "analysis",
+    "find",
+    "highly",
+    "relevant",
+    "social",
+    "track",
+    "conversation",
+    "conversations",
+    "evidence",
+    "quality",
+    "reports",
+    "guidance",
+    "projects",
+    "latest",
+    "recent",
+    "new",
+    "using",
+    "based",
+    "youtube",
+    "reddit",
+    "twitter",
+    "tiktok",
+    "instagram",
+    "platform",
+    "platforms",
 }
 
 
@@ -535,8 +1022,6 @@ def _build_relevance_terms(intent: dict, social_filter: str) -> set[str]:
     terms.update(_keyword_tokens(str(search_filters.get("instagram") or "")))
     terms.update(_keyword_tokens(str(social_filter or "")))
     terms = _filter_relevance_terms(terms)
-    if not terms:
-        terms = {"beauty", "cosmetics", "skincare", "makeup", "fragrance"}
     return terms
 
 
@@ -553,8 +1038,6 @@ def _build_brand_terms(intent: dict) -> set[str]:
         for tok in _keyword_tokens(str(kw)):
             if tok in _GENERIC_RELEVANCE_TERMS:
                 continue
-            if tok in _BEAUTY_SCOPE_TERMS:
-                continue
             terms.add(tok)
     return terms
 
@@ -565,6 +1048,31 @@ def _match_count(text: str, terms: set[str]) -> int:
         return 0
     tokens = _tokenize(text)
     return len(tokens & terms)
+
+
+def _content_quality_score(title: str, content: str) -> float:
+    """Estimate content quality from richness and specificity signals."""
+    merged = f"{title} {content}".strip()
+    if not merged:
+        return 0.0
+    tokens = _tokenize(merged)
+    unique_token_score = min(1.0, len(tokens) / 80.0)
+    length_score = min(1.0, len(content) / 900.0)
+    punctuation_count = content.count(".") + content.count("!") + content.count("?")
+    structure_score = min(1.0, punctuation_count / 8.0)
+    return (unique_token_score * 0.5) + (length_score * 0.35) + (structure_score * 0.15)
+
+
+def _required_social_match_count(anchor_terms: set[str]) -> int:
+    """Use OR semantics: one topical match is enough to keep a candidate."""
+    _ = anchor_terms
+    return 1
+
+
+def _required_must_match_count(must_terms: list[str] | set[str] | None = None) -> int:
+    """Use OR semantics for explicit must-match terms across all sources."""
+    _ = must_terms
+    return 1
 
 
 def _clean_instagram_keyword_query(raw: str) -> str:
@@ -584,6 +1092,15 @@ def _clean_instagram_keyword_query(raw: str) -> str:
     return " ".join(words)
 
 
+def _normalize_hashtag_token(raw: str) -> str:
+    """Normalize free text into a hashtag-safe token without spaces."""
+    cleaned = _clean_instagram_keyword_query(raw)
+    if not cleaned:
+        return ""
+    compact = re.sub(r"\s+", "", cleaned).strip().lower()
+    return compact if len(compact) >= 3 else ""
+
+
 def _extract_hashtags(text: str) -> list[str]:
     """Extract cleaned hashtag terms from a social filter string."""
     if not text:
@@ -592,7 +1109,7 @@ def _extract_hashtags(text: str) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
     for tag in tags:
-        cleaned = _clean_instagram_keyword_query(tag.replace("_", " "))
+        cleaned = _normalize_hashtag_token(tag.replace("_", " "))
         if not cleaned:
             continue
         key = cleaned.lower()
@@ -603,16 +1120,106 @@ def _extract_hashtags(text: str) -> list[str]:
     return out
 
 
+def _social_must_terms(intent: dict, query_terms: list[str]) -> list[str]:
+    """Build strict social must-match terms from intent and query terms."""
+    explicit = _clean_term_values(intent.get("must_match_terms") or [])
+    if explicit:
+        return explicit[:5]
+
+    specificity = str(intent.get("query_specificity") or "").strip().lower()
+    if specificity != "specific":
+        return []
+
+    candidates: list[str] = []
+    for value in intent.get("entities") or []:
+        candidates.extend(re.findall(r"[a-zA-Z0-9_]+", str(value or "")))
+    for value in intent.get("keywords") or []:
+        candidates.extend(re.findall(r"[a-zA-Z0-9_]+", str(value or "")))
+    candidates.extend(query_terms)
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in candidates:
+        term = str(raw or "").strip().lower().replace("_", " ")
+        term = re.sub(r"\s+", " ", term).strip()
+        if len(term) < 3:
+            continue
+        if term in seen:
+            continue
+        if term in _GENERIC_RELEVANCE_TERMS or term in _SOCIAL_BROAD_TERMS:
+            continue
+        seen.add(term)
+        out.append(term)
+        if len(out) >= 5:
+            break
+    return out
+
+
+def _project_anchor_terms(
+    intent: dict,
+    *,
+    social_filter: str = "",
+    project_title: str = "",
+    project_description: str = "",
+) -> set[str]:
+    """Build strict topical anchors from intent + project text for social relevance."""
+    raw_terms: list[str] = []
+    for value in (
+        *(intent.get("must_match_terms") or []),
+        *(intent.get("entities") or []),
+        *(intent.get("keywords") or []),
+        *(intent.get("domain_terms") or []),
+        social_filter,
+        project_title,
+        project_description,
+    ):
+        raw_terms.extend(re.findall(r"[a-zA-Z0-9_]+", str(value or "").replace("#", " ")))
+
+    anchors: set[str] = set()
+    for raw in raw_terms:
+        token = str(raw or "").strip().lower().replace("_", " ")
+        token = re.sub(r"\s+", " ", token).strip()
+        if len(token) < 3:
+            continue
+        if token in _GENERIC_RELEVANCE_TERMS or token in _SOCIAL_BROAD_TERMS:
+            continue
+        if token in _PROJECT_TEXT_STOPWORDS:
+            continue
+        anchors.add(token)
+    return anchors
+
+
 def _instagram_handle_candidates(social_filter: str, intent: dict) -> list[str]:
     """Build candidate Instagram handle queries for fallback account lookup."""
     candidates: list[str] = []
     seen: set[str] = set()
 
+    def _push_candidate(value: str) -> None:
+        cleaned_value = str(value or "").strip()
+        if not cleaned_value:
+            return
+        key = cleaned_value.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(cleaned_value)
+        if len(candidates) >= max(1, settings.INGEST_INSTAGRAM_ACCOUNT_CANDIDATES):
+            return
+
+    explicit_handles = re.findall(r"@([A-Za-z0-9_.]{2,30})", str(social_filter or ""))
+    for handle in explicit_handles:
+        _push_candidate(handle)
+        if len(candidates) >= max(1, settings.INGEST_INSTAGRAM_ACCOUNT_CANDIDATES):
+            return candidates
+
     raw_terms: list[str] = []
     if social_filter:
         raw_terms.append(str(social_filter))
         raw_terms.extend(str(token) for token in str(social_filter).split())
-    raw_terms.extend(str(term) for term in (intent.get("keywords") or [])[:6])
+    raw_terms.extend(str(term) for term in (intent.get("must_match_terms") or [])[:8])
+    raw_terms.extend(str(term) for term in (intent.get("entities") or [])[:8])
+    raw_terms.extend(str(term) for term in (intent.get("keywords") or [])[:8])
+    raw_terms.extend(str(term) for term in (intent.get("domain_terms") or [])[:8])
 
     for raw in raw_terms:
         cleaned = str(raw or "").strip()
@@ -623,13 +1230,12 @@ def _instagram_handle_candidates(social_filter: str, intent: dict) -> list[str]:
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
         if not cleaned:
             continue
-
-        key = cleaned.lower()
-        if key in seen:
+        cleaned = _clean_instagram_keyword_query(cleaned)
+        if not cleaned:
             continue
-        seen.add(key)
-        candidates.append(cleaned)
-        if len(candidates) >= 10:
+
+        _push_candidate(cleaned)
+        if len(candidates) >= max(1, settings.INGEST_INSTAGRAM_ACCOUNT_CANDIDATES):
             break
 
     return candidates
@@ -749,6 +1355,19 @@ async def ingest_project(ctx: dict, project_id: str) -> None:
     )
     try:
         outcome = await _run_ingestion(ctx, project_id, oldest_timestamp=None)
+    except asyncio.CancelledError:
+        finished_at = datetime.now(UTC).isoformat()
+        await _set_ingest_status(
+            redis,
+            project_id,
+            status="failed",
+            message="Ingestion cancelled due to worker timeout.",
+            queued_at=queued_at,
+            started_at=started_at,
+            finished_at=finished_at,
+            updated_at=finished_at,
+        )
+        raise
     except Exception as exc:
         finished_at = datetime.now(UTC).isoformat()
         await _set_ingest_status(
@@ -774,6 +1393,8 @@ async def ingest_project(ctx: dict, project_id: str) -> None:
         finished_at=finished_at,
         updated_at=finished_at,
         source_counts=outcome.get("source_counts") or {},
+        source_diagnostics=outcome.get("source_diagnostics") or {},
+        fulltext_enqueued=int(outcome.get("fulltext_enqueued") or 0),
         total_chunks=outcome.get("total_chunks"),
     )
 
@@ -798,7 +1419,8 @@ async def _run_ingestion(
         row = await conn.fetchrow(
             """
             SELECT id::text, user_id::text, title, description, structured_intent, last_refreshed_at,
-                   tiktok_enabled, instagram_enabled, papers_enabled,
+                   tiktok_enabled, instagram_enabled, youtube_enabled, reddit_enabled, x_enabled,
+                   papers_enabled,
                    patents_enabled, perigon_enabled, tavily_enabled, exa_enabled
             FROM projects
             WHERE id = $1::uuid
@@ -836,6 +1458,9 @@ async def _run_ingestion(
 
     tiktok_enabled = bool(project.get("tiktok_enabled"))
     instagram_enabled = bool(project.get("instagram_enabled"))
+    youtube_enabled = bool(project.get("youtube_enabled"))
+    reddit_enabled = bool(project.get("reddit_enabled"))
+    x_enabled = bool(project.get("x_enabled"))
     papers_enabled = bool(project.get("papers_enabled"))
     patents_enabled = bool(project.get("patents_enabled"))
     perigon_enabled = bool(project.get("perigon_enabled"))
@@ -847,9 +1472,17 @@ async def _run_ingestion(
             "ingest_project.no_social_filter",
             project_id=project_id,
             project_title=project_title[:80],
+            note="Social sources remain enabled and use intent/context-derived queries.",
         )
-        instagram_enabled = False
-        tiktok_enabled = False
+
+    strict_social_terms = sorted(
+        _project_anchor_terms(
+            intent,
+            social_filter=social_filter,
+            project_title=project_title,
+            project_description=project_description,
+        )
+    )
 
     logger.info(
         "ingest_project.start",
@@ -857,6 +1490,9 @@ async def _run_ingestion(
         social_filter=social_filter[:60],
         tiktok_enabled=tiktok_enabled,
         instagram_enabled=instagram_enabled,
+        youtube_enabled=youtube_enabled,
+        reddit_enabled=reddit_enabled,
+        x_enabled=x_enabled,
         papers_enabled=papers_enabled,
         patents_enabled=patents_enabled,
         perigon_enabled=perigon_enabled,
@@ -867,6 +1503,9 @@ async def _run_ingestion(
     source_types = [
         "social_tiktok",
         "social_instagram",
+        "social_youtube",
+        "social_reddit",
+        "social_x",
         "paper",
         "paper",
         "paper",
@@ -881,6 +1520,9 @@ async def _run_ingestion(
     source_enabled_flags = [
         tiktok_enabled,
         instagram_enabled,
+        youtube_enabled,
+        reddit_enabled,
+        x_enabled,
         papers_enabled,
         papers_enabled,
         papers_enabled,
@@ -896,7 +1538,15 @@ async def _run_ingestion(
     gather_results = await asyncio.gather(
         _run_source_with_timeout(
             "social_tiktok",
-            _ingest_tiktok(project_id=project_id, user_id=user_id, social_filter=social_filter),
+            _ingest_tiktok(
+                project_id=project_id,
+                user_id=user_id,
+                intent=intent,
+                social_filter=social_filter,
+                project_title=project_title,
+                project_description=project_description,
+            ),
+            timeout_seconds=settings.INGEST_SOCIAL_SOURCE_TIMEOUT,
         )
         if tiktok_enabled
         else _noop(),
@@ -907,11 +1557,56 @@ async def _run_ingestion(
                 user_id=user_id,
                 intent=intent,
                 social_filter=social_filter,
+                project_title=project_title,
+                project_description=project_description,
                 oldest_timestamp=oldest_timestamp,
                 redis=redis,
             ),
+            timeout_seconds=settings.INGEST_SOCIAL_SOURCE_TIMEOUT,
         )
         if instagram_enabled
+        else _noop(),
+        _run_source_with_timeout(
+            "social_youtube",
+            _ingest_youtube(
+                project_id=project_id,
+                user_id=user_id,
+                intent=intent,
+                social_filter=social_filter,
+                project_title=project_title,
+                project_description=project_description,
+            ),
+            timeout_seconds=settings.INGEST_SOCIAL_SOURCE_TIMEOUT,
+        )
+        if youtube_enabled
+        else _noop(),
+        _run_source_with_timeout(
+            "social_reddit",
+            _ingest_reddit(
+                project_id=project_id,
+                user_id=user_id,
+                intent=intent,
+                social_filter=social_filter,
+                project_title=project_title,
+                project_description=project_description,
+            ),
+            timeout_seconds=settings.INGEST_SOCIAL_SOURCE_TIMEOUT,
+        )
+        if reddit_enabled
+        else _noop(),
+        _run_source_with_timeout(
+            "social_x",
+            _ingest_x(
+                project_id=project_id,
+                user_id=user_id,
+                intent=intent,
+                social_filter=social_filter,
+                project_title=project_title,
+                project_description=project_description,
+            ),
+            timeout_seconds=settings.INGEST_SOCIAL_SOURCE_TIMEOUT,
+        )
+        if x_enabled
         else _noop(),
         _run_source_with_timeout(
             "paper_openalex",
@@ -1041,12 +1736,174 @@ async def _run_ingestion(
         else _noop(),
     )
 
+    expansion_meta: dict[str, dict[str, int | bool | str]] = {}
+    mutable_results = list(gather_results)
+    social_index_map = {
+        "social_tiktok": 0,
+        "social_instagram": 1,
+        "social_youtube": 2,
+        "social_reddit": 3,
+        "social_x": 4,
+    }
+    social_enabled_map = {
+        "social_tiktok": tiktok_enabled,
+        "social_instagram": instagram_enabled,
+        "social_youtube": youtube_enabled,
+        "social_reddit": reddit_enabled,
+        "social_x": x_enabled,
+    }
+
+    raw_social_fast_total = 0
+    for source_name, idx in social_index_map.items():
+        result = mutable_results[idx]
+        fast_count = len(result) if isinstance(result, list) else 0
+        raw_social_fast_total += fast_count
+        expansion_meta[source_name] = {
+            "raw_fast": fast_count,
+            "raw_expanded": 0,
+            "raw_final": fast_count,
+            "expansion_triggered": False,
+            "expansion_reason": "",
+        }
+
+    if settings.INGEST_SOCIAL_EXPANSION_ENABLED:
+        expanded_social_filter = _build_expanded_social_filter(
+            intent,
+            social_filter=social_filter,
+            project_title=project_title,
+            project_description=project_description,
+        )
+        for source_name, idx in social_index_map.items():
+            if not social_enabled_map[source_name]:
+                continue
+            source_result = mutable_results[idx]
+            source_fast = len(source_result) if isinstance(source_result, list) else 0
+            source_min = (
+                int(settings.INGEST_SOCIAL_RAW_MIN_PER_WEAK_SOURCE)
+                if source_name in {"social_instagram", "social_youtube"}
+                else int(settings.INGEST_SOCIAL_RAW_MIN_PER_SOURCE)
+            )
+            needs_expansion = (
+                source_fast < source_min
+                or raw_social_fast_total < int(settings.INGEST_SOCIAL_RAW_TARGET_TOTAL)
+            )
+            if not needs_expansion:
+                continue
+
+            reason = (
+                "low_source_and_low_total"
+                if source_fast < source_min
+                and raw_social_fast_total < int(settings.INGEST_SOCIAL_RAW_TARGET_TOTAL)
+                else ("low_source_raw" if source_fast < source_min else "low_total_raw")
+            )
+            expansion_meta[source_name]["expansion_triggered"] = True
+            expansion_meta[source_name]["expansion_reason"] = reason
+            try:
+                if source_name == "social_tiktok":
+                    expanded_docs = await _run_source_with_timeout(
+                        "social_tiktok_expand",
+                        _ingest_tiktok(
+                            project_id=project_id,
+                            user_id=user_id,
+                            intent=intent,
+                            social_filter=expanded_social_filter,
+                            project_title=project_title,
+                            project_description=project_description,
+                            max_results_override=settings.INGEST_SOCIAL_EXPANDED_TIKTOK_MAX_RESULTS,
+                        ),
+                        timeout_seconds=settings.INGEST_SOCIAL_EXPANSION_TIMEOUT,
+                    )
+                elif source_name == "social_instagram":
+                    expanded_docs = await _run_source_with_timeout(
+                        "social_instagram_expand",
+                        _ingest_instagram(
+                            project_id=project_id,
+                            user_id=user_id,
+                            intent=intent,
+                            social_filter=expanded_social_filter,
+                            project_title=project_title,
+                            project_description=project_description,
+                            oldest_timestamp=oldest_timestamp,
+                            redis=redis,
+                            max_pages_override=settings.INGEST_SOCIAL_EXPANDED_INSTAGRAM_HASHTAG_PAGES,
+                            max_age_days_override=settings.INGEST_SOCIAL_EXPANDED_MAX_AGE_DAYS,
+                        ),
+                        timeout_seconds=settings.INGEST_SOCIAL_EXPANSION_TIMEOUT,
+                    )
+                elif source_name == "social_youtube":
+                    expanded_docs = await _run_source_with_timeout(
+                        "social_youtube_expand",
+                        _ingest_youtube(
+                            project_id=project_id,
+                            user_id=user_id,
+                            intent=intent,
+                            social_filter=expanded_social_filter,
+                            project_title=project_title,
+                            project_description=project_description,
+                            fetch_limit_override=settings.INGEST_SOCIAL_EXPANDED_FETCH_LIMIT_PER_SOURCE,
+                            expansion_mode=True,
+                        ),
+                        timeout_seconds=settings.INGEST_SOCIAL_EXPANSION_TIMEOUT,
+                    )
+                elif source_name == "social_reddit":
+                    expanded_docs = await _run_source_with_timeout(
+                        "social_reddit_expand",
+                        _ingest_reddit(
+                            project_id=project_id,
+                            user_id=user_id,
+                            intent=intent,
+                            social_filter=expanded_social_filter,
+                            project_title=project_title,
+                            project_description=project_description,
+                            fetch_limit_override=settings.INGEST_SOCIAL_EXPANDED_FETCH_LIMIT_PER_SOURCE,
+                            expansion_mode=True,
+                        ),
+                        timeout_seconds=settings.INGEST_SOCIAL_EXPANSION_TIMEOUT,
+                    )
+                else:
+                    expanded_docs = await _run_source_with_timeout(
+                        "social_x_expand",
+                        _ingest_x(
+                            project_id=project_id,
+                            user_id=user_id,
+                            intent=intent,
+                            social_filter=expanded_social_filter,
+                            project_title=project_title,
+                            project_description=project_description,
+                            fetch_limit_override=settings.INGEST_SOCIAL_EXPANDED_FETCH_LIMIT_PER_SOURCE,
+                            expansion_mode=True,
+                        ),
+                        timeout_seconds=settings.INGEST_SOCIAL_EXPANSION_TIMEOUT,
+                    )
+            except Exception:
+                logger.exception("ingest_project.social_expansion_failed", project_id=project_id, source=source_name)
+                expanded_docs = []
+
+            merged = _dedupe_social_docs(
+                list(source_result if isinstance(source_result, list) else []) + list(expanded_docs or [])
+            )
+            mutable_results[idx] = merged
+            expanded_count = len(expanded_docs or [])
+            expansion_meta[source_name]["raw_expanded"] = expanded_count
+            expansion_meta[source_name]["raw_final"] = len(merged)
+            raw_social_fast_total += max(0, len(merged) - source_fast)
+            logger.info(
+                "ingest_project.social_expansion",
+                project_id=project_id,
+                source=source_name,
+                raw_fast=source_fast,
+                raw_expanded=expanded_count,
+                raw_final=len(merged),
+                reason=reason,
+            )
+
     intent_text = json.dumps(intent)
     documents: list[RawDocument] = []
     any_source_completed = False
+    source_diagnostics: dict[str, dict] = {}
 
     for result, source, source_enabled in zip(
-        gather_results, source_types, source_enabled_flags, strict=False
+        mutable_results, source_types, source_enabled_flags, strict=False
     ):
         if not source_enabled:
             continue
@@ -1054,14 +1911,35 @@ async def _run_ingestion(
             logger.warning(
                 "ingest_tool.failed", project_id=project_id, source=source, error=str(result)
             )
+            source_diagnostics[source] = {
+                "fetched": 0,
+                "kept": 0,
+                "filtered_out": 0,
+                "reason": "source_failed",
+            }
+            source_diagnostics[source].update(expansion_meta.get(source, {}))
             continue
         any_source_completed = True
         if not result:
+            source_diagnostics[source] = {
+                "fetched": 0,
+                "kept": 0,
+                "filtered_out": 0,
+                "reason": "no_results_from_source",
+            }
+            source_diagnostics[source].update(expansion_meta.get(source, {}))
             continue
 
         if oldest_timestamp is not None:
             result = [doc for doc in result if _is_document_new_enough(doc, oldest_timestamp)]
             if not result:
+                source_diagnostics[source] = {
+                    "fetched": 0,
+                    "kept": 0,
+                    "filtered_out": 0,
+                    "reason": "all_older_than_refresh_watermark",
+                }
+                source_diagnostics[source].update(expansion_meta.get(source, {}))
                 continue
 
         filter_items: list[dict] = []
@@ -1079,18 +1957,33 @@ async def _run_ingestion(
                 }
             )
 
+        fetched_count = len(result)
+        social_terms_for_source = strict_social_terms if source in SOCIAL_SOURCES else []
         filtered_items = await _filter_relevance(
             filter_items,
             intent_text,
             source,
             redis,
-            must_match_terms=intent.get("must_match_terms") or [],
+            must_match_terms=social_terms_for_source if source in SOCIAL_SOURCES else intent.get("must_match_terms") or [],
+            social_match_terms=social_terms_for_source,
         )
         kept_indexes = {
             int(item.get("_idx", -1))
             for item in filtered_items
             if isinstance(item, dict) and isinstance(item.get("_idx"), int)
         }
+        kept_count = len(kept_indexes)
+        source_diagnostics[source] = {
+            "fetched": fetched_count,
+            "kept": kept_count,
+            "filtered_out": max(0, fetched_count - kept_count),
+            "reason": (
+                "strict_relevance_filtered"
+                if source in SOCIAL_SOURCES and kept_count == 0 and fetched_count > 0
+                else "ok"
+            ),
+        }
+        source_diagnostics[source].update(expansion_meta.get(source, {}))
         documents.extend(doc for index, doc in enumerate(result) if index in kept_indexes)
 
     if not documents:
@@ -1109,18 +2002,21 @@ async def _run_ingestion(
             )
             return {
                 "status": "empty" if int(total or 0) <= 0 else "ready",
-                "message": "Ingestion completed but no new documents passed filters.",
+                "message": "Ingestion completed but no new documents passed strict relevance filters.",
                 "source_counts": {},
+                "source_diagnostics": source_diagnostics,
                 "total_chunks": int(total or 0),
             }
         return {
             "status": "failed",
             "message": "No source completed successfully.",
             "source_counts": {},
+            "source_diagnostics": source_diagnostics,
             "total_chunks": 0,
         }
 
     inserted = await ingest_documents(documents)
+    fulltext_enqueued = await _schedule_fulltext_enrichment(ctx, pool, documents)
 
     async with pool.acquire() as conn:
         total = await conn.fetchval(
@@ -1136,26 +2032,46 @@ async def _run_ingestion(
         project_id=project_id,
         social_instagram_docs=sum(1 for d in documents if d.source == "social_instagram"),
         social_tiktok_docs=sum(1 for d in documents if d.source == "social_tiktok"),
+        social_youtube_docs=sum(1 for d in documents if d.source == "social_youtube"),
+        social_reddit_docs=sum(1 for d in documents if d.source == "social_reddit"),
+        social_x_docs=sum(1 for d in documents if d.source == "social_x"),
         paper_docs=sum(1 for d in documents if d.source == "paper"),
         patent_docs=sum(1 for d in documents if d.source == "patent"),
         news_docs=sum(1 for d in documents if d.source == "news"),
         search_docs=sum(1 for d in documents if d.source == "search"),
         total_docs=len(documents),
+        fulltext_enqueued=fulltext_enqueued,
         chunks_inserted=inserted,
         total_chunks=total,
     )
     source_counts = {
         "social_instagram": sum(1 for d in documents if d.source == "social_instagram"),
         "social_tiktok": sum(1 for d in documents if d.source == "social_tiktok"),
+        "social_youtube": sum(1 for d in documents if d.source == "social_youtube"),
+        "social_reddit": sum(1 for d in documents if d.source == "social_reddit"),
+        "social_x": sum(1 for d in documents if d.source == "social_x"),
         "paper": sum(1 for d in documents if d.source == "paper"),
         "patent": sum(1 for d in documents if d.source == "patent"),
         "news": sum(1 for d in documents if d.source == "news"),
         "search": sum(1 for d in documents if d.source == "search"),
     }
+    social_total = (
+        source_counts["social_instagram"]
+        + source_counts["social_tiktok"]
+        + source_counts["social_youtube"]
+        + source_counts["social_reddit"]
+        + source_counts["social_x"]
+    )
+    social_enabled = any([tiktok_enabled, instagram_enabled, youtube_enabled, reddit_enabled, x_enabled])
+    message = "Ingestion completed."
+    if social_enabled and social_total == 0:
+        message = "Ingestion completed. Insufficient relevant social content for strict mode."
     return {
         "status": "ready",
-        "message": "Ingestion completed.",
+        "message": message,
         "source_counts": source_counts,
+        "source_diagnostics": source_diagnostics,
+        "fulltext_enqueued": fulltext_enqueued,
         "total_chunks": int(total or 0),
     }
 
@@ -1166,20 +2082,41 @@ async def _ingest_instagram(
     user_id: str,
     intent: dict,
     social_filter: str,
+    project_title: str = "",
+    project_description: str = "",
     oldest_timestamp: int | None,
     redis,
+    max_pages_override: int | None = None,
+    max_age_days_override: int | None = None,
 ) -> list[RawDocument]:
     """Ingest Instagram reels via hashtag-first discovery, fail-open on errors."""
     _ = redis
+    fallback_query = _query_for_social(
+        intent,
+        social_filter=social_filter,
+        project_title=project_title,
+        project_description=project_description,
+    )
     handle_candidates = _instagram_handle_candidates(social_filter, intent)
     hashtags = _extract_hashtags(social_filter)
     if not hashtags:
-        for keyword in intent.get("keywords") or []:
-            cleaned = _clean_instagram_keyword_query(str(keyword))
+        for must in intent.get("must_match_terms") or []:
+            cleaned = _normalize_hashtag_token(str(must))
             if cleaned:
                 hashtags.append(cleaned)
-            if len(hashtags) >= 5:
+        for keyword in intent.get("keywords") or []:
+            cleaned = _normalize_hashtag_token(str(keyword))
+            if cleaned:
+                hashtags.append(cleaned)
+            if len(hashtags) >= settings.INGEST_INSTAGRAM_HASHTAG_QUERIES:
                 break
+        for entity in intent.get("entities") or []:
+            cleaned = _normalize_hashtag_token(str(entity))
+            if cleaned:
+                hashtags.append(cleaned)
+            if len(hashtags) >= settings.INGEST_INSTAGRAM_HASHTAG_QUERIES:
+                break
+        hashtags = list(dict.fromkeys(hashtags))[: settings.INGEST_INSTAGRAM_HASHTAG_QUERIES]
     if not hashtags:
         fallback_reels = await _fetch_instagram_reels_from_candidates(
             project_id=project_id,
@@ -1188,7 +2125,13 @@ async def _ingest_instagram(
         )
         if not fallback_reels:
             logger.warning("ingest_instagram.no_hashtags", project_id=project_id)
-            return []
+            return await _social_web_fallback_docs(
+                source="social_instagram",
+                project_id=project_id,
+                user_id=user_id,
+                query=fallback_query,
+                keep_limit=max(1, settings.INGEST_SOCIAL_KEEP_LIMIT_PER_SOURCE),
+            )
         all_posts: list[dict] = fallback_reels
     else:
         all_posts = []
@@ -1196,18 +2139,28 @@ async def _ingest_instagram(
     logger.info("ingest_instagram.start", project_id=project_id, hashtag_count=len(hashtags))
 
     now_utc = datetime.now(UTC)
-    cutoff_30d = now_utc - timedelta(days=30)
+    cutoff_days = (
+        max(1, int(max_age_days_override))
+        if isinstance(max_age_days_override, int) and max_age_days_override > 0
+        else max(1, int(settings.INGEST_SOCIAL_MAX_AGE_DAYS))
+    )
+    cutoff_window = now_utc - timedelta(days=cutoff_days)
     oldest_cutoff = (
         datetime.fromtimestamp(oldest_timestamp, tz=UTC)
         if isinstance(oldest_timestamp, int | float) and oldest_timestamp > 0
         else None
     )
-    recency_cutoff = max(cutoff_30d, oldest_cutoff) if oldest_cutoff else cutoff_30d
+    recency_cutoff = max(cutoff_window, oldest_cutoff) if oldest_cutoff else cutoff_window
 
     if hashtags:
-        max_pages = max(1, settings.INGEST_INSTAGRAM_HASHTAG_PAGES)
-        for hashtag in hashtags[:5]:
+        max_pages = (
+            max(1, int(max_pages_override))
+            if isinstance(max_pages_override, int) and max_pages_override > 0
+            else max(1, settings.INGEST_INSTAGRAM_HASHTAG_PAGES)
+        )
+        for hashtag in hashtags[: max(1, settings.INGEST_INSTAGRAM_HASHTAG_QUERIES)]:
             cursor: str | None = None
+            empty_page_streak = 0
             for _ in range(max_pages):
                 try:
                     posts, next_cursor = await instagram_hashtag_posts(
@@ -1223,6 +2176,19 @@ async def _ingest_instagram(
                     )
                     break
 
+                if not posts and next_cursor:
+                    empty_page_streak += 1
+                    logger.info(
+                        "ingest_instagram.empty_page_break",
+                        project_id=project_id,
+                        hashtag=hashtag,
+                        has_cursor=bool(cursor),
+                    )
+                    if empty_page_streak >= 1:
+                        break
+                else:
+                    empty_page_streak = 0
+
                 for post in posts:
                     ts = post.get("timestamp")
                     if isinstance(ts, int | float):
@@ -1231,6 +2197,8 @@ async def _ingest_instagram(
                             continue
                     all_posts.append(post)
 
+                if next_cursor == cursor:
+                    break
                 cursor = next_cursor
                 if not cursor:
                     break
@@ -1243,7 +2211,13 @@ async def _ingest_instagram(
         )
         if not fallback_reels:
             logger.warning("ingest_instagram.no_posts", project_id=project_id)
-            return []
+            return await _social_web_fallback_docs(
+                source="social_instagram",
+                project_id=project_id,
+                user_id=user_id,
+                query=fallback_query,
+                keep_limit=max(1, settings.INGEST_SOCIAL_KEEP_LIMIT_PER_SOURCE),
+            )
         all_posts.extend(fallback_reels)
 
     author_scores: dict[str, int] = {}
@@ -1256,7 +2230,7 @@ async def _ingest_instagram(
 
     top_authors = sorted(
         author_scores, key=lambda author: author_scores.get(author, 0), reverse=True
-    )[:10]
+    )[: max(1, settings.INGEST_INSTAGRAM_ACCOUNTS_TO_FETCH)]
     author_id_map: dict[str, int] = {}
     for username in top_authors:
         try:
@@ -1302,8 +2276,15 @@ async def _ingest_instagram(
 
     relevance_terms = _build_relevance_terms(intent, social_filter)
     brand_terms = _build_brand_terms(intent)
+    anchor_terms = _project_anchor_terms(
+        intent,
+        social_filter=social_filter,
+        project_title=project_title,
+        project_description=project_description,
+    )
+    min_match = max(1, int(settings.INGEST_SOCIAL_MIN_RELEVANCE_MATCHES))
 
-    scored: list[tuple[float, dict]] = []
+    scored: list[tuple[int, float, float, float, dict]] = []
     for reel in all_reels:
         caption = str(reel.get("caption") or "").strip()
         if not caption:
@@ -1311,9 +2292,14 @@ async def _ingest_instagram(
 
         likes = _as_int(reel.get("like_count"))
         views = _as_int(reel.get("view_count") or reel.get("play_count"))
-        relevance = float(
-            _match_count(caption, relevance_terms) + _match_count(caption, brand_terms)
+        relevance_match = int(
+            _match_count(caption, anchor_terms)
+            + _match_count(caption, relevance_terms)
+            + _match_count(caption, brand_terms)
         )
+        if relevance_match < min_match:
+            continue
+        quality_score = _content_quality_score(str(reel.get("username") or ""), caption)
         engagement_score = min(1.0, math.log1p(max(0, likes + views)) / 20.0)
 
         days_old = 15.0
@@ -1325,15 +2311,17 @@ async def _ingest_instagram(
             except Exception:
                 days_old = 15.0
         recency_score = math.exp(-days_old / REEL_RECENCY_DAYS)
-        total_score = (relevance * 0.60) + (engagement_score * 0.25) + (recency_score * 0.15)
-        scored.append((total_score, reel))
+        scored.append((relevance_match, quality_score, engagement_score, recency_score, reel))
 
-    scored.sort(key=lambda item: item[0], reverse=True)
+    scored.sort(key=lambda item: (item[0], item[1], item[2], item[3]), reverse=True)
 
     docs: list[RawDocument] = []
     seen_ids: set[str] = set()
-    limit = max(1, settings.INGEST_INSTAGRAM_GLOBAL_REELS_LIMIT)
-    for _, reel in scored:
+    limit = max(
+        1,
+        min(settings.INGEST_INSTAGRAM_GLOBAL_REELS_LIMIT, settings.INGEST_SOCIAL_KEEP_LIMIT_PER_SOURCE),
+    )
+    for _, _, _, _, reel in scored:
         source_id = str(reel.get("shortcode") or "").strip()
         if not source_id or source_id in seen_ids:
             continue
@@ -1375,6 +2363,14 @@ async def _ingest_instagram(
         candidate_reels=len(all_reels),
         docs=len(docs),
     )
+    if not docs:
+        return await _social_web_fallback_docs(
+            source="social_instagram",
+            project_id=project_id,
+            user_id=user_id,
+            query=fallback_query,
+            keep_limit=max(1, settings.INGEST_SOCIAL_KEEP_LIMIT_PER_SOURCE),
+        )
     return docs
 
 
@@ -1382,7 +2378,11 @@ async def _ingest_tiktok(
     *,
     project_id: str,
     user_id: str,
+    intent: dict,
     social_filter: str,
+    project_title: str = "",
+    project_description: str = "",
+    max_results_override: int | None = None,
 ) -> list[RawDocument]:
     """
     Fetch recent TikTok posts for the handle derived from social_filter.
@@ -1394,18 +2394,128 @@ async def _ingest_tiktok(
     Returns [] (and logs a warning) if the fetch yields no posts.
     Never raises — all exceptions are caught and logged.
     """
-    handle = social_filter
-    posts = await fetch_tiktok_posts(handle)
+    fallback_query = _query_for_social(
+        intent,
+        social_filter=social_filter,
+        project_title=project_title,
+        project_description=project_description,
+    )
+    query_terms = _social_query_terms(
+        intent,
+        social_filter=social_filter,
+        project_title=project_title,
+        project_description=project_description,
+    )
+    if not query_terms:
+        logger.warning("ingest_tiktok.no_query_terms", project_id=project_id)
+        return await _social_web_fallback_docs(
+            source="social_tiktok",
+            project_id=project_id,
+            user_id=user_id,
+            query=fallback_query,
+            keep_limit=max(1, settings.INGEST_SOCIAL_KEEP_LIMIT_PER_SOURCE),
+        )
+
+    specificity = str(intent.get("query_specificity") or "").strip().lower()
+    must_terms = _social_must_terms(intent, query_terms)
+    anchor_terms = _project_anchor_terms(
+        intent,
+        social_filter=social_filter,
+        project_title=project_title,
+        project_description=project_description,
+    )
+    exact_match = specificity == "specific" or bool(must_terms)
+    keyword_queries = query_terms[: max(1, settings.INGEST_TIKTOK_KEYWORD_LIMIT)]
+    max_results = (
+        max(1, int(max_results_override))
+        if isinstance(max_results_override, int) and max_results_override > 0
+        else settings.INGEST_TIKTOK_MAX_RESULTS
+    )
+    hashtag_query = " ".join(
+        f"#{tag}" for tag in (_normalize_hashtag_token(term) for term in keyword_queries) if tag
+    )
+
+    posts = await fetch_tiktok_posts(
+        hashtags=hashtag_query,
+        keyword_queries=keyword_queries,
+        exact_match=exact_match,
+        period="90" if exact_match else "30",
+        max_results=max_results,
+    )
+    if len(posts) < settings.INGEST_TIKTOK_MIN_RELEVANT_RESULTS and exact_match:
+        # Controlled expansion: relax exact matching but keep the same topical query terms.
+        expanded = await fetch_tiktok_posts(
+            hashtags=hashtag_query,
+            keyword_queries=keyword_queries,
+            exact_match=False,
+            period="30",
+            max_results=max_results,
+        )
+        seen_ids = {str(item.get("video_id") or "") for item in posts}
+        for item in expanded:
+            vid = str(item.get("video_id") or "")
+            if not vid or vid in seen_ids:
+                continue
+            seen_ids.add(vid)
+            posts.append(item)
+            if len(posts) >= max_results:
+                break
+
     logger.info(
         "ingest_project.tiktok.posts_fetched",
         project_id=project_id,
-        handle=handle,
+        exact_match=exact_match,
+        query_terms=keyword_queries[:6],
         post_count=len(posts),
     )
 
-    docs: list[RawDocument] = []
+    scored: list[tuple[int, float, float, float, dict]] = []
+    skipped_non_match = 0
+    required_must_hits = _required_must_match_count(must_terms)
+    min_match = max(
+        int(settings.INGEST_SOCIAL_MIN_RELEVANCE_MATCHES),
+        _required_social_match_count(anchor_terms),
+    )
+    now_utc = datetime.now(UTC)
     for video in posts:
         description = (video.get("description") or "").strip()
+        if not description:
+            continue
+        if must_terms and _match_count(description, set(_clean_term_values(must_terms))) < required_must_hits:
+            skipped_non_match += 1
+            continue
+        relevance_match = int(_match_count(description, anchor_terms))
+        if relevance_match < min_match:
+            skipped_non_match += 1
+            continue
+        quality_score = _content_quality_score(str(video.get("author_username") or ""), description)
+        engagement_score = min(
+            1.0,
+            math.log1p(max(0, _as_int(video.get("likes")) + _as_int(video.get("views")))) / 20.0,
+        )
+        recency_score = 0.4
+        ts = video.get("create_time") or video.get("created_at")
+        if ts:
+            try:
+                if isinstance(ts, int | float) or str(ts).isdigit():
+                    video_dt = datetime.fromtimestamp(float(ts), tz=UTC)
+                else:
+                    normalized = str(ts).replace("Z", "+00:00")
+                    video_dt = datetime.fromisoformat(normalized)
+                    if video_dt.tzinfo is None:
+                        video_dt = video_dt.replace(tzinfo=UTC)
+                days_old = max(0.0, (now_utc - video_dt).total_seconds() / 86400.0)
+                recency_score = math.exp(-days_old / 21.0)
+            except Exception:
+                recency_score = 0.4
+        scored.append((relevance_match, quality_score, engagement_score, recency_score, video))
+
+    scored.sort(key=lambda item: (item[0], item[1], item[2], item[3]), reverse=True)
+
+    docs: list[RawDocument] = []
+    keep_limit = max(1, settings.INGEST_SOCIAL_KEEP_LIMIT_PER_SOURCE)
+    for _, _, _, _, video in scored:
+        description = str(video.get("description") or "").strip()
         if not description:
             continue
         docs.append(
@@ -1415,7 +2525,7 @@ async def _ingest_tiktok(
                 source="social_tiktok",
                 source_id=video.get("video_id", ""),
                 title=f"@{video.get('author_username', '')}",
-                content=description,
+                content=description[:2000],
                 metadata={
                     "platform": "tiktok",
                     "author_username": video.get("author_username", ""),
@@ -1427,7 +2537,550 @@ async def _ingest_tiktok(
                 },
             )
         )
+        if len(docs) >= keep_limit:
+            break
 
+    logger.info(
+        "ingest_project.tiktok.docs_filtered",
+        project_id=project_id,
+        candidates=len(posts),
+        docs=len(docs),
+        skipped_non_match=skipped_non_match,
+        must_terms=must_terms[:5],
+    )
+    if not docs:
+        return await _social_web_fallback_docs(
+            source="social_tiktok",
+            project_id=project_id,
+            user_id=user_id,
+            query=fallback_query,
+            keep_limit=max(1, settings.INGEST_SOCIAL_KEEP_LIMIT_PER_SOURCE),
+        )
+    return docs
+
+
+async def _ingest_x(
+    *,
+    project_id: str,
+    user_id: str,
+    intent: dict,
+    social_filter: str,
+    project_title: str = "",
+    project_description: str = "",
+    fetch_limit_override: int | None = None,
+    expansion_mode: bool = False,
+) -> list[RawDocument]:
+    """Fetch recent X posts and map them into social KB documents."""
+    query = _query_for_social(
+        intent,
+        social_filter=social_filter,
+        project_title=project_title,
+        project_description=project_description,
+    )
+    if not query:
+        logger.warning("ingest_x.no_query", project_id=project_id)
+        return []
+
+    default_fetch_limit = max(
+        settings.INGEST_SOCIAL_KEEP_LIMIT_PER_SOURCE,
+        settings.INGEST_SOCIAL_FETCH_LIMIT_PER_SOURCE,
+    )
+    fetch_limit = (
+        max(1, int(fetch_limit_override))
+        if isinstance(fetch_limit_override, int) and fetch_limit_override > 0
+        else default_fetch_limit
+    )
+    keep_limit = max(1, settings.INGEST_SOCIAL_KEEP_LIMIT_PER_SOURCE)
+
+    posts: list[dict] = []
+    seen_source_ids: set[str] = set()
+    try:
+        for query_variant in _social_query_variants(
+            intent=intent,
+            base_query=query,
+            social_filter=social_filter,
+            project_title=project_title,
+            project_description=project_description,
+            expanded=expansion_mode,
+        ):
+            batch = await search_x_posts(query_variant, max_results=fetch_limit)
+            for row in batch:
+                source_id = str(row.get("source_id") or row.get("id") or row.get("url") or "").strip()
+                if not source_id or source_id in seen_source_ids:
+                    continue
+                seen_source_ids.add(source_id)
+                posts.append(row)
+                if len(posts) >= fetch_limit:
+                    break
+            if len(posts) >= fetch_limit:
+                break
+    except Exception:
+        logger.exception("ingest_x.failed", project_id=project_id)
+        return await _social_web_fallback_docs(
+            source="social_x",
+            project_id=project_id,
+            user_id=user_id,
+            query=query,
+            keep_limit=keep_limit,
+        )
+    if not posts:
+        return await _social_web_fallback_docs(
+            source="social_x",
+            project_id=project_id,
+            user_id=user_id,
+            query=query,
+            keep_limit=keep_limit,
+        )
+
+    relevance_terms = _build_relevance_terms(intent, query)
+    brand_terms = _build_brand_terms(intent)
+    anchor_terms = _project_anchor_terms(
+        intent,
+        social_filter=social_filter,
+        project_title=project_title,
+        project_description=project_description,
+    )
+    min_match = max(
+        int(settings.INGEST_SOCIAL_MIN_RELEVANCE_MATCHES),
+        _required_social_match_count(anchor_terms),
+    )
+    now_utc = datetime.now(UTC)
+    scored: list[tuple[int, float, float, float, dict]] = []
+    for post in posts:
+        content = str(post.get("content") or "").strip()
+        if not content:
+            continue
+        likes = _as_int(post.get("likes"))
+        retweets = _as_int(post.get("retweets"))
+        replies = _as_int(post.get("replies"))
+        relevance_match = int(
+            _match_count(content, anchor_terms)
+            + _match_count(content, relevance_terms)
+            + _match_count(content, brand_terms)
+        )
+        if relevance_match < min_match:
+            continue
+        quality_score = _content_quality_score(str(post.get("author") or ""), content)
+        engagement_score = min(1.0, math.log1p(max(0, likes + retweets + replies)) / 20.0)
+
+        recency_score = 0.4
+        published_raw = post.get("published_at")
+        if published_raw:
+            try:
+                normalized = str(published_raw).replace("Z", "+00:00")
+                published_dt = datetime.fromisoformat(normalized)
+                if published_dt.tzinfo is None:
+                    published_dt = published_dt.replace(tzinfo=UTC)
+                days_old = max(0.0, (now_utc - published_dt).total_seconds() / 86400.0)
+                recency_score = math.exp(-days_old / 14.0)
+            except Exception:
+                recency_score = 0.4
+
+        scored.append((relevance_match, quality_score, engagement_score, recency_score, post))
+
+    scored.sort(key=lambda item: (item[0], item[1], item[2], item[3]), reverse=True)
+
+    docs: list[RawDocument] = []
+    for _, _, _, _, post in scored:
+        content = str(post.get("content") or "").strip()
+        source_id = str(post.get("source_id") or "").strip()
+        if not content or not source_id:
+            continue
+        docs.append(
+            RawDocument(
+                project_id=project_id,
+                user_id=user_id,
+                source="social_x",
+                source_id=source_id,
+                title=f"@{str(post.get('author') or 'x')}",
+                content=content[:2000],
+                metadata={
+                    "platform": "x",
+                    "author": post.get("author") or "",
+                    "likes": _as_int(post.get("likes")),
+                    "retweets": _as_int(post.get("retweets")),
+                    "replies": _as_int(post.get("replies")),
+                    "quotes": _as_int(post.get("quotes")),
+                    "published_at": post.get("published_at") or "",
+                    "url": post.get("url") or "",
+                    "tool": "ensemble_twitter",
+                },
+            )
+        )
+        if len(docs) >= keep_limit:
+            break
+
+    logger.info("ingest_x.success", project_id=project_id, count=len(docs))
+    if not docs:
+        return await _social_web_fallback_docs(
+            source="social_x",
+            project_id=project_id,
+            user_id=user_id,
+            query=query,
+            keep_limit=keep_limit,
+        )
+    return docs
+
+
+async def _ingest_reddit(
+    *,
+    project_id: str,
+    user_id: str,
+    intent: dict,
+    social_filter: str,
+    project_title: str = "",
+    project_description: str = "",
+    fetch_limit_override: int | None = None,
+    expansion_mode: bool = False,
+) -> list[RawDocument]:
+    """Fetch Reddit posts and map them into social KB documents."""
+    query = _query_for_social(
+        intent,
+        social_filter=social_filter,
+        project_title=project_title,
+        project_description=project_description,
+    )
+    query = re.sub(r"@[A-Za-z0-9_]{2,20}", " ", query)
+    query = re.sub(r"\s+", " ", query).strip()
+    if not query:
+        logger.warning("ingest_reddit.no_query", project_id=project_id)
+        return []
+
+    default_fetch_limit = max(
+        settings.INGEST_SOCIAL_KEEP_LIMIT_PER_SOURCE,
+        settings.INGEST_SOCIAL_FETCH_LIMIT_PER_SOURCE,
+    )
+    fetch_limit = (
+        max(1, int(fetch_limit_override))
+        if isinstance(fetch_limit_override, int) and fetch_limit_override > 0
+        else default_fetch_limit
+    )
+    keep_limit = max(1, settings.INGEST_SOCIAL_KEEP_LIMIT_PER_SOURCE)
+
+    posts: list[dict] = []
+    seen_source_ids: set[str] = set()
+    try:
+        for query_variant in _social_query_variants(
+            intent=intent,
+            base_query=query,
+            social_filter=social_filter,
+            project_title=project_title,
+            project_description=project_description,
+            expanded=expansion_mode,
+        ):
+            batch = await search_reddit_posts(query_variant, limit=fetch_limit)
+            for row in batch:
+                source_id = str(row.get("source_id") or row.get("id") or row.get("url") or "").strip()
+                if not source_id or source_id in seen_source_ids:
+                    continue
+                seen_source_ids.add(source_id)
+                posts.append(row)
+                if len(posts) >= fetch_limit:
+                    break
+            if len(posts) >= fetch_limit:
+                break
+    except Exception:
+        logger.exception("ingest_reddit.failed", project_id=project_id)
+        return await _social_web_fallback_docs(
+            source="social_reddit",
+            project_id=project_id,
+            user_id=user_id,
+            query=query,
+            keep_limit=keep_limit,
+        )
+    if not posts:
+        return await _social_web_fallback_docs(
+            source="social_reddit",
+            project_id=project_id,
+            user_id=user_id,
+            query=query,
+            keep_limit=keep_limit,
+        )
+
+    relevance_terms = _build_relevance_terms(intent, query)
+    brand_terms = _build_brand_terms(intent)
+    anchor_terms = _project_anchor_terms(
+        intent,
+        social_filter=social_filter,
+        project_title=project_title,
+        project_description=project_description,
+    )
+    min_match = max(
+        int(settings.INGEST_SOCIAL_MIN_RELEVANCE_MATCHES),
+        _required_social_match_count(anchor_terms),
+    )
+    now_utc = datetime.now(UTC)
+    scored: list[tuple[int, float, float, float, dict]] = []
+    for post in posts:
+        source_id = str(post.get("source_id") or "").strip()
+        title = str(post.get("title") or "").strip()
+        body = str(post.get("content") or "").strip()
+        content = f"{title}\n\n{body}".strip()
+        if not source_id or not content:
+            continue
+        score_count = _as_int(post.get("score"))
+        comments_count = _as_int(post.get("comments"))
+        relevance_match = int(
+            _match_count(content, anchor_terms)
+            + _match_count(content, relevance_terms)
+            + _match_count(content, brand_terms)
+        )
+        if relevance_match < min_match:
+            continue
+        quality_score = _content_quality_score(title, content)
+        engagement_score = min(1.0, math.log1p(max(0, score_count + comments_count)) / 20.0)
+
+        recency_score = 0.4
+        published_raw = post.get("published_at")
+        if published_raw:
+            try:
+                if isinstance(published_raw, int | float) or str(published_raw).isdigit():
+                    published_dt = datetime.fromtimestamp(float(published_raw), tz=UTC)
+                else:
+                    normalized = str(published_raw).replace("Z", "+00:00")
+                    published_dt = datetime.fromisoformat(normalized)
+                    if published_dt.tzinfo is None:
+                        published_dt = published_dt.replace(tzinfo=UTC)
+                days_old = max(0.0, (now_utc - published_dt).total_seconds() / 86400.0)
+                recency_score = math.exp(-days_old / 21.0)
+            except Exception:
+                recency_score = 0.4
+
+        scored.append((relevance_match, quality_score, engagement_score, recency_score, post))
+
+    scored.sort(key=lambda item: (item[0], item[1], item[2], item[3]), reverse=True)
+
+    docs: list[RawDocument] = []
+    for _, _, _, _, post in scored:
+        source_id = str(post.get("source_id") or "").strip()
+        title = str(post.get("title") or "").strip()
+        body = str(post.get("content") or "").strip()
+        content = f"{title}\n\n{body}".strip()
+        if not source_id or not content:
+            continue
+        docs.append(
+            RawDocument(
+                project_id=project_id,
+                user_id=user_id,
+                source="social_reddit",
+                source_id=source_id,
+                title=title or "Reddit post",
+                content=content[:2000],
+                metadata={
+                    "platform": "reddit",
+                    "author": post.get("author") or "",
+                    "subreddit": post.get("subreddit") or "",
+                    "score": _as_int(post.get("score")),
+                    "comments": _as_int(post.get("comments")),
+                    "published_at": post.get("published_at") or "",
+                    "url": post.get("url") or "",
+                    "tool": "ensemble_reddit",
+                },
+            )
+        )
+        if len(docs) >= keep_limit:
+            break
+
+    logger.info("ingest_reddit.success", project_id=project_id, count=len(docs))
+    if not docs:
+        return await _social_web_fallback_docs(
+            source="social_reddit",
+            project_id=project_id,
+            user_id=user_id,
+            query=query,
+            keep_limit=keep_limit,
+        )
+    return docs
+
+
+async def _ingest_youtube(
+    *,
+    project_id: str,
+    user_id: str,
+    intent: dict,
+    social_filter: str,
+    project_title: str = "",
+    project_description: str = "",
+    fetch_limit_override: int | None = None,
+    expansion_mode: bool = False,
+) -> list[RawDocument]:
+    """Fetch YouTube videos and map them into social KB documents."""
+    query = _query_for_social(
+        intent,
+        social_filter=social_filter,
+        project_title=project_title,
+        project_description=project_description,
+    )
+    query = re.sub(r"@[A-Za-z0-9_]{2,20}", " ", query)
+    query = re.sub(r"\s+", " ", query).strip()
+    if not query:
+        logger.warning("ingest_youtube.no_query", project_id=project_id)
+        return []
+
+    default_fetch_limit = max(
+        settings.INGEST_SOCIAL_KEEP_LIMIT_PER_SOURCE,
+        settings.INGEST_SOCIAL_FETCH_LIMIT_PER_SOURCE,
+    )
+    fetch_limit = (
+        max(1, int(fetch_limit_override))
+        if isinstance(fetch_limit_override, int) and fetch_limit_override > 0
+        else default_fetch_limit
+    )
+    keep_limit = max(1, settings.INGEST_SOCIAL_KEEP_LIMIT_PER_SOURCE)
+
+    videos: list[dict] = []
+    seen_source_ids: set[str] = set()
+    try:
+        for query_variant in _social_query_variants(
+            intent=intent,
+            base_query=query,
+            social_filter=social_filter,
+            project_title=project_title,
+            project_description=project_description,
+            expanded=expansion_mode,
+        ):
+            batch = await search_youtube_videos(query_variant, max_results=fetch_limit)
+            for row in batch:
+                source_id = str(row.get("source_id") or row.get("video_id") or row.get("url") or "").strip()
+                if not source_id or source_id in seen_source_ids:
+                    continue
+                seen_source_ids.add(source_id)
+                videos.append(row)
+                if len(videos) >= fetch_limit:
+                    break
+            if len(videos) >= fetch_limit:
+                break
+    except Exception:
+        logger.exception("ingest_youtube.failed", project_id=project_id)
+        return await _social_web_fallback_docs(
+            source="social_youtube",
+            project_id=project_id,
+            user_id=user_id,
+            query=query,
+            keep_limit=keep_limit,
+        )
+    if not videos:
+        return await _social_web_fallback_docs(
+            source="social_youtube",
+            project_id=project_id,
+            user_id=user_id,
+            query=query,
+            keep_limit=keep_limit,
+        )
+
+    relevance_terms = _build_relevance_terms(intent, query)
+    brand_terms = _build_brand_terms(intent)
+    anchor_terms = _project_anchor_terms(
+        intent,
+        social_filter=social_filter,
+        project_title=project_title,
+        project_description=project_description,
+    )
+    min_match = max(
+        int(settings.INGEST_SOCIAL_MIN_RELEVANCE_MATCHES),
+        _required_social_match_count(anchor_terms),
+    )
+    now_utc = datetime.now(UTC)
+    scored: list[tuple[int, float, float, float, dict]] = []
+    for video in videos:
+        title = str(video.get("title") or "").strip()
+        content = str(video.get("content") or "").strip()
+        if not content:
+            continue
+        likes = _as_int(video.get("likes"))
+        views = _as_int(video.get("views"))
+        comments = _as_int(video.get("comments"))
+        merged_text = f"{title} {content}"
+        relevance_match = int(
+            _match_count(merged_text, anchor_terms)
+            + _match_count(merged_text, relevance_terms)
+            + _match_count(merged_text, brand_terms)
+        )
+        if relevance_match < min_match:
+            continue
+        quality_score = _content_quality_score(title, content)
+        engagement_score = min(1.0, math.log1p(max(0, likes + views + comments)) / 20.0)
+
+        recency_score = 0.4
+        published_raw = video.get("published_at")
+        if published_raw:
+            try:
+                normalized = str(published_raw).replace("Z", "+00:00")
+                published_dt = datetime.fromisoformat(normalized)
+                if published_dt.tzinfo is None:
+                    published_dt = published_dt.replace(tzinfo=UTC)
+                days_old = max(0.0, (now_utc - published_dt).total_seconds() / 86400.0)
+                recency_score = math.exp(-days_old / 21.0)
+            except Exception:
+                recency_score = 0.4
+
+        scored.append((relevance_match, quality_score, engagement_score, recency_score, video))
+
+    if not scored and videos:
+        logger.info("ingest_youtube.relevance_fallback", project_id=project_id, candidate_count=len(videos))
+        for video in videos:
+            title = str(video.get("title") or "").strip()
+            content = str(video.get("content") or "").strip()
+            if not content:
+                continue
+            merged_text = f"{title} {content}"
+            lexical_match = int(
+                _match_count(merged_text, anchor_terms)
+                + _match_count(merged_text, relevance_terms)
+                + _match_count(merged_text, brand_terms)
+            )
+            if lexical_match < 1:
+                continue
+            likes = _as_int(video.get("likes"))
+            views = _as_int(video.get("views"))
+            comments = _as_int(video.get("comments"))
+            quality_score = _content_quality_score(title, content)
+            engagement_score = min(1.0, math.log1p(max(0, likes + views + comments)) / 20.0)
+            scored.append((0, quality_score, engagement_score, 0.4, video))
+
+    scored.sort(key=lambda item: (item[0], item[1], item[2], item[3]), reverse=True)
+
+    docs: list[RawDocument] = []
+    for _, _, _, _, video in scored:
+        source_id = str(video.get("source_id") or "").strip()
+        title = str(video.get("title") or "").strip()
+        content = str(video.get("content") or "").strip()
+        if not source_id or not content:
+            continue
+        docs.append(
+            RawDocument(
+                project_id=project_id,
+                user_id=user_id,
+                source="social_youtube",
+                source_id=source_id,
+                title=title or "YouTube video",
+                content=content[:2000],
+                metadata={
+                    "platform": "youtube",
+                    "author": video.get("author") or "",
+                    "thumbnail_url": video.get("thumbnail_url") or "",
+                    "cover_url": video.get("thumbnail_url") or "",
+                    "likes": _as_int(video.get("likes")),
+                    "views": _as_int(video.get("views")),
+                    "comments": _as_int(video.get("comments")),
+                    "published_at": video.get("published_at") or "",
+                    "url": video.get("url") or "",
+                    "tool": "ensemble_youtube",
+                },
+            )
+        )
+        if len(docs) >= keep_limit:
+            break
+
+    logger.info("ingest_youtube.success", project_id=project_id, count=len(docs))
+    if not docs:
+        return await _social_web_fallback_docs(
+            source="social_youtube",
+            project_id=project_id,
+            user_id=user_id,
+            query=query,
+            keep_limit=keep_limit,
+        )
     return docs
 
 
@@ -1469,7 +3122,21 @@ async def _ingest_papers_openalex(
         logger.warning("ingest_openalex.no_query", project_id=project_id)
         return []
 
-    papers = await fetch_papers(query)
+    papers: list[dict] = []
+    seen_papers: set[str] = set()
+    for query_variant in _query_variants_for_source(intent, query):
+        batch = await fetch_papers(query_variant)
+        for paper in batch:
+            paper_key = str(
+                paper.get("paper_id") or paper.get("doi") or paper.get("title") or ""
+            ).strip()
+            if not paper_key:
+                continue
+            normalized_key = paper_key.lower()
+            if normalized_key in seen_papers:
+                continue
+            seen_papers.add(normalized_key)
+            papers.append(paper)
     logger.info(
         "ingest_project.openalex.papers_fetched",
         project_id=project_id,
@@ -1493,6 +3160,10 @@ async def _ingest_papers_openalex(
                 metadata={
                     "doi": paper.get("doi", ""),
                     "publication_year": paper.get("publication_year", 0),
+                    "url": paper.get("url") or "",
+                    "pdf_url": paper.get("pdf_url") or "",
+                    "open_access_url": paper.get("open_access_url") or "",
+                    "is_open_access": bool(paper.get("is_open_access") or False),
                     "tool": "openalex",
                 },
             )
@@ -1525,12 +3196,26 @@ async def _ingest_papers_semantic_scholar(
         return []
 
     try:
-        papers = await search_semantic_scholar(
-            query,
-            must_match_terms=intent.get("must_match_terms") or [],
-            domain_terms=intent.get("domain_terms") or [],
-            query_specificity=intent.get("query_specificity"),
-        )
+        papers: list[dict] = []
+        seen_papers: set[str] = set()
+        for query_variant in _query_variants_for_source(intent, query):
+            batch = await search_semantic_scholar(
+                query_variant,
+                must_match_terms=intent.get("must_match_terms") or [],
+                domain_terms=intent.get("domain_terms") or [],
+                query_specificity=intent.get("query_specificity"),
+            )
+            for paper in batch:
+                paper_key = str(
+                    paper.get("paper_id") or paper.get("url") or paper.get("title") or ""
+                ).strip()
+                if not paper_key:
+                    continue
+                normalized_key = paper_key.lower()
+                if normalized_key in seen_papers:
+                    continue
+                seen_papers.add(normalized_key)
+                papers.append(paper)
     except Exception:
         logger.exception("ingest_ss.failed", project_id=project_id)
         return []
@@ -1586,12 +3271,26 @@ async def _ingest_papers_pubmed(
         return []
 
     try:
-        papers = await search_pubmed(
-            query,
-            must_match_terms=intent.get("must_match_terms") or [],
-            domain_terms=intent.get("domain_terms") or [],
-            query_specificity=intent.get("query_specificity"),
-        )
+        papers: list[dict] = []
+        seen_papers: set[str] = set()
+        for query_variant in _query_variants_for_source(intent, query):
+            batch = await search_pubmed(
+                query_variant,
+                must_match_terms=intent.get("must_match_terms") or [],
+                domain_terms=intent.get("domain_terms") or [],
+                query_specificity=intent.get("query_specificity"),
+            )
+            for paper in batch:
+                paper_key = str(
+                    paper.get("pmid") or paper.get("url") or paper.get("title") or ""
+                ).strip()
+                if not paper_key:
+                    continue
+                normalized_key = paper_key.lower()
+                if normalized_key in seen_papers:
+                    continue
+                seen_papers.add(normalized_key)
+                papers.append(paper)
     except Exception:
         logger.exception("ingest_pubmed.failed", project_id=project_id)
         return []
@@ -1648,12 +3347,26 @@ async def _ingest_papers_arxiv(
         return []
 
     try:
-        papers = await search_arxiv(
-            query,
-            must_match_terms=intent.get("must_match_terms") or [],
-            domain_terms=intent.get("domain_terms") or [],
-            query_specificity=intent.get("query_specificity"),
-        )
+        papers: list[dict] = []
+        seen_papers: set[str] = set()
+        for query_variant in _query_variants_for_source(intent, query):
+            batch = await search_arxiv(
+                query_variant,
+                must_match_terms=intent.get("must_match_terms") or [],
+                domain_terms=intent.get("domain_terms") or [],
+                query_specificity=intent.get("query_specificity"),
+            )
+            for paper in batch:
+                paper_key = str(
+                    paper.get("arxiv_id") or paper.get("url") or paper.get("title") or ""
+                ).strip()
+                if not paper_key:
+                    continue
+                normalized_key = paper_key.lower()
+                if normalized_key in seen_papers:
+                    continue
+                seen_papers.add(normalized_key)
+                papers.append(paper)
     except Exception:
         logger.exception("ingest_arxiv.failed", project_id=project_id)
         return []
@@ -1708,12 +3421,26 @@ async def _ingest_patents_patentsview(
         return []
 
     try:
-        patents = await search_patentsview(
-            query,
-            must_match_terms=intent.get("must_match_terms") or [],
-            domain_terms=intent.get("domain_terms") or [],
-            query_specificity=intent.get("query_specificity"),
-        )
+        patents: list[dict] = []
+        seen_patents: set[str] = set()
+        for query_variant in _query_variants_for_source(intent, query):
+            batch = await search_patentsview(
+                query_variant,
+                must_match_terms=intent.get("must_match_terms") or [],
+                domain_terms=intent.get("domain_terms") or [],
+                query_specificity=intent.get("query_specificity"),
+            )
+            for patent in batch:
+                patent_key = str(
+                    patent.get("patent_number") or patent.get("url") or patent.get("title") or ""
+                ).strip()
+                if not patent_key:
+                    continue
+                normalized_key = patent_key.lower()
+                if normalized_key in seen_patents:
+                    continue
+                seen_patents.add(normalized_key)
+                patents.append(patent)
     except Exception:
         logger.exception("ingest_patentsview.failed", project_id=project_id)
         return []
@@ -1737,6 +3464,7 @@ async def _ingest_patents_patentsview(
                     "date": patent.get("date") or "",
                     "inventors": patent.get("inventors") or [],
                     "url": patent.get("url") or "",
+                    "fulltext_url": patent.get("url") or "",
                     "claims_snippet": claims_snippet,
                     "tool": "patentsview",
                 },
@@ -1769,7 +3497,21 @@ async def _ingest_patents_lens(
         return []
 
     try:
-        patents = await search_lens(query)
+        patents: list[dict] = []
+        seen_patents: set[str] = set()
+        for query_variant in _query_variants_for_source(intent, query):
+            batch = await search_lens(query_variant)
+            for patent in batch:
+                patent_key = str(
+                    patent.get("lens_id") or patent.get("patent_number") or patent.get("title") or ""
+                ).strip()
+                if not patent_key:
+                    continue
+                normalized_key = patent_key.lower()
+                if normalized_key in seen_patents:
+                    continue
+                seen_patents.add(normalized_key)
+                patents.append(patent)
     except Exception:
         logger.exception("ingest_lens.failed", project_id=project_id)
         return []
@@ -1796,6 +3538,7 @@ async def _ingest_patents_lens(
                     "date": patent.get("date") or "",
                     "inventors": patent.get("inventors") or [],
                     "url": patent.get("url") or "",
+                    "fulltext_url": patent.get("url") or "",
                     "claims_snippet": claims_snippet,
                     "tool": "lens",
                 },
@@ -1817,8 +3560,7 @@ def _query_for_news_or_web(intent: dict, *, source: str = "perigon") -> str:
         or (entities[0] if entities else "")
         or " ".join(str(k) for k in keywords[:4])
     )
-    policy = build_query_policy(str(seed_query or "").strip(), intent)
-    return build_source_query(policy, source)
+    return str(seed_query or "").strip()
 
 
 def _project_context_query(project_title: str, project_description: str) -> str:
@@ -1832,28 +3574,332 @@ def _project_context_query(project_title: str, project_description: str) -> str:
     return " ".join(tokens[:12]).strip()
 
 
+def _social_query_terms(
+    intent: dict,
+    *,
+    social_filter: str = "",
+    project_title: str = "",
+    project_description: str = "",
+) -> list[str]:
+    """Build deterministic high-signal query terms for social retrieval."""
+    search_filters = intent.get("search_filters") or {}
+    terms: list[str] = []
+
+    for value in intent.get("must_match_terms") or []:
+        terms.extend(re.findall(r"[a-zA-Z0-9_]+", str(value or "")))
+    for value in intent.get("entities") or []:
+        terms.extend(re.findall(r"[a-zA-Z0-9_]+", str(value or "")))
+    for value in intent.get("keywords") or []:
+        terms.extend(re.findall(r"[a-zA-Z0-9_]+", str(value or "")))
+    for value in intent.get("domain_terms") or []:
+        terms.extend(re.findall(r"[a-zA-Z0-9_]+", str(value or "")))
+
+    for value in (
+        social_filter,
+        search_filters.get("social"),
+        search_filters.get("tiktok"),
+        search_filters.get("instagram"),
+    ):
+        tokens = re.findall(r"[a-zA-Z0-9_]+", str(value or "").replace("#", " "))
+        terms.extend(tokens)
+
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw in terms:
+        token = str(raw or "").strip().lower().replace("_", " ")
+        token = re.sub(r"\s+", " ", token)
+        token = token.strip()
+        if len(token) < 3:
+            continue
+        if token in _GENERIC_RELEVANCE_TERMS:
+            continue
+        if token in _PROJECT_TEXT_STOPWORDS:
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        cleaned.append(token)
+
+    if not cleaned:
+        context = _project_context_query(project_title, project_description)
+        for raw in re.findall(r"[a-zA-Z0-9_]+", context):
+            token = str(raw or "").strip().lower().replace("_", " ")
+            token = re.sub(r"\s+", " ", token).strip()
+            if len(token) < 3:
+                continue
+            if token in seen:
+                continue
+            seen.add(token)
+            cleaned.append(token)
+
+    return cleaned[:20]
+
+
+def _prioritize_social_terms(intent: dict, terms: list[str], *, budget: int) -> list[str]:
+    """Prioritize must-match/entities first, then fill with remaining terms."""
+    budget = max(1, int(budget))
+    seen: set[str] = set()
+    prioritized: list[str] = []
+
+    priority_terms: list[str] = []
+    for value in intent.get("must_match_terms") or []:
+        priority_terms.extend(re.findall(r"[a-zA-Z0-9_]+", str(value or "")))
+    for value in intent.get("entities") or []:
+        priority_terms.extend(re.findall(r"[a-zA-Z0-9_]+", str(value or "")))
+
+    for raw in priority_terms + terms:
+        token = str(raw or "").strip().lower().replace("_", " ")
+        token = re.sub(r"\s+", " ", token).strip()
+        if len(token) < 3:
+            continue
+        if token in _GENERIC_RELEVANCE_TERMS or token in _PROJECT_TEXT_STOPWORDS:
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        prioritized.append(token)
+        if len(prioritized) >= budget:
+            break
+
+    return prioritized
+
+
 def _query_for_social(
     intent: dict,
     *,
+    social_filter: str = "",
     project_title: str = "",
     project_description: str = "",
 ) -> str:
     """Select a robust social search seed even when intent filters are sparse."""
     search_filters = intent.get("search_filters") or {}
-    keywords = intent.get("keywords") or []
-    entities = intent.get("entities") or []
+    query_budget = max(4, int(settings.INGEST_SOCIAL_QUERY_MAX_TERMS))
+    explicit_handles = [
+        f"@{h.lstrip('@')}"
+        for h in re.findall(
+            r"@[A-Za-z0-9_]{2,20}",
+            " ".join(
+                [
+                    str(social_filter or ""),
+                    str(search_filters.get("social") or ""),
+                    str(project_title or ""),
+                    str(project_description or ""),
+                ]
+            ),
+        )
+    ]
+    explicit_handles = list(dict.fromkeys(explicit_handles))[:2]
 
-    direct = str(search_filters.get("social") or search_filters.get("instagram") or "").strip()
+    direct = str(
+        social_filter or search_filters.get("social") or search_filters.get("instagram") or ""
+    ).strip()
     if direct:
-        return direct
+        tokens: list[str] = []
+        for raw in re.findall(r"[a-zA-Z0-9_]+", direct.replace("#", " ")):
+            token = str(raw or "").strip().lower().replace("_", " ")
+            token = re.sub(r"\s+", " ", token).strip()
+            if len(token) < 3:
+                continue
+            if token in _GENERIC_RELEVANCE_TERMS or token in _PROJECT_TEXT_STOPWORDS:
+                continue
+            tokens.append(token)
+        merged = list(dict.fromkeys(tokens))
+        if len(merged) < 3:
+            extras = _social_query_terms(
+                intent,
+                social_filter=social_filter,
+                project_title=project_title,
+                project_description=project_description,
+            )
+            for token in extras:
+                if token not in merged:
+                    merged.append(token)
+        if len(merged) < 4:
+            context_terms = re.findall(
+                r"[a-zA-Z0-9_]+",
+                _project_context_query(project_title, project_description),
+            )
+            for raw in context_terms:
+                token = str(raw or "").strip().lower().replace("_", " ")
+                token = re.sub(r"\s+", " ", token).strip()
+                if len(token) < 3:
+                    continue
+                if token in _GENERIC_RELEVANCE_TERMS or token in _PROJECT_TEXT_STOPWORDS:
+                    continue
+                if token in merged:
+                    continue
+                merged.append(token)
+        merged = _prioritize_social_terms(intent, merged, budget=query_budget)
+        if merged:
+            return " ".join(explicit_handles + merged).strip()
 
-    terms = [str(value).strip() for value in keywords[:4] if str(value).strip()]
-    if not terms:
-        terms = [str(value).strip() for value in entities[:3] if str(value).strip()]
+    terms = _social_query_terms(
+        intent,
+        social_filter=social_filter,
+        project_title=project_title,
+        project_description=project_description,
+    )
+    terms = _prioritize_social_terms(intent, terms, budget=query_budget)
     if terms:
-        return " ".join(terms)
+        return " ".join(explicit_handles + terms).strip()
 
-    return _project_context_query(project_title, project_description)
+    fallback_query = _project_context_query(project_title, project_description)
+    return " ".join(explicit_handles + [fallback_query]).strip()
+
+
+def _query_variants_for_source(intent: dict, base_query: str) -> list[str]:
+    """Build bounded query variants: base + focused term/phrase queries from intent."""
+    base = str(base_query or "").strip()
+    if not base:
+        return []
+    max_variants = max(1, int(settings.INGEST_QUERY_VARIANTS_PER_SOURCE))
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _push(query: str) -> None:
+        cleaned = re.sub(r"\s+", " ", str(query or "")).strip()
+        if not cleaned:
+            return
+        key = cleaned.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(cleaned)
+
+    _push(base)
+    focused_phrases: list[str] = []
+    for value in (
+        *(intent.get("must_match_terms") or []),
+        *(intent.get("entities") or []),
+        *(intent.get("keywords") or []),
+        *(intent.get("domain_terms") or []),
+    ):
+        phrase = re.sub(r"\s+", " ", str(value or "").replace("#", " ")).strip().lower()
+        if not phrase:
+            continue
+        words = [w for w in re.findall(r"[a-zA-Z0-9_]+", phrase) if len(w) >= 3]
+        if not words:
+            continue
+        normalized_words: list[str] = []
+        for word in words:
+            lowered = word.lower()
+            if lowered in _GENERIC_RELEVANCE_TERMS or lowered in _PROJECT_TEXT_STOPWORDS:
+                continue
+            normalized_words.append(lowered)
+        if not normalized_words:
+            continue
+        focused = " ".join(normalized_words[:4]).strip()
+        if not focused:
+            continue
+        focused_phrases.append(focused)
+
+    for focused in focused_phrases:
+        _push(focused)
+        if len(out) >= max_variants:
+            break
+        _push(f"{focused} {base}")
+        if len(out) >= max_variants:
+            break
+
+    if len(out) < max_variants:
+        token_pool: list[str] = []
+        for phrase in focused_phrases:
+            token_pool.extend(re.findall(r"[a-zA-Z0-9_]+", phrase))
+        for raw in token_pool:
+            token = str(raw or "").strip().lower()
+            if len(token) < 3:
+                continue
+            if token in _GENERIC_RELEVANCE_TERMS or token in _PROJECT_TEXT_STOPWORDS:
+                continue
+            _push(f"{base} {token}")
+            if len(out) >= max_variants:
+                break
+    return out
+
+
+def _social_query_variants(
+    *,
+    intent: dict,
+    base_query: str,
+    social_filter: str,
+    project_title: str,
+    project_description: str,
+    expanded: bool = False,
+) -> list[str]:
+    """Build bounded social query variants with deterministic term-level fanout."""
+    base = str(base_query or "").strip()
+    if not base:
+        return []
+
+    max_variants = (
+        max(1, int(settings.INGEST_SOCIAL_EXPANSION_MAX_VARIANTS))
+        if expanded
+        else max(1, int(settings.INGEST_SOCIAL_TIER1_MAX_VARIANTS))
+    )
+    probe_terms = max(0, int(settings.INGEST_SOCIAL_TIER1_PROBE_TERMS))
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _push(query: str) -> None:
+        cleaned = re.sub(r"\s+", " ", str(query or "")).strip()
+        if not cleaned:
+            return
+        key = cleaned.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(cleaned)
+
+    _push(base)
+    if len(out) >= max_variants:
+        return out[:max_variants]
+
+    budget = (
+        max(8, int(settings.INGEST_SOCIAL_EXPANDED_QUERY_MAX_TERMS))
+        if expanded
+        else max(4, int(settings.INGEST_SOCIAL_QUERY_MAX_TERMS))
+    )
+    terms = _social_query_terms(
+        intent,
+        social_filter=social_filter,
+        project_title=project_title,
+        project_description=project_description,
+    )
+    terms = _prioritize_social_terms(intent, terms, budget=budget)
+    if not terms:
+        for raw in re.findall(r"[a-zA-Z0-9_]+", base):
+            token = str(raw or "").strip().lower()
+            if len(token) < 3:
+                continue
+            if token in _GENERIC_RELEVANCE_TERMS or token in _PROJECT_TEXT_STOPWORDS:
+                continue
+            terms.append(token)
+            if len(terms) >= budget:
+                break
+
+    for term in terms[:probe_terms]:
+        _push(term)
+        if len(out) >= max_variants:
+            return out[:max_variants]
+        _push(f"{base} {term}")
+        if len(out) >= max_variants:
+            return out[:max_variants]
+
+    if len(terms) >= 2:
+        _push(f"{terms[0]} {terms[1]}")
+        if len(out) >= max_variants:
+            return out[:max_variants]
+        _push(f"{base} {terms[0]} {terms[1]}")
+        if len(out) >= max_variants:
+            return out[:max_variants]
+
+    if len(out) < max_variants:
+        for variant in _query_variants_for_source(intent, base):
+            _push(variant)
+            if len(out) >= max_variants:
+                break
+
+    return out[:max_variants]
 
 
 def _query_for_papers(
@@ -1871,28 +3917,48 @@ def _query_for_papers(
 
     direct = str(search_filters.get("papers") or "").strip()
     if direct:
-        policy = build_query_policy(direct, intent)
-        return build_source_query(policy, source)
+        return direct
 
     news_fallback = str(search_filters.get("news") or "").strip()
     if news_fallback:
-        policy = build_query_policy(news_fallback, intent)
-        return build_source_query(policy, source)
+        return news_fallback
 
     terms = [str(value).strip() for value in entities[:2] if str(value).strip()]
     terms.extend(str(value).strip() for value in keywords[:6] if str(value).strip())
     if terms:
-        policy = build_query_policy(" ".join(terms), intent)
-        return build_source_query(policy, source)
+        return " ".join(terms)
 
     social_fallback = str(social_filter or "").replace("#", " ").strip()
     if social_fallback:
-        policy = build_query_policy(social_fallback, intent)
-        return build_source_query(policy, source)
+        return social_fallback
 
-    fallback = _project_context_query(project_title, project_description)
-    policy = build_query_policy(fallback, intent)
-    return build_source_query(policy, source)
+    return _project_context_query(project_title, project_description)
+
+
+def _build_expanded_social_filter(
+    intent: dict,
+    *,
+    social_filter: str,
+    project_title: str,
+    project_description: str,
+) -> str:
+    """Build a broader social query used only in low-data expansion pass."""
+    budget = max(8, int(settings.INGEST_SOCIAL_EXPANDED_QUERY_MAX_TERMS))
+    terms = _social_query_terms(
+        intent,
+        social_filter=social_filter,
+        project_title=project_title,
+        project_description=project_description,
+    )
+    terms = _prioritize_social_terms(intent, terms, budget=budget)
+    if terms:
+        return " ".join(terms)
+    return _query_for_social(
+        intent,
+        social_filter=social_filter,
+        project_title=project_title,
+        project_description=project_description,
+    )
 
 
 def _query_for_patents(
@@ -1909,23 +3975,16 @@ def _query_for_patents(
 
     direct = str(search_filters.get("patents") or search_filters.get("papers") or "").strip()
     if direct:
-        policy = build_query_policy(direct, intent)
-        return build_source_query(policy, source)
+        return direct
 
     terms: list[str] = []
     if entities:
         terms.append(str(entities[0]))
     terms.extend(str(keyword) for keyword in keywords[:4] if str(keyword).strip())
     if terms:
-        policy = build_query_policy(
-            " ".join(term.strip() for term in terms if term.strip()),
-            intent,
-        )
-        return build_source_query(policy, source)
+        return " ".join(term.strip() for term in terms if term.strip())
 
-    fallback = _project_context_query(project_title, project_description)
-    policy = build_query_policy(fallback, intent)
-    return build_source_query(policy, source)
+    return _project_context_query(project_title, project_description)
 
 
 def _looks_like_patent_url(url: str) -> bool:
@@ -1965,14 +4024,15 @@ async def _ingest_patents_web_fallback(
         return []
 
     candidates: list[dict] = []
-    try:
-        candidates.extend(await search_exa(f"{query} patents"))
-    except Exception:
-        logger.exception("ingest_patent_fallback.exa_failed", project_id=project_id)
-    try:
-        candidates.extend(await search_tavily(f"{query} patents"))
-    except Exception:
-        logger.exception("ingest_patent_fallback.tavily_failed", project_id=project_id)
+    for query_variant in _query_variants_for_source(intent, query):
+        try:
+            candidates.extend(await search_exa(f"{query_variant} patents"))
+        except Exception:
+            logger.exception("ingest_patent_fallback.exa_failed", project_id=project_id)
+        try:
+            candidates.extend(await search_tavily(f"{query_variant} patents"))
+        except Exception:
+            logger.exception("ingest_patent_fallback.tavily_failed", project_id=project_id)
 
     seen_urls: set[str] = set()
     docs: list[RawDocument] = []
@@ -2029,12 +4089,26 @@ async def _ingest_news(
         return []
 
     try:
-        articles = await search_perigon(
-            query,
-            must_match_terms=intent.get("must_match_terms") or [],
-            domain_terms=intent.get("domain_terms") or [],
-            query_specificity=intent.get("query_specificity"),
-        )
+        articles: list[dict] = []
+        seen_articles: set[str] = set()
+        for query_variant in _query_variants_for_source(intent, query):
+            batch = await search_perigon(
+                query_variant,
+                must_match_terms=intent.get("must_match_terms") or [],
+                domain_terms=intent.get("domain_terms") or [],
+                query_specificity=intent.get("query_specificity"),
+            )
+            for article in batch:
+                article_key = str(
+                    article.get("url") or article.get("id") or article.get("title") or ""
+                ).strip()
+                if not article_key:
+                    continue
+                normalized_key = article_key.lower()
+                if normalized_key in seen_articles:
+                    continue
+                seen_articles.add(normalized_key)
+                articles.append(article)
     except Exception:
         logger.exception("ingest_news.failed", project_id=project_id)
         return []
@@ -2080,7 +4154,19 @@ async def _ingest_web_tavily(
         return []
 
     try:
-        results = await search_tavily(query)
+        results: list[dict] = []
+        seen_results: set[str] = set()
+        for query_variant in _query_variants_for_source(intent, query):
+            batch = await search_tavily(query_variant)
+            for row in batch:
+                result_key = str(row.get("url") or row.get("title") or "").strip()
+                if not result_key:
+                    continue
+                normalized_key = result_key.lower()
+                if normalized_key in seen_results:
+                    continue
+                seen_results.add(normalized_key)
+                results.append(row)
     except Exception:
         logger.exception("ingest_tavily.failed", project_id=project_id)
         return []
@@ -2126,7 +4212,19 @@ async def _ingest_web_exa(
         return []
 
     try:
-        results = await search_exa(query)
+        results: list[dict] = []
+        seen_results: set[str] = set()
+        for query_variant in _query_variants_for_source(intent, query):
+            batch = await search_exa(query_variant)
+            for row in batch:
+                result_key = str(row.get("url") or row.get("title") or "").strip()
+                if not result_key:
+                    continue
+                normalized_key = result_key.lower()
+                if normalized_key in seen_results:
+                    continue
+                seen_results.add(normalized_key)
+                results.append(row)
     except Exception:
         logger.exception("ingest_exa.failed", project_id=project_id)
         return []

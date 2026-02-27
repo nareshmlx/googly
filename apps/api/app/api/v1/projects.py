@@ -16,7 +16,14 @@ from app.api.ownership import require_owned_project
 from app.core.arq import get_arq_pool
 from app.core.auth import get_current_user, verify_internal_token
 from app.core.constants import ProjectRefresh
-from app.models.schemas import DiscoverItem, IngestStatusResponse, ProjectCreate, ProjectResponse
+from app.models.schemas import (
+    DiscoverItem,
+    IngestStatusResponse,
+    ProjectBootstrapRequest,
+    ProjectCreate,
+    ProjectResponse,
+    ProjectSetupStatusResponse,
+)
 from app.services import project as project_service
 
 logger = structlog.get_logger(__name__)
@@ -65,6 +72,9 @@ def _serialize_project(p: dict) -> ProjectResponse:
         kb_chunk_count=p.get("kb_chunk_count") or 0,
         tiktok_enabled=p.get("tiktok_enabled", True),
         instagram_enabled=p.get("instagram_enabled", True),
+        youtube_enabled=p.get("youtube_enabled", True),
+        reddit_enabled=p.get("reddit_enabled", True),
+        x_enabled=p.get("x_enabled", True),
         papers_enabled=p.get("papers_enabled", True),
         patents_enabled=p.get("patents_enabled", True),
         perigon_enabled=p.get("perigon_enabled", True),
@@ -83,16 +93,43 @@ def _row_to_discover_item(row: dict) -> DiscoverItem | None:
     Returns None for unsupported source types.
     """
     raw_source = str(row.get("source") or "search")
-    source: Literal["tiktok", "instagram", "paper", "patent", "news", "search"] | None = (
+    source: Literal[
+        "tiktok",
+        "instagram",
+        "youtube",
+        "reddit",
+        "x",
+        "paper",
+        "patent",
+        "news",
+        "search",
+    ] | None = (
         "tiktok"
         if raw_source == "social_tiktok"
         else "instagram"
         if raw_source == "social_instagram"
+        else "youtube"
+        if raw_source == "social_youtube"
+        else "reddit"
+        if raw_source == "social_reddit"
+        else "x"
+        if raw_source == "social_x"
         else None
     )
     if raw_source in {"paper", "patent", "news", "search"}:
         source = cast(
-            Literal["tiktok", "instagram", "paper", "patent", "news", "search"], raw_source
+            Literal[
+                "tiktok",
+                "instagram",
+                "youtube",
+                "reddit",
+                "x",
+                "paper",
+                "patent",
+                "news",
+                "search",
+            ],
+            raw_source,
         )
     if source is None:
         logger.warning("projects.discover.unsupported_source", source=raw_source)
@@ -199,6 +236,9 @@ async def create_project(
             arq_pool=arq_pool,
             tiktok_enabled=body.tiktok_enabled,
             instagram_enabled=body.instagram_enabled,
+            youtube_enabled=body.youtube_enabled,
+            reddit_enabled=body.reddit_enabled,
+            x_enabled=body.x_enabled,
             papers_enabled=body.papers_enabled,
             patents_enabled=body.patents_enabled,
             perigon_enabled=body.perigon_enabled,
@@ -289,3 +329,42 @@ async def get_ingest_status(
         coro=project_service.get_project_ingest_status(project_id),
     )
     return IngestStatusResponse(**payload)
+
+
+@router.post("/{project_id}/bootstrap", response_model=ProjectSetupStatusResponse)
+async def bootstrap_project(
+    project_id: str,
+    body: ProjectBootstrapRequest,
+    current_user: dict = Depends(get_current_user),
+    arq_pool=Depends(get_arq_pool),
+):
+    """Enqueue async project setup/bootstrap with idempotent active-run handling."""
+    user_id = current_user["user_id"]
+    await require_owned_project(project_id, user_id)
+    payload = await _run_service_call(
+        action="bootstrap",
+        detail="Failed to bootstrap project setup",
+        coro=project_service.enqueue_project_bootstrap(
+            project_id=project_id,
+            user_id=user_id,
+            upload_ids=body.upload_ids,
+            arq_pool=arq_pool,
+        ),
+    )
+    return ProjectSetupStatusResponse(**payload)
+
+
+@router.get("/{project_id}/setup-status", response_model=ProjectSetupStatusResponse)
+async def get_setup_status(
+    project_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Return latest async setup/bootstrap status for a project."""
+    user_id = current_user["user_id"]
+    await require_owned_project(project_id, user_id)
+    payload = await _run_service_call(
+        action="setup_status",
+        detail="Failed to fetch setup status",
+        coro=project_service.get_project_setup_status(project_id),
+    )
+    return ProjectSetupStatusResponse(**payload)

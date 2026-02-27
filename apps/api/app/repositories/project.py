@@ -26,6 +26,9 @@ async def insert_project(
     refresh_strategy: str,
     tiktok_enabled: bool,
     instagram_enabled: bool,
+    youtube_enabled: bool,
+    reddit_enabled: bool,
+    x_enabled: bool,
     papers_enabled: bool,
     patents_enabled: bool,
     perigon_enabled: bool,
@@ -46,15 +49,16 @@ async def insert_project(
             INSERT INTO projects
                 (id, user_id, title, description, refresh_strategy,
                  structured_intent, kb_chunk_count,
-                 tiktok_enabled, instagram_enabled, papers_enabled,
-                 patents_enabled, perigon_enabled, tavily_enabled, exa_enabled,
-                 created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6::jsonb, 0, $7, $8, $9, $10, $11, $12, $13, $14, $14)
+                 tiktok_enabled, instagram_enabled, youtube_enabled, reddit_enabled, x_enabled,
+                 papers_enabled, patents_enabled, perigon_enabled, tavily_enabled, exa_enabled,
+                 metadata, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6::jsonb, 0, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17::jsonb, $18, $18)
             RETURNING id::text, user_id, title, description,
                       refresh_strategy, structured_intent,
                       kb_chunk_count,
-                      tiktok_enabled, instagram_enabled, papers_enabled,
+                      tiktok_enabled, instagram_enabled, youtube_enabled, reddit_enabled, x_enabled, papers_enabled,
                       patents_enabled, perigon_enabled, tavily_enabled, exa_enabled,
+                      metadata,
                       created_at, updated_at,
                       last_refreshed_at
             """,
@@ -66,11 +70,15 @@ async def insert_project(
             json.dumps({}),
             tiktok_enabled,
             instagram_enabled,
+            youtube_enabled,
+            reddit_enabled,
+            x_enabled,
             papers_enabled,
             patents_enabled,
             perigon_enabled,
             tavily_enabled,
             exa_enabled,
+            json.dumps({}),
             now,
         )
     return dict(row)
@@ -92,8 +100,9 @@ async def fetch_project(
             """
             SELECT id::text, user_id, title, description,
                    refresh_strategy, structured_intent,
-                   kb_chunk_count, tiktok_enabled, instagram_enabled, papers_enabled,
+                   kb_chunk_count, tiktok_enabled, instagram_enabled, youtube_enabled, reddit_enabled, x_enabled, papers_enabled,
                    patents_enabled, perigon_enabled, tavily_enabled, exa_enabled,
+                   metadata,
                    created_at, updated_at, last_refreshed_at
             FROM projects
             WHERE id = $1::uuid AND user_id = $2
@@ -114,8 +123,9 @@ async def fetch_project_by_id(
             """
             SELECT id::text, user_id, title, description,
                    refresh_strategy, structured_intent,
-                   kb_chunk_count, tiktok_enabled, instagram_enabled, papers_enabled,
+                   kb_chunk_count, tiktok_enabled, instagram_enabled, youtube_enabled, reddit_enabled, x_enabled, papers_enabled,
                    patents_enabled, perigon_enabled, tavily_enabled, exa_enabled,
+                   metadata,
                    created_at, updated_at, last_refreshed_at
             FROM projects
             WHERE id = $1::uuid
@@ -160,8 +170,9 @@ async def list_projects(
             """
             SELECT id::text, user_id, title, description,
                    refresh_strategy, structured_intent,
-                   kb_chunk_count, tiktok_enabled, instagram_enabled, papers_enabled,
+                   kb_chunk_count, tiktok_enabled, instagram_enabled, youtube_enabled, reddit_enabled, x_enabled, papers_enabled,
                    patents_enabled, perigon_enabled, tavily_enabled, exa_enabled,
+                   metadata,
                    created_at, updated_at, last_refreshed_at
             FROM projects
             WHERE user_id = $1
@@ -214,6 +225,21 @@ async def fetch_discover_feed(
             """
             WITH project_embedding AS (
                 SELECT intent_embedding
+                FROM projects
+                WHERE id = $1::uuid
+            ),
+            project_flags AS (
+                SELECT
+                    tiktok_enabled,
+                    instagram_enabled,
+                    youtube_enabled,
+                    reddit_enabled,
+                    x_enabled,
+                    papers_enabled,
+                    patents_enabled,
+                    perigon_enabled,
+                    tavily_enabled,
+                    exa_enabled
                 FROM projects
                 WHERE id = $1::uuid
             ),
@@ -306,6 +332,75 @@ async def fetch_discover_feed(
                                     )
                                 ) / 20.0
                             )
+                        WHEN 'social_youtube' THEN
+                            LEAST(
+                                1.0,
+                                LOG(
+                                    1
+                                    + GREATEST(
+                                        0,
+                                        CASE
+                                            WHEN (kc.metadata->>'likes') ~ '^-?[0-9]+$'
+                                            THEN (kc.metadata->>'likes')::int
+                                            ELSE 0
+                                        END
+                                    )
+                                    + GREATEST(
+                                        0,
+                                        CASE
+                                            WHEN (kc.metadata->>'views') ~ '^-?[0-9]+$'
+                                            THEN (kc.metadata->>'views')::int
+                                            ELSE 0
+                                        END
+                                    )
+                                ) / 20.0
+                            )
+                        WHEN 'social_reddit' THEN
+                            LEAST(
+                                1.0,
+                                LOG(
+                                    1
+                                    + GREATEST(
+                                        0,
+                                        CASE
+                                            WHEN (kc.metadata->>'score') ~ '^-?[0-9]+$'
+                                            THEN (kc.metadata->>'score')::int
+                                            ELSE 0
+                                        END
+                                    )
+                                    + GREATEST(
+                                        0,
+                                        CASE
+                                            WHEN (kc.metadata->>'comments') ~ '^-?[0-9]+$'
+                                            THEN (kc.metadata->>'comments')::int
+                                            ELSE 0
+                                        END
+                                    )
+                                ) / 20.0
+                            )
+                        WHEN 'social_x' THEN
+                            LEAST(
+                                1.0,
+                                LOG(
+                                    1
+                                    + GREATEST(
+                                        0,
+                                        CASE
+                                            WHEN (kc.metadata->>'likes') ~ '^-?[0-9]+$'
+                                            THEN (kc.metadata->>'likes')::int
+                                            ELSE 0
+                                        END
+                                    )
+                                    + GREATEST(
+                                        0,
+                                        CASE
+                                            WHEN (kc.metadata->>'retweets') ~ '^-?[0-9]+$'
+                                            THEN (kc.metadata->>'retweets')::int
+                                            ELSE 0
+                                        END
+                                    )
+                                ) / 20.0
+                            )
                         WHEN 'search' THEN
                             CASE
                                 WHEN (kc.metadata->>'score') ~ '^-?[0-9]+(\\.[0-9]+)?$'
@@ -316,14 +411,29 @@ async def fetch_discover_feed(
                     END AS quality
                 FROM knowledge_chunks AS kc
                 CROSS JOIN project_embedding AS pe
+                CROSS JOIN project_flags AS pf
                 WHERE kc.project_id = $1::uuid
                   AND kc.source IN (
                       'social_tiktok',
                       'social_instagram',
+                      'social_youtube',
+                      'social_reddit',
+                      'social_x',
                       'paper',
                       'patent',
                       'news',
                       'search'
+                  )
+                  AND (
+                      (kc.source = 'social_tiktok' AND pf.tiktok_enabled)
+                      OR (kc.source = 'social_instagram' AND pf.instagram_enabled)
+                      OR (kc.source = 'social_youtube' AND pf.youtube_enabled)
+                      OR (kc.source = 'social_reddit' AND pf.reddit_enabled)
+                      OR (kc.source = 'social_x' AND pf.x_enabled)
+                      OR (kc.source = 'paper' AND pf.papers_enabled)
+                      OR (kc.source = 'patent' AND pf.patents_enabled)
+                      OR (kc.source = 'news' AND pf.perigon_enabled)
+                      OR (kc.source = 'search' AND (pf.tavily_enabled OR pf.exa_enabled))
                   )
             )
             SELECT
@@ -360,7 +470,6 @@ async def fetch_discover_feed(
                 END AS score
             FROM scored
             ORDER BY score DESC
-            LIMIT 100
             """,
             project_id,
         )
@@ -437,6 +546,28 @@ async def update_project_kb_stats(
         )
 
 
+async def increment_project_kb_stats(
+    pool: asyncpg.Pool,
+    project_id: str,
+    chunk_delta: int,
+    refreshed_at: datetime,
+) -> None:
+    """Increment kb_chunk_count by delta and update last_refreshed_at."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE projects
+            SET kb_chunk_count = GREATEST(0, kb_chunk_count + $1),
+                last_refreshed_at = $2,
+                updated_at = NOW()
+            WHERE id = $3::uuid
+            """,
+            int(chunk_delta),
+            refreshed_at,
+            project_id,
+        )
+
+
 async def delete_project(
     pool: asyncpg.Pool,
     project_id: str,
@@ -461,3 +592,70 @@ async def delete_project(
     # result is 'DELETE N' — N=0 means nothing matched.
     # Guard against None (asyncpg execute should always return a string, but be defensive).
     return (result or "DELETE 0").split()[-1] != "0"
+
+
+async def update_project_metadata(
+    pool: asyncpg.Pool,
+    project_id: str,
+    metadata: dict,
+) -> None:
+    """Overwrite project metadata JSON and bump updated_at."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE projects
+            SET metadata = $1::jsonb,
+                updated_at = NOW()
+            WHERE id = $2::uuid
+            """,
+            json.dumps(metadata),
+            project_id,
+        )
+
+
+async def update_project_setup_status_metadata(
+    pool: asyncpg.Pool,
+    project_id: str,
+    setup_status: dict,
+) -> None:
+    """Persist latest setup status under metadata.setup_status."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE projects
+            SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('setup_status', $1::jsonb),
+                updated_at = NOW()
+            WHERE id = $2::uuid
+            """,
+            json.dumps(setup_status),
+            project_id,
+        )
+
+
+async def fetch_upload_chunk_summaries(
+    pool: asyncpg.Pool,
+    project_id: str,
+    upload_ids: list[str],
+    *,
+    limit: int = 40,
+) -> list[str]:
+    """Return recent upload chunk snippets for provided upload IDs."""
+    if not upload_ids:
+        return []
+    async with pool.acquire() as conn, conn.transaction():
+        await conn.execute("SELECT set_config('app.accessible_projects', $1, true)", str(project_id))
+        rows = await conn.fetch(
+            """
+            SELECT content
+            FROM knowledge_chunks
+            WHERE project_id = $1::uuid
+              AND source = 'upload'
+              AND source_id = ANY($2::text[])
+            ORDER BY created_at DESC
+            LIMIT $3
+            """,
+            project_id,
+            upload_ids,
+            limit,
+        )
+    return [str(row.get("content") or "")[:300] for row in rows if str(row.get("content") or "").strip()]

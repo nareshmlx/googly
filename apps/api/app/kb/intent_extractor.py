@@ -33,43 +33,42 @@ def _get_client() -> AsyncOpenAI:
 
 
 _EXTRACT_SYSTEM = """\
-You are a domain-expert beauty and cosmetics research analyst.
+You are a domain-agnostic research intent analyst.
 Extract structured research intent from a project description.
 Output ONLY valid JSON — no prose, no markdown fences.
 
 Before producing JSON, reason through these questions internally:
-1. What is the most specific BEAUTY domain label? (e.g. "cosmetic_formulation" not "beauty"; "fragrance_trends" not "general")
-2. What brands, companies, or product lines are relevant? (expand beyond the user's words — e.g. "P&G" → Olay, SK-II, Pantene, Gillette)
-3. What active compounds, ingredients, or technical terms are central? (e.g. "active ingredients" → retinol, niacinamide, hyaluronic acid, peptides, AHA, BHA)
-4. What practitioners or creators discuss this topic? (dermatologists, cosmetic chemists, formulators, beauty editors)
+1. What is the most specific domain label? (e.g. "cosmetic_formulation", "battery_materials", "llm_evaluation")
+2. What named entities are relevant? (brands, companies, products, compounds, frameworks, standards)
+3. What technical terms are central?
+4. What practitioners or creators discuss this topic?
 5. What academic/journal terms would appear in a paper abstract about this topic?
-6. What hashtags do practitioners actually use on TikTok and Instagram — not the user's words, but what experts in this field post under?
-7. What 1–3 word descriptive phrase best characterises this space for an Instagram user search? (This is used to find relevant accounts — keep it short and natural, like "skincare science" or "beauty chemistry")
+6. What hashtags are actually used on social platforms for this topic?
+7. What 1–3 word descriptive phrase best characterises this space for Instagram account search?
 
 Schema:
 {
-  "domain": "<most specific beauty/cosmetics/fragrance snake_case label, e.g. cosmetic_formulation, makeup_trends, fragrance_market>",
+  "domain": "<specific snake_case domain label, e.g. cosmetic_formulation, battery_recycling, llm_safety>",
   "keywords": ["<expanded keyword1>", "<expanded keyword2>", ...],
   "search_filters": {
-    "news": "<natural language query for news APIs — expanded brand/product names, no hashtags>",
-    "papers": "<natural language query for academic paper APIs — use technical/scientific terms, no hashtags, no # symbols>",
+    "news": "<natural language query for news APIs — domain terms/entities, no hashtags>",
+    "papers": "<natural language query for academic paper APIs — technical/scientific terms, no hashtags, no # symbols>",
     "patents": "<natural language query for patent APIs — company names + technical terms, no hashtags>",
-    "tiktok": "<hashtags for TikTok search — what practitioners actually use, e.g. #skincare #retinol #niacinamide #cosmeticchemist>",
+    "tiktok": "<hashtags for TikTok search when applicable; may be empty if topic is not social-native>",
     "social": "<same as tiktok — kept for backwards compatibility>",
-    "instagram": "<1–3 word descriptive phrase for Instagram user search, e.g. 'skincare science' or 'beauty chemistry' — NO hashtags, NO long strings>"
+    "instagram": "<1–3 word phrase for Instagram account search, no hashtags>"
   },
   "confidence": <float 0.0–1.0>
 }
 
 Rules:
 - domain: most specific label possible, always snake_case — think like a librarian classifying a journal
-- keywords: 5–10 terms — expand beyond the user's words to expert vocabulary (brands, compounds, techniques)
-- Stay strictly in beauty/cosmetics/fragrance/haircare/personal-care scope.
-- If the prompt is ambiguous, still map to the nearest beauty/cosmetics/fragrance domain.
+- keywords: 5–10 terms — expand beyond the user's words to expert vocabulary
+- Never force a domain that is not present in the user description or sample text.
 - search_filters.papers: natural language only — no hashtags, no # symbols, no boolean operators
-- search_filters.tiktok: hashtag format (#) — use what practitioners post under, not what the user typed
+- search_filters.tiktok: hashtag format (#) when used; keep concise and topic-focused
 - search_filters.social: exact copy of tiktok (backwards compatibility)
-- search_filters.instagram: SHORT — 1–3 words max, descriptive, no hashtags — used for EnsembleData user search
+- search_filters.instagram: SHORT — 1–3 words max, descriptive, no hashtags
 - confidence: 1.0 = unambiguous domain, 0.5 = could be multiple domains
 - Output ONLY the JSON object, nothing else
 """
@@ -96,8 +95,6 @@ Rules:
 """
 
 _GENERIC_KEYWORDS: set[str] = {
-    "beauty",
-    "fashion",
     "research",
     "trend",
     "trends",
@@ -345,19 +342,15 @@ async def refine_intent(
         )
         text = response.choices[0].message.content or ""
         refined = json.loads(text.strip())
-        # refined_at is always Python-generated — never trust the LLM to produce timestamps.
         refined["refined_at"] = datetime.now(UTC).isoformat()
         logger.info(
             "intent_extractor.refine.success",
             new_domain=refined.get("domain"),
             keyword_count=len(refined.get("keywords", [])),
         )
-        # Deep-merge search_filters: LLM may omit sub-keys it didn't change,
-        # which would silently delete tiktok/social/instagram on a shallow merge.
-        existing_filters = existing_intent.get("search_filters") or {}
-        refined_filters = refined.get("search_filters") or {}
+        existing_filters = _as_mapping(existing_intent.get("search_filters"))
+        refined_filters = _as_mapping(refined.get("search_filters"))
         merged_filters = {**existing_filters, **refined_filters}
-        # social must always mirror tiktok — unconditional, never diverge.
         merged_filters["social"] = merged_filters.get("tiktok") or merged_filters.get("social", "")
         refined["search_filters"] = merged_filters
         return _postprocess_intent({**existing_intent, **refined}, description="")
@@ -371,6 +364,115 @@ async def refine_intent(
             error=str(exc),
         )
         return existing_intent
+
+
+async def extract_document_intent(new_chunk_summaries: list[str]) -> dict:
+    """Extract intent signal from uploaded document summaries only."""
+    if not new_chunk_summaries:
+        return {}
+    combined = "\n".join(s for s in new_chunk_summaries if s.strip())
+    if not combined.strip():
+        return {}
+    return await extract_intent(
+        "Document-based intent refinement from uploaded project files.",
+        sample_text=combined[:4000],
+    )
+
+
+def _weighted_union(description_terms: list[str], document_terms: list[str]) -> list[str]:
+    """Merge terms with description-first weighting and deterministic ordering."""
+    rank: dict[str, tuple[int, int, str]] = {}
+    order = 0
+    for term in description_terms:
+        value = str(term or "").strip()
+        key = value.lower()
+        if not key:
+            continue
+        if key not in rank:
+            rank[key] = (2, order, value)
+        else:
+            rank[key] = (rank[key][0] + 2, rank[key][1], rank[key][2])
+        order += 1
+    for term in document_terms:
+        value = str(term or "").strip()
+        key = value.lower()
+        if not key:
+            continue
+        if key not in rank:
+            rank[key] = (1, order, value)
+        else:
+            rank[key] = (rank[key][0] + 1, rank[key][1], rank[key][2])
+        order += 1
+    ordered = sorted(rank.values(), key=lambda item: (-item[0], item[1]))
+    return [item[2] for item in ordered]
+
+
+def _enrich_text_filter(base_text: str, doc_text: str) -> str:
+    """Append missing high-signal doc terms without overriding base filter intent."""
+    base = str(base_text or "").strip()
+    doc = str(doc_text or "").strip()
+    if not base:
+        return doc
+    if not doc:
+        return base
+    base_tokens = set(_tokenize(base))
+    doc_tokens = [t for t in _tokenize(doc) if t not in base_tokens]
+    if not doc_tokens:
+        return base
+    return f"{base} {' '.join(doc_tokens[:6])}".strip()
+
+
+def merge_intents(description_intent: dict, document_intent: dict) -> dict:
+    """Merge description-base intent with additive document intent enrichment."""
+    base = _as_mapping(description_intent)
+    doc = _as_mapping(document_intent)
+
+    base_filters = _as_mapping(base.get("search_filters"))
+    doc_filters = _as_mapping(doc.get("search_filters"))
+    merged_filters = dict(base_filters)
+
+    for key in ("news", "papers", "patents"):
+        merged_filters[key] = _enrich_text_filter(base_filters.get(key, ""), doc_filters.get(key, ""))
+
+    for key in ("tiktok", "social", "instagram"):
+        merged_filters[key] = str(base_filters.get(key) or doc_filters.get(key) or "").strip()
+
+    merged_must_match = _dedupe_keep_order(
+        [
+            *_as_str_list(base.get("must_match_terms")),
+            *_as_str_list(doc.get("must_match_terms")),
+        ]
+    )
+
+    merged_entities = _weighted_union(
+        _as_str_list(base.get("entities")),
+        _as_str_list(doc.get("entities")),
+    )
+    merged_keywords = _weighted_union(
+        _as_str_list(base.get("keywords")),
+        _as_str_list(doc.get("keywords")),
+    )
+    merged_domain_terms = _weighted_union(
+        _as_str_list(base.get("domain_terms")),
+        _as_str_list(doc.get("domain_terms")),
+    )
+
+    merged = {
+        **doc,
+        **base,
+        "domain": str(base.get("domain") or doc.get("domain") or "general"),
+        "must_match_terms": merged_must_match,
+        "entities": merged_entities,
+        "keywords": merged_keywords[:12],
+        "domain_terms": merged_domain_terms,
+        "search_filters": merged_filters,
+    }
+
+    merged["search_filters"]["social"] = str(
+        merged["search_filters"].get("tiktok") or merged["search_filters"].get("social") or ""
+    )
+
+    return _postprocess_intent(merged, description=str(base.get("description") or ""))
 
 
 def _tokenize(text: str) -> list[str]:
@@ -389,6 +491,20 @@ def _dedupe_keep_order(values: list[str]) -> list[str]:
         seen.add(norm)
         out.append(value.strip())
     return out
+
+
+def _as_mapping(value: object) -> dict:
+    """Coerce possibly malformed LLM field values into a mapping."""
+    return value if isinstance(value, dict) else {}
+
+
+def _as_str_list(value: object) -> list[str]:
+    """Coerce scalar/list intent fields into a list of non-empty strings."""
+    if isinstance(value, list | tuple | set):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
 
 
 def _expand_related_keywords(domain: str, seed_keywords: list[str]) -> list[str]:
@@ -424,71 +540,67 @@ def _keyword_quality_filter(keywords: list[str]) -> list[str]:
     return filtered
 
 
-def _is_beauty_keyword(keyword: str, description_tokens: set[str]) -> bool:
-    """Return True if keyword is within beauty/cosmetics/fragrance scope."""
-    tokens = set(_tokenize(keyword))
-    if not tokens:
-        return False
-    if tokens & _BEAUTY_SCOPE_TERMS:
-        return True
-    if tokens & description_tokens:
-        return True
-    compact = re.sub(r"[^a-z0-9]", "", keyword.lower())
-    return compact in description_tokens
+def _normalize_domain(domain: str, keywords: list[str], description: str) -> str:
+    """Normalize domain label to snake_case and infer from context when missing."""
+    raw = str(domain or "").strip().lower().replace(" ", "_")
+    raw = re.sub(r"[^a-z0-9_]+", "_", raw)
+    raw = re.sub(r"_+", "_", raw).strip("_")
+    if raw:
+        return raw
+
+    candidates = _tokenize(" ".join(keywords))
+    if not candidates:
+        candidates = _tokenize(description)
+    return "_".join(candidates[:3]) if candidates else "general"
 
 
-def _enforce_beauty_keywords(keywords: list[str], description: str) -> list[str]:
-    """Keep beauty-scope keywords and backfill with beauty defaults."""
-    description_tokens = set(_tokenize(description))
-    scoped = [kw for kw in keywords if _is_beauty_keyword(kw, description_tokens)]
-    scoped = _dedupe_keep_order(scoped)
-    if len(scoped) < 5:
-        scoped.extend(_BEAUTY_FALLBACK_KEYWORDS)
-        scoped = _dedupe_keep_order(scoped)
-    return scoped[:10]
+def _derive_hashtag_terms(keywords: list[str], description: str) -> list[str]:
+    """Derive compact, high-signal hashtag terms from keywords/description."""
+    blocked = _STOPWORD_KEYWORDS | _GENERIC_KEYWORDS
+    source_tokens = _tokenize(" ".join(keywords))
+    if not source_tokens:
+        source_tokens = _tokenize(description)
+    out: list[str] = []
+    seen: set[str] = set()
+    for token in source_tokens:
+        if token in blocked or len(token) < 3:
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        out.append(token)
+        if len(out) >= 4:
+            break
+    return out
 
 
-def _normalize_beauty_domain(domain: str, keywords: list[str], description: str) -> str:
-    """Map any out-of-scope domain label to a beauty-focused fallback domain."""
-    value = (domain or "").strip().lower().replace(" ", "_")
-    domain_tokens = set(_tokenize(value))
-    if domain_tokens & _BEAUTY_SCOPE_TERMS:
-        return value or "beauty_market_intelligence"
-    return "beauty_market_intelligence"
-
-
-def _enforce_beauty_filters(search_filters: dict, keywords: list[str]) -> dict:
-    """Ensure search filters stay in beauty/cosmetics/fragrance scope."""
+def _enforce_dynamic_filters(search_filters: dict, keywords: list[str], description: str) -> dict:
+    """Normalize filters without forcing any fixed domain vocabulary."""
     filters = dict(search_filters)
     keyword_phrase = " ".join(keywords[:6]).strip()
-    beauty_context = "beauty cosmetics skincare fragrance"
+    description_phrase = " ".join(_tokenize(description)[:8]).strip()
+    fallback_phrase = keyword_phrase or description_phrase
 
     for field in ("news", "papers", "patents"):
         base = str(filters.get(field) or "").strip()
-        base_tokens = set(_tokenize(base))
-        if not base or not (base_tokens & _BEAUTY_SCOPE_TERMS):
-            base = keyword_phrase or beauty_context
-        if beauty_context not in base.lower():
-            base = f"{base} {beauty_context}".strip()
-        filters[field] = base
+        if not base:
+            base = fallback_phrase
+        if field == "papers":
+            base = base.replace("#", " ")
+        filters[field] = re.sub(r"\s+", " ", base).strip()
 
+    hashtags = _derive_hashtag_terms(keywords, description)
     tiktok = str(filters.get("tiktok") or "").strip()
-    if not tiktok:
-        tiktok = "#beauty #skincare #makeup #fragrance"
-    if not (set(_tokenize(tiktok)) & _BEAUTY_SCOPE_TERMS):
-        tiktok = "#beauty #skincare #makeup #fragrance"
-    elif "#beauty" not in tiktok.lower():
-        tiktok = f"{tiktok} #beauty"
+    if not tiktok and hashtags:
+        tiktok = " ".join(f"#{term}" for term in hashtags)
     filters["tiktok"] = tiktok
     filters["social"] = tiktok
 
     instagram = str(filters.get("instagram") or "").replace("#", " ").strip()
+    if not instagram:
+        instagram = " ".join(_tokenize(keyword_phrase)[:3]).strip()
     words = instagram.split()
-    if len(words) > 3:
-        instagram = " ".join(words[:3])
-    if not instagram or not (set(_tokenize(instagram)) & _BEAUTY_SCOPE_TERMS):
-        instagram = "beauty trends"
-    filters["instagram"] = instagram
+    filters["instagram"] = " ".join(words[:3]).strip()
     return filters
 
 
@@ -510,13 +622,13 @@ def _build_minimum_keywords(
         search_filters.get("patents", ""),
         search_filters.get("instagram", ""),
     ]
-    description_terms = [t for t in _tokenize(description) if t in _BEAUTY_SCOPE_TERMS][:20]
-    filter_terms = [t for t in _tokenize(" ".join(str(x) for x in filter_tokens)) if t in _BEAUTY_SCOPE_TERMS][:20]
+    description_terms = _tokenize(description)[:20]
+    filter_terms = _tokenize(" ".join(str(x) for x in filter_tokens))[:20]
     candidate_terms = seeds + related + filter_terms + description_terms
     candidate_terms = _dedupe_keep_order(candidate_terms)
     candidate_terms = _keyword_quality_filter(candidate_terms)
     if len(candidate_terms) < 5:
-        candidate_terms.extend(_RELATED_KEYWORD_HINTS.get("skincare", []))
+        candidate_terms.extend(_tokenize(description)[:8])
         candidate_terms = _dedupe_keep_order(candidate_terms)
         candidate_terms = _keyword_quality_filter(candidate_terms)
     return candidate_terms[:10]
@@ -556,13 +668,12 @@ def _postprocess_intent(intent: dict, description: str) -> dict:
         llm_keywords=keywords,
         search_filters=search_filters,
     )
-    normalized_keywords = _enforce_beauty_keywords(normalized_keywords, description)
-    normalized_domain = _normalize_beauty_domain(
+    normalized_domain = _normalize_domain(
         str(intent.get("domain") or "general"),
         normalized_keywords,
         description,
     )
-    search_filters = _enforce_beauty_filters(search_filters, normalized_keywords)
+    search_filters = _enforce_dynamic_filters(search_filters, normalized_keywords, description)
 
     return {
         **intent,

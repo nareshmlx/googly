@@ -53,9 +53,9 @@ def _build_arxiv_query(
     domain_terms = [str(term).strip() for term in (domain_terms or []) if str(term).strip()]
     if not must_match_terms:
         return query
-    must_expr = " OR ".join(f'ti:"{term}" OR abs:"{term}"' for term in must_match_terms[:3])
+    must_expr = " OR ".join(f'ti:"{term}" OR abs:"{term}"' for term in must_match_terms)
     if domain_terms:
-        domain_expr = " OR ".join(f'all:"{term}"' for term in domain_terms[:2])
+        domain_expr = " OR ".join(f'all:"{term}"' for term in domain_terms)
         return f"({must_expr}) AND ({domain_expr})"
     return must_expr
 
@@ -332,7 +332,7 @@ async def search_arxiv(
     if str(query_specificity or "").lower() == "specific" and must_match_terms:
         logger.info(
             "search_arxiv.specific_query",
-            must_match_terms=must_match_terms[:3],
+            must_match_terms=must_match_terms,
             effective_query=effective_query[:120],
         )
     logger.info("search_arxiv.start", query_preview=effective_query[:80])

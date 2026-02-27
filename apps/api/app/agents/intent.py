@@ -41,7 +41,7 @@ Rules:
 - entities: max 5, most important named things in the query
 - must_match_terms: max 5; include exact user-mentioned specific entities when present
 - expanded_terms: max 8 optional related terms to improve recall
-- domain_terms: max 4 concise terms to constrain topical domain relevance
+- domain_terms: max 15 concise terms to constrain topical domain relevance
 - query_specificity: "specific" when user mentions concrete named entities, else "broad"
 - confidence: how certain you are about the domain classification
 - is_research_query: true if the query is asking about research, academic papers, scientific studies, literature reviews, citations, or scholarly content; false otherwise

@@ -64,6 +64,15 @@ class Settings(BaseSettings):
     INGEST_INSTAGRAM_MIN_ACCOUNT_RELEVANCE: int = 1
     INGEST_INSTAGRAM_HASHTAG_QUERIES: int = 4
     INGEST_INSTAGRAM_HASHTAG_PAGES: int = 1
+    SOCIAL_RELEVANCE_MIN_SIMILARITY: float = Field(
+        default=0.35,
+        ge=0.0,
+        le=1.0,
+        description="Minimum cosine similarity for social items to pass strict relevance gating.",
+    )
+    INGEST_TIKTOK_KEYWORD_LIMIT: int = 8
+    INGEST_TIKTOK_MIN_RELEVANT_RESULTS: int = 8
+    INGEST_TIKTOK_MAX_RESULTS: int = 50
 
     AGNO_TELEMETRY: bool = False
 
@@ -127,6 +136,217 @@ class Settings(BaseSettings):
         ge=5.0,
         le=180.0,
         description="Per-source timeout for ingest source calls (seconds).",
+    )
+    INGEST_SOCIAL_SOURCE_TIMEOUT: float = Field(
+        default=35.0,
+        ge=10.0,
+        le=240.0,
+        description="Per-source timeout for social ingest calls (seconds).",
+    )
+    INGEST_REDDIT_BASE_SUBREDDITS: str = (
+        "SkincareAddiction,AsianBeauty,MakeupAddiction,beauty,femalefashionadvice,Fashion"
+    )
+    INGEST_REDDIT_MAX_DYNAMIC_SUBREDDITS: int = Field(
+        default=2,
+        ge=0,
+        le=10,
+        description="Maximum number of dynamic subreddit candidates beyond curated base list.",
+    )
+    INGEST_REDDIT_MAX_PAGES_PER_SUBREDDIT: int = Field(
+        default=2,
+        ge=1,
+        le=10,
+        description="Maximum pagination pages fetched per subreddit during ingest.",
+    )
+    INGEST_YOUTUBE_SEARCH_DEPTH: int = Field(
+        default=2,
+        ge=1,
+        le=10,
+        description="Depth/pages requested from Ensemble YouTube keyword search.",
+    )
+    INGEST_SOCIAL_MIN_RELEVANCE_MATCHES: int = Field(
+        default=1,
+        ge=0,
+        le=5,
+        description="Minimum lexical relevance term matches required for social items to be kept.",
+    )
+    INGEST_SOCIAL_FETCH_LIMIT_PER_SOURCE: int = Field(
+        default=100,
+        ge=20,
+        le=200,
+        description="Maximum raw social items fetched per source before filtering/reranking.",
+    )
+    INGEST_SOCIAL_KEEP_LIMIT_PER_SOURCE: int = Field(
+        default=40,
+        ge=1,
+        le=100,
+        description="Maximum social items kept per source after filtering/reranking.",
+    )
+    INGEST_SOCIAL_LLM_FILTER_ENABLED: bool = Field(
+        default=True,
+        description="Enable LLM stage-2 relevance filtering for social sources.",
+    )
+    INGEST_SOCIAL_LLM_FAIL_OPEN: bool = Field(
+        default=False,
+        description="If true, keep stage-1 social items when stage-2 LLM parsing/call fails.",
+    )
+    INGEST_SOCIAL_LLM_MAX_CANDIDATES: int = Field(
+        default=60,
+        ge=5,
+        le=120,
+        description="Max social candidates per source sent to stage-2 LLM relevance filtering.",
+    )
+    INGEST_QUERY_VARIANTS_PER_SOURCE: int = Field(
+        default=4,
+        ge=1,
+        le=12,
+        description="Max number of query variants generated per source from base query + intent terms.",
+    )
+    INGEST_SOCIAL_QUERY_MAX_TERMS: int = Field(
+        default=10,
+        ge=4,
+        le=20,
+        description="Maximum number of social query terms to send to social source APIs.",
+    )
+    INGEST_SOCIAL_TIER1_MAX_VARIANTS: int = Field(
+        default=4,
+        ge=1,
+        le=12,
+        description="Maximum number of query variants per social source in fast tier-1 mode.",
+    )
+    INGEST_SOCIAL_TIER1_PROBE_TERMS: int = Field(
+        default=2,
+        ge=0,
+        le=8,
+        description="Number of top intent terms to probe as standalone social queries in tier-1.",
+    )
+    INGEST_SOCIAL_EXPANSION_MAX_VARIANTS: int = Field(
+        default=10,
+        ge=2,
+        le=24,
+        description="Maximum number of query variants per social source during expansion mode.",
+    )
+    INGEST_SOCIAL_MAX_AGE_DAYS: int = Field(
+        default=30,
+        ge=7,
+        le=120,
+        description="Maximum social post age in days for social ingest recency cutoff.",
+    )
+    INGEST_SOCIAL_EXPANSION_ENABLED: bool = Field(
+        default=False,
+        description="Enable second-pass social fetch expansion when raw social volume is low.",
+    )
+    INGEST_SOCIAL_EXPANSION_TIMEOUT: float = Field(
+        default=180.0,
+        ge=30.0,
+        le=600.0,
+        description="Per-source timeout for second-pass social expansion fetch (seconds).",
+    )
+    ARQ_WORKER_JOB_TIMEOUT: int = Field(
+        default=1200,
+        ge=120,
+        le=3600,
+        description="ARQ worker job timeout in seconds.",
+    )
+    INGEST_SOCIAL_RAW_TARGET_TOTAL: int = Field(
+        default=120,
+        ge=20,
+        le=500,
+        description="Target total raw social candidates across enabled social sources.",
+    )
+    INGEST_SOCIAL_RAW_MIN_PER_SOURCE: int = Field(
+        default=30,
+        ge=5,
+        le=200,
+        description="Minimum raw candidates per strong social source before expansion.",
+    )
+    INGEST_SOCIAL_RAW_MIN_PER_WEAK_SOURCE: int = Field(
+        default=20,
+        ge=5,
+        le=200,
+        description="Minimum raw candidates for weaker social sources (Instagram/YouTube).",
+    )
+    INGEST_SOCIAL_EXPANDED_QUERY_MAX_TERMS: int = Field(
+        default=16,
+        ge=8,
+        le=32,
+        description="Maximum query terms used in second-pass social expansion fetch.",
+    )
+    INGEST_SOCIAL_EXPANDED_FETCH_LIMIT_PER_SOURCE: int = Field(
+        default=120,
+        ge=20,
+        le=300,
+        description="Max raw items fetched per source in second-pass social expansion.",
+    )
+    INGEST_SOCIAL_EXPANDED_TIKTOK_MAX_RESULTS: int = Field(
+        default=100,
+        ge=20,
+        le=200,
+        description="TikTok max_results used during second-pass expansion.",
+    )
+    INGEST_SOCIAL_EXPANDED_INSTAGRAM_HASHTAG_PAGES: int = Field(
+        default=1,
+        ge=1,
+        le=10,
+        description="Instagram hashtag pages to fetch per tag during second-pass expansion.",
+    )
+    INGEST_SOCIAL_EXPANDED_MAX_AGE_DAYS: int = Field(
+        default=90,
+        ge=14,
+        le=365,
+        description="Maximum social post age in days used during second-pass expansion.",
+    )
+    ENABLE_FULLTEXT_ENRICHMENT: bool = Field(
+        default=False,
+        description="Enable ARQ fulltext enrichment scheduling for paper/patent sources.",
+    )
+    ENABLE_FULLTEXT_RETRIEVAL_PREFERENCE: bool = Field(
+        default=False,
+        description="Prefer fulltext chunks over abstract chunks when relevance is comparable.",
+    )
+    ENABLE_FULLTEXT_BACKFILL: bool = Field(
+        default=False,
+        description="Enable backfill task for existing metadata-only paper/patent chunks.",
+    )
+    FULLTEXT_MAX_SOURCE_BYTES: int = Field(
+        default=25 * 1024 * 1024,
+        ge=1024,
+        le=100 * 1024 * 1024,
+        description="Maximum bytes downloaded for one fulltext source asset.",
+    )
+    FULLTEXT_MAX_PAGES: int = Field(
+        default=300,
+        ge=1,
+        le=2000,
+        description="Maximum pages extracted from one fulltext document.",
+    )
+    FULLTEXT_FETCH_TIMEOUT_SECONDS: float = Field(
+        default=30.0,
+        ge=5.0,
+        le=300.0,
+        description="Timeout for resolving/fetching one fulltext source asset.",
+    )
+    FULLTEXT_MAX_ENRICHMENT_ATTEMPTS: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Maximum bounded retries for one source asset enrichment.",
+    )
+    FULLTEXT_MAX_REDIRECTS: int = Field(
+        default=4,
+        ge=0,
+        le=10,
+        description="Maximum redirects followed when fetching fulltext source URLs.",
+    )
+    FULLTEXT_ALLOWED_DOMAINS: str = Field(
+        default="",
+        description="Optional comma-separated allowlist of fulltext source domains.",
+    )
+    ENSEMBLE_TIKTOK_FULL_SEARCH_TIMEOUT: float = Field(
+        default=180.0,
+        ge=20.0,
+        le=900.0,
+        description="HTTP timeout for Ensemble TikTok full keyword search endpoint.",
     )
 
     # === Cache TTL Configuration ===
@@ -244,6 +464,9 @@ class CacheKeys:
     NEWS_PERIGON = "news:perigon"
     SOCIAL_INSTAGRAM = "social:instagram"
     SOCIAL_TIKTOK = "social:tiktok"
+    SOCIAL_YOUTUBE = "social:youtube"
+    SOCIAL_REDDIT = "social:reddit"
+    SOCIAL_X = "social:x"
     SOCIAL_X = "social:x"
 
 

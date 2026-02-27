@@ -28,7 +28,7 @@ logger = structlog.get_logger(__name__)
 
 _TAVILY_BASE_URL = "https://api.tavily.com/search"
 _TIMEOUT = 15.0  # seconds
-_MAX_RESULTS = 5
+_MAX_RESULTS = 15
 # Domain-filtered queries use advanced depth (full page extraction vs snippets) and
 # request more results, because the user named a specific site and needs rich detail.
 _MAX_RESULTS_DOMAIN = 7
@@ -63,7 +63,7 @@ async def _search_with_retry(query: str, include_domains: list[str] | None = Non
         payload: dict = {
             "api_key": settings.TAVILY_API_KEY,
             "query": query,
-            "search_depth": _SEARCH_DEPTH_DOMAIN if include_domains else "basic",
+            "search_depth": "advanced",
             "max_results": _MAX_RESULTS_DOMAIN if include_domains else _MAX_RESULTS,
             "include_answer": False,  # We synthesize our own answer
             "include_raw_content": False,

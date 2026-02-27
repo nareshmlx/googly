@@ -5,6 +5,7 @@ refine_intent to detect domain shifts and update structured_intent.
 """
 
 import io
+import json
 from datetime import UTC, datetime
 
 import structlog
@@ -17,6 +18,22 @@ from app.kb.intent_extractor import refine_intent
 from app.repositories import project as project_repo
 
 logger = structlog.get_logger(__name__)
+
+
+def _coerce_intent_mapping(value: object) -> dict:
+    """Normalize structured intent payload into a dictionary."""
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return {}
+        try:
+            loaded = json.loads(text)
+        except json.JSONDecodeError:
+            return {}
+        return dict(loaded) if isinstance(loaded, dict) else {}
+    return {}
 
 
 async def _invalidate_project_caches(project_id: str) -> None:
@@ -199,14 +216,21 @@ async def ingest_document(
         if chunk_summaries:
             project = await project_repo.fetch_project(pool, project_id, user_id)
             if project:
-                existing_intent = dict(project.get("structured_intent") or {})
-                refined = await refine_intent(existing_intent, chunk_summaries)
-                if refined != existing_intent:
-                    await project_repo.update_project_intent(pool, project_id, refined)
-                    logger.info(
-                        "ingest_document.intent_refined",
+                existing_intent = _coerce_intent_mapping(project.get("structured_intent"))
+                try:
+                    refined = await refine_intent(existing_intent, chunk_summaries)
+                    if refined != existing_intent:
+                        await project_repo.update_project_intent(pool, project_id, refined)
+                        logger.info(
+                            "ingest_document.intent_refined",
+                            project_id=project_id,
+                            new_domain=refined.get("domain"),
+                        )
+                except Exception:
+                    logger.exception(
+                        "ingest_document.intent_refine_failed",
                         project_id=project_id,
-                        new_domain=refined.get("domain"),
+                        upload_id=upload_id,
                     )
 
         # Step 4: Update kb_chunk_count
