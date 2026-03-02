@@ -4,13 +4,14 @@ Supports PDF, DOCX, TXT, and MD. After chunking and embedding, runs
 refine_intent to detect domain shifts and update structured_intent.
 """
 
+import base64
 import io
 import json
 from datetime import UTC, datetime
 
 import structlog
 
-from app.core.cache_version import bump_project_cache_version
+from app.core.cache_invalidation import invalidate_project_caches
 from app.core.db import get_db_pool
 from app.core.redis import get_redis
 from app.kb.ingester import RawDocument, ingest_documents
@@ -34,47 +35,6 @@ def _coerce_intent_mapping(value: object) -> dict:
             return {}
         return dict(loaded) if isinstance(loaded, dict) else {}
     return {}
-
-
-async def _invalidate_project_caches(project_id: str) -> None:
-    """
-    Invalidate all caches for a project after KB update.
-
-    Bumps project cache version so semantic + KB hot cache keys rotate immediately,
-    then clears project-scoped search cache keys via SCAN.
-
-    Cache invalidation failure is logged but does not crash the ingestion
-    task — data consistency is maintained even if caches remain stale.
-    """
-    try:
-        redis = await get_redis()
-        new_version = await bump_project_cache_version(redis, project_id)
-        patterns = [
-            f"search:cache:{project_id}:*",
-        ]
-
-        deleted_count = 0
-        for pattern in patterns:
-            cursor = 0
-            while True:
-                cursor, keys = await redis.scan(cursor, match=pattern, count=100)
-                if keys:
-                    await redis.delete(*keys)
-                    deleted_count += len(keys)
-                if cursor == 0:
-                    break
-
-        logger.info(
-            "cache_invalidation.complete",
-            project_id=project_id,
-            cache_version=new_version,
-            keys_deleted=deleted_count,
-        )
-    except Exception:
-        logger.exception(
-            "cache_invalidation.failed",
-            project_id=project_id,
-        )
 
 
 def _extract_text_from_bytes(content_bytes: bytes, filename: str) -> str:
@@ -131,10 +91,12 @@ async def ingest_document(
     redis = await get_redis()
     try:
         payload = await redis.get(staging_key)
-        if isinstance(payload, bytes):
+        if isinstance(payload, str):
+            # Payload is base64-encoded (stored by kb.py upload handler)
+            content_bytes = base64.b64decode(payload)
+        elif isinstance(payload, bytes):
+            # Fallback for legacy pre-base64 entries
             content_bytes = payload
-        elif isinstance(payload, str):
-            content_bytes = payload.encode()
         if not content_bytes:
             logger.warning(
                 "ingest_document.staging_payload_missing",
@@ -183,7 +145,7 @@ async def ingest_document(
         logger.info("ingest_document.ingested", upload_id=upload_id, chunks_inserted=inserted)
 
         # Invalidate caches so users see new content immediately
-        await _invalidate_project_caches(project_id)
+        await invalidate_project_caches(project_id)
 
         # Step 3: Refine intent — collect short summaries from the new chunks
         pool = await get_db_pool()
@@ -234,7 +196,9 @@ async def ingest_document(
                     )
 
         # Step 4: Update kb_chunk_count
-        await project_repo.update_project_kb_stats(pool, project_id, int(total or 0), datetime.now(UTC))
+        await project_repo.update_project_kb_stats(
+            pool, project_id, int(total or 0), datetime.now(UTC)
+        )
 
         logger.info(
             "ingest_document.done",

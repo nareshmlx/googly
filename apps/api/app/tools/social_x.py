@@ -1,6 +1,8 @@
 """X (Twitter) retrieval tool backed by EnsembleData endpoints."""
 
 import base64
+import hashlib
+import json
 import re
 
 import httpx
@@ -30,6 +32,32 @@ X_HANDLE_STOPWORDS = frozenset(
 )
 
 
+class _XAuthRequiredError(RuntimeError):
+    """Raised when X keyword endpoints require unavailable auth/session fields."""
+
+
+def _is_auth_required_error(status_code: int | None, payload_or_text: object) -> bool:
+    """Detect auth-required responses from Ensemble keyword endpoints."""
+    text = str(payload_or_text or "").lower()
+    if status_code in {401, 403}:
+        return True
+    if status_code == 422 and ("ct0" in text or "auth_token" in text or "guest_id" in text):
+        return True
+    return "authentication required" in text or "authorization required" in text
+
+
+def _keyword_auth_params() -> dict[str, str]:
+    """Return optional Ensemble X keyword auth/session params when configured."""
+    params: dict[str, str] = {}
+    if settings.ENSEMBLE_X_CT0:
+        params["ct0"] = settings.ENSEMBLE_X_CT0
+    if settings.ENSEMBLE_X_AUTH_TOKEN:
+        params["auth_token"] = settings.ENSEMBLE_X_AUTH_TOKEN
+    if settings.ENSEMBLE_X_GUEST_ID:
+        params["guest_id"] = settings.ENSEMBLE_X_GUEST_ID
+    return params
+
+
 def _as_int(value: object) -> int:
     """Convert mixed metric values (int/float/str) into int safely."""
     if isinstance(value, bool) or value is None:
@@ -55,7 +83,12 @@ def _extract_items(payload: object) -> list[dict]:
         return [row for row in payload if isinstance(row, dict)]
     if not isinstance(payload, dict):
         return []
-    candidates = [payload.get("data"), payload.get("posts"), payload.get("tweets"), payload.get("results")]
+    candidates = [
+        payload.get("data"),
+        payload.get("posts"),
+        payload.get("tweets"),
+        payload.get("results"),
+    ]
     for value in candidates:
         if isinstance(value, list):
             return [row for row in value if isinstance(row, dict)]
@@ -115,15 +148,19 @@ def _normalize_tweet_row(post: dict) -> dict:
     if not isinstance(result, dict):
         return post
 
-    legacy = result.get("legacy") if isinstance(result.get("legacy"), dict) else {}
+    legacy_obj = result.get("legacy")
+    legacy: dict = legacy_obj if isinstance(legacy_obj, dict) else {}
     core_user = _dig(result, ("core", "user_results", "result"))
-    user_legacy = core_user.get("legacy") if isinstance(core_user, dict) else {}
+    user_legacy_obj = core_user.get("legacy") if isinstance(core_user, dict) else None
+    user_legacy: dict = user_legacy_obj if isinstance(user_legacy_obj, dict) else {}
 
     screen_name = str(user_legacy.get("screen_name") or "").strip()
     tweet_id = str(result.get("rest_id") or legacy.get("id_str") or "").strip()
     text = str(legacy.get("full_text") or legacy.get("text") or "").strip()
     if not text:
-        text = str(_dig(result, ("note_tweet", "note_tweet_results", "result", "text")) or "").strip()
+        text = str(
+            _dig(result, ("note_tweet", "note_tweet_results", "result", "text")) or ""
+        ).strip()
     url = f"https://x.com/{screen_name}/status/{tweet_id}" if screen_name and tweet_id else ""
 
     return {
@@ -167,6 +204,12 @@ def _candidate_handles(query: str) -> list[str]:
     return combined
 
 
+def _cache_key(project_id: str, query: str, max_results: int) -> str:
+    """Generate a deterministic, project-scoped cache key for X searches."""
+    query_hash = hashlib.sha256(f"{query}:{max_results}".encode()).hexdigest()[:16]
+    return f"search:cache:{project_id}:social_x:posts:{query_hash}"
+
+
 def _endpoint_candidates(path: str) -> list[str]:
     """Return ordered unique endpoint candidates for one path."""
     normalized_path = str(path or "").strip()
@@ -201,8 +244,20 @@ async def _get_json_from_candidates(
                 params=params,
                 headers={"Accept": "application/json"},
             )
+            if _is_auth_required_error(int(response.status_code), response.text):
+                logger.warning(
+                    "social_x.auth_required",
+                    endpoint=endpoint,
+                    path=path,
+                    status_code=int(response.status_code),
+                )
+                raise _XAuthRequiredError(response.text[:200])
             response.raise_for_status()
-            return response.json()
+            payload = response.json()
+            if _is_auth_required_error(None, payload):
+                logger.warning("social_x.auth_required", endpoint=endpoint, path=path)
+                raise _XAuthRequiredError(str(payload)[:200])
+            return payload
         except httpx.HTTPStatusError as exc:
             logger.warning(
                 "social_x.endpoint_failed",
@@ -212,6 +267,8 @@ async def _get_json_from_candidates(
                 response_preview=str(exc.response.text or "")[:200],
             )
             continue
+        except _XAuthRequiredError:
+            raise
         except Exception as exc:
             logger.warning(
                 "social_x.endpoint_failed",
@@ -256,9 +313,49 @@ async def _fetch_tweets_by_handle(client: httpx.AsyncClient, handle: str) -> lis
         return []
 
 
-async def search_x_posts(query: str, max_results: int = 20) -> list[dict]:
-    """Retrieve X posts most relevant to project query."""
+async def search_x_posts(
+    project_id: str, query: str, max_results: int = 20, redis=None
+) -> list[dict]:
+    """Retrieve X posts most relevant to project query with caching."""
     cleaned_query = str(query or "").strip()
+    if not cleaned_query:
+        return []
+
+    # Check cache first
+    cache_key = _cache_key(project_id, cleaned_query, max_results)
+    stale_key = f"{cache_key}:stale"
+    if redis:
+        try:
+            cached = await redis.get(cache_key)
+            if cached:
+                return json.loads(cached)
+        except Exception:
+            logger.warning("social_x.cache_read_failed", project_id=project_id)
+
+    try:
+        results = await _search_x_posts_impl(cleaned_query, max_results)
+        if redis and results:
+            try:
+                await redis.setex(cache_key, settings.CACHE_TTL_SOCIAL, json.dumps(results))
+                await redis.setex(stale_key, settings.CACHE_TTL_STALE, json.dumps(results))
+            except Exception:
+                logger.warning("social_x.cache_write_failed", project_id=project_id)
+        return results
+    except Exception as exc:
+        if redis:
+            try:
+                stale = await redis.get(stale_key)
+                if stale:
+                    logger.info("social_x.serving_stale", project_id=project_id, error=str(exc))
+                    return json.loads(stale)
+            except Exception:
+                pass
+        raise
+
+
+async def _search_x_posts_impl(query: str, max_results: int = 20) -> list[dict]:
+    """Internal implementation of X post retrieval."""
+    cleaned_query = query
     if not cleaned_query:
         return []
 
@@ -282,8 +379,9 @@ async def search_x_posts(query: str, max_results: int = 20) -> list[dict]:
                 {
                     "name": cleaned_query,
                     "cursor": "",
-                    "type": "Latest",
+                    "type": "latest",
                     "token": settings.ENSEMBLE_API_TOKEN,
+                    **_keyword_auth_params(),
                 },
             ),
             (
@@ -291,22 +389,32 @@ async def search_x_posts(query: str, max_results: int = 20) -> list[dict]:
                 {
                     "name": cleaned_query,
                     "cursor": "",
-                    "type": "Latest",
+                    "type": "latest",
                     "token": settings.ENSEMBLE_API_TOKEN,
+                    **_keyword_auth_params(),
                 },
             ),
         )
-        for path, params in keyword_candidates:
-            payload = await _get_json_from_candidates(client, path=path, params=params)
-            if payload is None:
-                continue
-            candidate_posts = _extract_items(payload)
-            if candidate_posts:
-                posts.extend(candidate_posts)
-                break
+        auth_required = False
+        try:
+            for path, params in keyword_candidates:
+                payload = await _get_json_from_candidates(client, path=path, params=params)
+                if payload is None:
+                    continue
+                candidate_posts = _extract_items(payload)
+                if candidate_posts:
+                    posts.extend(candidate_posts)
+                    break
+        except _XAuthRequiredError:
+            auth_required = True
+            logger.warning(
+                "social_x.search.auth_required_skip_keyword", query_preview=cleaned_query[:80]
+            )
 
         if not posts:
             handles = _candidate_handles(cleaned_query)
+            if auth_required and not handles:
+                return []
             for handle in handles:
                 handle_posts = await _fetch_tweets_by_handle(client, handle)
                 if handle_posts:

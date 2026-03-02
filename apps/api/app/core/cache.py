@@ -54,6 +54,8 @@ class TwoTierCache:
             ttl=settings.L1_CACHE_TTL,
         )
         self._l1_lock = asyncio.Lock()
+        # Track background L2 write tasks for graceful shutdown
+        self._pending_writes: set[asyncio.Task] = set()
 
     async def get(self, key: str) -> dict | None:
         """Retrieve value from L1 (fast) or L2 (distributed).
@@ -115,6 +117,8 @@ class TwoTierCache:
 
         # Write to L2 (distributed with TTL) - fire and forget with error callback
         task = asyncio.create_task(self._write_l2(key, value, ttl))
+        self._pending_writes.add(task)
+        task.add_done_callback(lambda t: self._pending_writes.discard(t))
         task.add_done_callback(self._handle_l2_write_error)
 
     async def _write_l2(self, key: str, value: dict, ttl: int) -> None:
@@ -145,3 +149,24 @@ class TwoTierCache:
         except Exception:
             # Exception() itself raised an error - extremely rare
             logger.exception("cache.l2.error_handler_failed")
+
+    async def shutdown(self, timeout: float = 5.0) -> None:
+        """Await all pending L2 writes with a timeout.
+
+        Called during application shutdown to ensure data consistency.
+        """
+        if not self._pending_writes:
+            return
+
+        logger.info("cache.shutdown.waiting", count=len(self._pending_writes))
+        try:
+            # Wait for all pending tasks to complete
+            await asyncio.wait_for(
+                asyncio.gather(*self._pending_writes, return_exceptions=True),
+                timeout=timeout,
+            )
+            logger.info("cache.shutdown.complete")
+        except TimeoutError:
+            logger.warning("cache.shutdown.timeout", count=len(self._pending_writes))
+        except Exception:
+            logger.exception("cache.shutdown.error")

@@ -16,6 +16,11 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "text-embedding-3-small"
     EMBEDDING_MODEL_VERSION: str = "v3-small-2024"  # Update when OpenAI changes model
 
+    # === LLM Model Configuration ===
+    INTENT_MODEL: str = "gpt-4o-mini"
+    ANALYZER_MODEL: str = "gpt-4o-mini"
+    SUMMARY_MODEL: str = "gpt-4o-mini"
+
     DATABASE_URL: str = "postgresql+asyncpg://googly:googly@localhost:5432/googly"
     REDIS_URL: str = "redis://localhost:6379/0"
 
@@ -58,12 +63,20 @@ class Settings(BaseSettings):
     INGEST_INSTAGRAM_REELS_PER_ACCOUNT: int = 6
     INGEST_INSTAGRAM_DETAIL_ENRICH_PER_ACCOUNT: int = 3
     INGEST_INSTAGRAM_ACCOUNTS_TO_FETCH: int = 10
-    INGEST_INSTAGRAM_GLOBAL_REELS_LIMIT: int = 24
+    INGEST_INSTAGRAM_GLOBAL_REELS_LIMIT: int = 60  # Increased from 24 to get more volume
     INGEST_INSTAGRAM_MAX_REELS_PER_ACCOUNT: int = 2
     INGEST_INSTAGRAM_MIN_REEL_RELEVANCE: int = 1
     INGEST_INSTAGRAM_MIN_ACCOUNT_RELEVANCE: int = 1
-    INGEST_INSTAGRAM_HASHTAG_QUERIES: int = 4
-    INGEST_INSTAGRAM_HASHTAG_PAGES: int = 1
+    INGEST_INSTAGRAM_HASHTAG_QUERIES: int = 10  # Increased from 6 to fetch more hashtags
+    INGEST_INSTAGRAM_HASHTAG_PAGES: int = 8  # Increased from 5 to fetch more pages
+    INGEST_INSTAGRAM_VIDEO_ONLY: bool = Field(
+        default=False,  # Changed from True - include both images and videos
+        description="Only keep video posts from hashtag search (filter out images).",
+    )
+    INGEST_INSTAGRAM_USE_HASHTAG_ONLY: bool = Field(
+        default=False,  # Changed from True - enable account reel expansion
+        description="Skip expensive user lookup/reels and use hashtag posts only.",
+    )
     SOCIAL_RELEVANCE_MIN_SIMILARITY: float = Field(
         default=0.35,
         ge=0.0,
@@ -94,6 +107,9 @@ class Settings(BaseSettings):
 
     ENSEMBLE_API_TOKEN: str | None = None
     ENSEMBLE_API_BASE_URL: str = "https://api.ensembledata.com"
+    ENSEMBLE_X_CT0: str | None = None
+    ENSEMBLE_X_AUTH_TOKEN: str | None = None
+    ENSEMBLE_X_GUEST_ID: str | None = None
 
     OPENALEX_EMAIL: str = ""
 
@@ -138,22 +154,40 @@ class Settings(BaseSettings):
         description="Per-source timeout for ingest source calls (seconds).",
     )
     INGEST_SOCIAL_SOURCE_TIMEOUT: float = Field(
-        default=35.0,
+        default=150.0,
         ge=10.0,
+        le=300.0,
+        description="Per-source timeout for social ingest calls (seconds). Instagram needs more time due to Ensemble API + filtering.",
+    )
+    INGEST_PAPERS_TIMEOUT: float = Field(
+        default=90.0,
+        ge=30.0,
         le=240.0,
-        description="Per-source timeout for social ingest calls (seconds).",
+        description="Per-source timeout for paper ingest calls (OpenAlex, Semantic Scholar, PubMed, arXiv). Papers need more time for internal filtering and scoring.",
+    )
+    INGEST_PATENTS_TIMEOUT: float = Field(
+        default=60.0,
+        ge=30.0,
+        le=180.0,
+        description="Per-source timeout for patent ingest calls (PatentsView, Lens).",
+    )
+    INGEST_NEWS_TIMEOUT: float = Field(
+        default=45.0,
+        ge=20.0,
+        le=120.0,
+        description="Per-source timeout for news ingest calls (Perigon).",
     )
     INGEST_REDDIT_BASE_SUBREDDITS: str = (
         "SkincareAddiction,AsianBeauty,MakeupAddiction,beauty,femalefashionadvice,Fashion"
     )
     INGEST_REDDIT_MAX_DYNAMIC_SUBREDDITS: int = Field(
-        default=2,
+        default=6,  # Increased from 2 to fetch from more subreddits
         ge=0,
         le=10,
         description="Maximum number of dynamic subreddit candidates beyond curated base list.",
     )
     INGEST_REDDIT_MAX_PAGES_PER_SUBREDDIT: int = Field(
-        default=2,
+        default=5,  # Increased from 2 to fetch more pages per subreddit
         ge=1,
         le=10,
         description="Maximum pagination pages fetched per subreddit during ingest.",
@@ -171,7 +205,7 @@ class Settings(BaseSettings):
         description="Minimum lexical relevance term matches required for social items to be kept.",
     )
     INGEST_SOCIAL_FETCH_LIMIT_PER_SOURCE: int = Field(
-        default=100,
+        default=140,
         ge=20,
         le=200,
         description="Maximum raw social items fetched per source before filtering/reranking.",
@@ -197,7 +231,7 @@ class Settings(BaseSettings):
         description="Max social candidates per source sent to stage-2 LLM relevance filtering.",
     )
     INGEST_QUERY_VARIANTS_PER_SOURCE: int = Field(
-        default=4,
+        default=6,
         ge=1,
         le=12,
         description="Max number of query variants generated per source from base query + intent terms.",
@@ -209,13 +243,13 @@ class Settings(BaseSettings):
         description="Maximum number of social query terms to send to social source APIs.",
     )
     INGEST_SOCIAL_TIER1_MAX_VARIANTS: int = Field(
-        default=4,
+        default=6,
         ge=1,
         le=12,
         description="Maximum number of query variants per social source in fast tier-1 mode.",
     )
     INGEST_SOCIAL_TIER1_PROBE_TERMS: int = Field(
-        default=2,
+        default=3,
         ge=0,
         le=8,
         description="Number of top intent terms to probe as standalone social queries in tier-1.",
@@ -356,6 +390,15 @@ class Settings(BaseSettings):
     CACHE_TTL_PATENTS: int = Field(default=86400, description="Cache TTL for patents (24 hours)")
     CACHE_TTL_SEARCH: int = Field(default=3600, description="Cache TTL for search results (1 hour)")
     CACHE_TTL_NEWS: int = Field(default=1800, description="Cache TTL for news articles (30 min)")
+    CACHE_TTL_SOCIAL: int = Field(
+        default=3600,
+        description="Cache TTL for social media API results (1 hour)",
+    )
+    CACHE_TTL_STALE: int = Field(
+        default=86400 * 7,
+        description="Cache TTL for stale fallback copies of API results (7 days). "
+        "Used as a long-lived fallback when the primary API call fails.",
+    )
     INTENT_CACHE_TTL: int = Field(
         default=3600,
         ge=1,
@@ -466,7 +509,6 @@ class CacheKeys:
     SOCIAL_TIKTOK = "social:tiktok"
     SOCIAL_YOUTUBE = "social:youtube"
     SOCIAL_REDDIT = "social:reddit"
-    SOCIAL_X = "social:x"
     SOCIAL_X = "social:x"
 
 

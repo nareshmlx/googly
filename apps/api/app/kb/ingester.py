@@ -105,51 +105,54 @@ async def ingest_documents(documents: list[RawDocument]) -> int:
     inserted = 0
 
     async with pool.acquire() as conn:
-        # Bulk insert — ON CONFLICT DO NOTHING for idempotent re-ingestion
-        rows = [
-            (
-                str(uuid.uuid4()),
-                all_chunks[i][0],  # project_id
-                all_chunks[i][1],  # user_id
-                all_chunks[i][2],  # source
-                all_chunks[i][3],  # source_id
-                all_chunks[i][4],  # title
-                all_chunks[i][5],  # content
-                str(vectors[i]),  # embedding as vector literal '[0.1, 0.2, ...]'
-                json.dumps(all_chunks[i][6]),  # metadata: dict → JSON string for asyncpg ::jsonb
+        # Build parallel column arrays for unnest bulk INSERT.
+        # Embeddings are passed as text (json-formatted list strings) and cast
+        # to vector inside SQL — asyncpg's binary COPY protocol has no encoder
+        # for pgvector's vector type (OID varies per install), so copy_records_to_table
+        # raises InternalClientError: no binary format encoder for type vector.
+        ids = [str(uuid.uuid4()) for _ in all_chunks]
+        project_ids = [c[0] for c in all_chunks]
+        user_ids = [c[1] for c in all_chunks]
+        sources = [c[2] for c in all_chunks]
+        source_ids = [c[3] for c in all_chunks]
+        titles = [c[4] for c in all_chunks]
+        contents = [c[5] for c in all_chunks]
+        embeddings = [str(vectors[i]) for i in range(len(all_chunks))]
+        metadatas = [json.dumps(c[6]) for c in all_chunks]
+
+        batch_inserted = await conn.fetchval(
+            """
+            WITH inserted AS (
+                INSERT INTO knowledge_chunks
+                    (id, project_id, user_id, source, source_id, title,
+                     content, embedding, metadata)
+                SELECT
+                    unnest($1::uuid[]),
+                    unnest($2::uuid[]),
+                    unnest($3::uuid[]),
+                    unnest($4::text[]),
+                    unnest($5::text[]),
+                    unnest($6::text[]),
+                    unnest($7::text[]),
+                    unnest($8::text[])::vector,
+                    unnest($9::text[])::jsonb
+                ON CONFLICT (project_id, source, source_id) DO NOTHING
+                RETURNING 1
             )
-            for i in range(len(all_chunks))
-        ]
+            SELECT COUNT(*)::int FROM inserted
+            """,
+            ids,
+            project_ids,
+            user_ids,
+            sources,
+            source_ids,
+            titles,
+            contents,
+            embeddings,
+            metadatas,
+        )
+        inserted = int(batch_inserted or 0)
 
-        # Insert in batches of 500 to keep individual transactions reasonable.
-        batch_size = 500
-        for batch_start in range(0, len(rows), batch_size):
-            batch = rows[batch_start : batch_start + batch_size]
-            values_sql: list[str] = []
-            params: list[object] = []
-            for row_index, row in enumerate(batch):
-                base = row_index * 9
-                values_sql.append(
-                    f"(${base + 1}, ${base + 2}, ${base + 3}, ${base + 4}, "
-                    f"${base + 5}, ${base + 6}, ${base + 7}, ${base + 8}::vector, ${base + 9}::jsonb)"
-                )
-                params.extend(row)
-
-            batch_inserted = await conn.fetchval(
-                f"""
-                WITH inserted AS (
-                    INSERT INTO knowledge_chunks
-                        (id, project_id, user_id, source, source_id, title, content, embedding, metadata)
-                    VALUES {", ".join(values_sql)}
-                    ON CONFLICT (project_id, source, source_id) DO NOTHING
-                    RETURNING 1
-                )
-                SELECT COUNT(*)::int FROM inserted
-                """,
-                *params,
-            )
-            inserted += int(batch_inserted or 0)
-
-        logger.info("ingester.done", inserted=inserted, total_chunks=len(all_chunks))
+    logger.info("ingester.done", inserted=inserted, total_chunks=len(all_chunks))
 
     return inserted

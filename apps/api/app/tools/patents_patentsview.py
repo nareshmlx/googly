@@ -14,6 +14,7 @@ NOTE: The legacy API (api.patentsview.org) was shut down on May 1, 2025.
 """
 
 import hashlib
+import json
 import time
 
 import httpx
@@ -21,7 +22,7 @@ import structlog
 
 from app.core.cache import TwoTierCache
 from app.core.circuit_breaker import call_with_circuit_breaker, patentsview_breaker
-from app.core.config import CacheKeys, settings
+from app.core.config import settings
 from app.core.dedup import deduplicate_request
 from app.core.metrics import api_call_duration_seconds, api_calls_total
 from app.core.rate_limiter import patentsview_limiter, rate_limited_call
@@ -49,10 +50,10 @@ async def _get_http_client() -> httpx.AsyncClient:
     return _http_client
 
 
-def _cache_key(query: str) -> str:
-    """Generate deterministic cache key for a query."""
+def _cache_key(project_id: str, query: str) -> str:
+    """Generate deterministic project-scoped cache key for a query."""
     query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()[:16]
-    return f"{CacheKeys.PATENTS_PATENTSVIEW}:{query_hash}"
+    return f"search:cache:{project_id}:patentsview:patents:{query_hash}"
 
 
 def _build_patentsview_query(
@@ -78,9 +79,7 @@ def _build_patentsview_query(
         )
     if domain_terms:
         domain_clause = {
-            "_or": [
-                {"_text_all": {"patent_title": term}} for term in domain_terms
-            ]
+            "_or": [{"_text_all": {"patent_title": term}} for term in domain_terms]
             + [{"_text_all": {"patent_abstract": term}} for term in domain_terms]
         }
         and_clauses.append(domain_clause)
@@ -218,45 +217,56 @@ async def _search_impl(query: str, query_payload: dict) -> list[dict]:
     return normalized
 
 
-async def _search_patentsview_impl(query: str, cache_key: str, query_payload: dict) -> list[dict]:
+async def _search_patentsview_impl(
+    project_id: str, query: str, cache_key: str, query_payload: dict
+) -> list[dict]:
     """
     Internal implementation (called by dedup layer).
-
-    Handles cache check, API call, and cache write.
-    This function is only called once even if 1000 users search
-    for the same query simultaneously.
+    Handles cache check, API call, and cache write with stale fallback.
     """
-    # Initialize cache (lazy singleton pattern)
     redis_client = await get_redis()
     cache = TwoTierCache(redis_client)
 
-    # Check cache first (using normalized query)
+    # 1. Primary Cache Check (Fresh result)
     cached = await cache.get(cache_key)
     if cached is not None:
-        logger.info("patents_patentsview.cache.hit", result_count=len(cached.get("results", [])))
         return cached.get("results", [])
 
-    # Wrap entire search operation in circuit breaker
+    # 2. Fetch from API
     async def _fetch_impl() -> list[dict]:
         return await _search_impl(query, query_payload)
 
-    result = await call_with_circuit_breaker(
-        patentsview_breaker,
-        _fetch_impl,
-    )
+    result = await call_with_circuit_breaker(patentsview_breaker, _fetch_impl)
 
-    # Circuit breaker returns [] on failure, or list[dict] on success
-    if result is None or not isinstance(result, list):
-        result = []
-
-    # Cache successful results (TTL from config - patents don't change frequently)
+    # 3. Success -> Cache and Return
     if result:
         await cache.set(cache_key, {"results": result}, ttl=settings.CACHE_TTL_PATENTS)
+        # Store a "stale" copy that lasts longer
+        stale_key = f"{cache_key}:stale"
+        await redis_client.setex(
+            stale_key, settings.CACHE_TTL_STALE, json.dumps({"results": result})
+        )
+        return result
 
-    return result
+    # 4. Failure -> Serve Stale Fallback
+    stale_key = f"{cache_key}:stale"
+    stale_raw = await redis_client.get(stale_key)
+    if stale_raw:
+        logger.warning(
+            "patents_patentsview.api_failed.serving_stale",
+            project_id=project_id,
+            query=query[:50],
+        )
+        try:
+            return json.loads(stale_raw).get("results", [])
+        except json.JSONDecodeError:
+            pass
+
+    return []
 
 
 async def search_patentsview(
+    project_id: str,
     query: str,
     *,
     must_match_terms: list[str] | None = None,
@@ -308,13 +318,13 @@ async def search_patentsview(
         )
     logger.info("patents_patentsview.start", query_preview=query[:80])
 
-    # Generate cache key (used for both dedup and cache)
-    cache_key = _cache_key(f"{query}|{query_payload}")
+    # Generate cache key (instrumented with project_id for multi-tenant security)
+    cache_key = _cache_key(project_id, f"{query}|{query_payload}")
 
     # Deduplicate concurrent identical requests
     result = await deduplicate_request(
         cache_key,
-        lambda: _search_patentsview_impl(query, cache_key, query_payload),
+        lambda: _search_patentsview_impl(project_id, query, cache_key, query_payload),
     )
 
     logger.info("patents_patentsview.complete", result_count=len(result))

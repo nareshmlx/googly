@@ -209,13 +209,15 @@ async def list_projects_summary(
 async def fetch_discover_feed(
     pool: asyncpg.Pool,
     project_id: str,
+    limit: int = 500,
+    offset: int = 0,
 ) -> list[dict]:
     """
     Retrieve Discover feed rows scored by relevance, recency, and quality.
 
     Uses project intent embedding cosine similarity when available.
     Falls back to recency-only ranking when no intent embedding exists.
-    Returns up to 100 rows across all supported sources.
+    Supports pagination for scalable feed rendering.
     """
     async with pool.acquire() as conn, conn.transaction():
         await conn.execute(
@@ -282,7 +284,9 @@ async def fetch_discover_feed(
                                     EXTRACT(YEAR FROM NOW()) - CASE
                                         WHEN (kc.metadata->>'year') ~ '^[0-9]{4}$'
                                         THEN (kc.metadata->>'year')::int
-                                        ELSE 2020
+                                        WHEN (kc.metadata->>'date') ~ '^[0-9]{4}'
+                                        THEN LEFT(kc.metadata->>'date', 4)::int
+                                        ELSE 2022
                                     END
                                 ) / 5.0
                             )
@@ -446,32 +450,29 @@ async def fetch_discover_feed(
                 relevance,
                 recency,
                 quality,
-                CASE
-                    WHEN EXISTS (
-                        SELECT 1 FROM projects p
-                        WHERE p.id = $1::uuid AND p.intent_embedding IS NOT NULL
-                    ) AND source = 'paper'
+                 CASE
+                    WHEN pe_exists.has_embedding AND source = 'paper'
                     THEN (relevance * 0.65 + quality * 0.30 + recency * 0.05)
-                    WHEN EXISTS (
-                        SELECT 1 FROM projects p
-                        WHERE p.id = $1::uuid AND p.intent_embedding IS NOT NULL
-                    ) AND source = 'patent'
+                    WHEN pe_exists.has_embedding AND source = 'patent'
                     THEN (relevance * 0.60 + quality * 0.30 + recency * 0.10)
-                    WHEN EXISTS (
-                        SELECT 1 FROM projects p
-                        WHERE p.id = $1::uuid AND p.intent_embedding IS NOT NULL
-                    )
-                    THEN (relevance * 0.60 + recency * 0.25 + quality * 0.15)
+                    WHEN pe_exists.has_embedding
+                    THEN (relevance * 0.60 + quality * 0.15 + recency * 0.25)
                     WHEN source = 'paper'
                     THEN (quality * 0.85 + recency * 0.15)
                     WHEN source = 'patent'
                     THEN (quality * 0.80 + recency * 0.20)
-                    ELSE recency
+                    WHEN source LIKE 'social_%'
+                    THEN (quality * 0.40 + recency * 0.60)
+                    ELSE (quality * 0.20 + recency * 0.80)
                 END AS score
             FROM scored
+            CROSS JOIN (SELECT EXISTS(SELECT 1 FROM project_embedding WHERE intent_embedding IS NOT NULL) AS has_embedding) AS pe_exists
             ORDER BY score DESC
+            LIMIT $2 OFFSET $3
             """,
             project_id,
+            limit,
+            offset,
         )
     return [dict(r) for r in rows]
 
@@ -643,7 +644,9 @@ async def fetch_upload_chunk_summaries(
     if not upload_ids:
         return []
     async with pool.acquire() as conn, conn.transaction():
-        await conn.execute("SELECT set_config('app.accessible_projects', $1, true)", str(project_id))
+        await conn.execute(
+            "SELECT set_config('app.accessible_projects', $1, true)", str(project_id)
+        )
         rows = await conn.fetch(
             """
             SELECT content
@@ -658,4 +661,6 @@ async def fetch_upload_chunk_summaries(
             upload_ids,
             limit,
         )
-    return [str(row.get("content") or "")[:300] for row in rows if str(row.get("content") or "").strip()]
+    return [
+        str(row.get("content") or "")[:300] for row in rows if str(row.get("content") or "").strip()
+    ]

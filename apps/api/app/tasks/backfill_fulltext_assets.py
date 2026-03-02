@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 
 import structlog
 
@@ -15,6 +15,33 @@ from app.repositories import source_asset as source_asset_repo
 from app.services.fulltext_resolver import resolve_fulltext_url
 
 logger = structlog.get_logger(__name__)
+
+
+def _parse_cursor_ts(value: object) -> datetime:
+    """Parse cursor timestamp payload into aware datetime for asyncpg."""
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    raw = str(value or "").strip()
+    if not raw:
+        return datetime(1970, 1, 1, tzinfo=UTC)
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return datetime(1970, 1, 1, tzinfo=UTC)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _coerce_metadata(value: object) -> dict:
+    """Normalize metadata payload from asyncpg/jsonb into a dict."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
 
 
 def _cursor_scope(project_id: str | None) -> str:
@@ -38,7 +65,7 @@ async def backfill_fulltext_assets(ctx: dict, project_id: str | None = None, lim
     cursor_payload = await redis.get(cursor_key)
     cursor = json.loads(cursor_payload) if isinstance(cursor_payload, str) and cursor_payload else {}
 
-    cursor_ts = str(cursor.get("created_at") or "1970-01-01T00:00:00+00:00")
+    cursor_ts = _parse_cursor_ts(cursor.get("created_at"))
     cursor_id = str(cursor.get("id") or "00000000-0000-0000-0000-000000000000")
 
     pool = await get_db_pool()
@@ -68,10 +95,10 @@ async def backfill_fulltext_assets(ctx: dict, project_id: str | None = None, lim
         )
 
     scheduled = 0
-    last_created_at = cursor_ts
+    last_created_at = cursor_ts.isoformat()
     last_id = cursor_id
     for row in rows:
-        metadata = dict(row.get("metadata") or {})
+        metadata = _coerce_metadata(row.get("metadata"))
         doc = RawDocument(
             project_id=str(row["project_id"]),
             user_id=str(row["user_id"]),

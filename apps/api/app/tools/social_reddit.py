@@ -1,5 +1,7 @@
 """Reddit retrieval tool backed by EnsembleData subreddit-posts endpoint."""
 
+import hashlib
+import json
 import re
 
 import httpx
@@ -9,7 +11,7 @@ from app.core.config import settings
 
 logger = structlog.get_logger(__name__)
 
-REDDIT_MAX_POSTS_PER_SUBREDDIT = 10
+REDDIT_MAX_POSTS_PER_SUBREDDIT = 40  # Increased from 10 to allow more posts per subreddit
 REDDIT_TIMEOUT_SECONDS = 20.0
 REDDIT_MIN_TOKEN_LEN = 3
 REDDIT_TOKEN_MAX_LEN = 40
@@ -96,7 +98,9 @@ def _curated_subreddits() -> list[str]:
 
 def _dynamic_subreddit_candidates(query: str, max_dynamic: int) -> list[str]:
     """Extract bounded subreddit candidates from explicit mentions and topical hints."""
-    explicit_mentions = list(re.findall(r"(?:^|\s)r/([A-Za-z0-9_]{3,40})", query, flags=re.IGNORECASE))
+    explicit_mentions = list(
+        re.findall(r"(?:^|\s)r/([A-Za-z0-9_]{3,40})", query, flags=re.IGNORECASE)
+    )
 
     candidates: list[str] = []
     seen: set[str] = set()
@@ -190,6 +194,12 @@ def _extract_next_cursor(payload: object) -> str:
     return ""
 
 
+def _cache_key(project_id: str, query: str, limit: int, time_filter: str) -> str:
+    """Generate a deterministic, project-scoped cache key for Reddit searches."""
+    query_hash = hashlib.sha256(f"{query}:{limit}:{time_filter}".encode()).hexdigest()[:16]
+    return f"search:cache:{project_id}:social_reddit:posts:{query_hash}"
+
+
 def _endpoint_candidates() -> list[str]:
     """Return ordered unique candidate endpoints for subreddit posts."""
     candidates = [
@@ -206,9 +216,53 @@ def _endpoint_candidates() -> list[str]:
     return out
 
 
-async def search_reddit_posts(query: str, limit: int = 24, time_filter: str = "week") -> list[dict]:
-    """Aggregate top Reddit posts from intent-derived subreddits."""
+async def search_reddit_posts(
+    project_id: str, query: str, limit: int = 24, time_filter: str = "week", redis=None
+) -> list[dict]:
+    """Aggregate top Reddit posts from intent-derived subreddits with caching."""
     cleaned_query = str(query or "").strip()
+    if not cleaned_query:
+        return []
+
+    # Check cache first
+    cache_key = _cache_key(project_id, cleaned_query, limit, time_filter)
+    stale_key = f"{cache_key}:stale"
+    if redis:
+        try:
+            cached = await redis.get(cache_key)
+            if cached:
+                return json.loads(cached)
+        except Exception:
+            logger.warning("social_reddit.cache_read_failed", project_id=project_id)
+
+    try:
+        results = await _search_reddit_posts_impl(cleaned_query, limit, time_filter)
+        if redis and results:
+            try:
+                await redis.setex(cache_key, settings.CACHE_TTL_SOCIAL, json.dumps(results))
+                await redis.setex(stale_key, settings.CACHE_TTL_STALE, json.dumps(results))
+            except Exception:
+                logger.warning("social_reddit.cache_write_failed", project_id=project_id)
+        return results
+    except Exception as exc:
+        if redis:
+            try:
+                stale = await redis.get(stale_key)
+                if stale:
+                    logger.info(
+                        "social_reddit.serving_stale", project_id=project_id, error=str(exc)
+                    )
+                    return json.loads(stale)
+            except Exception:
+                pass
+        raise
+
+
+async def _search_reddit_posts_impl(
+    query: str, limit: int = 24, time_filter: str = "week"
+) -> list[dict]:
+    """Internal implementation of Reddit post retrieval."""
+    cleaned_query = query
     if not cleaned_query:
         return []
 
@@ -289,7 +343,9 @@ async def search_reddit_posts(query: str, limit: int = 24, time_filter: str = "w
             if len(rows) >= limit:
                 break
 
-    query_terms = {token.lower() for token in re.findall(r"[a-z0-9]+", cleaned_query) if len(token) >= 3}
+    query_terms = {
+        token.lower() for token in re.findall(r"[a-z0-9]+", cleaned_query) if len(token) >= 3
+    }
     filtered_rows: list[dict] = []
     for row in rows:
         normalized = _normalize_row(row)
@@ -302,11 +358,7 @@ async def search_reddit_posts(query: str, limit: int = 24, time_filter: str = "w
     seen_ids: set[str] = set()
     for row in filtered_rows:
         source_id = str(
-            row.get("id")
-            or row.get("post_id")
-            or row.get("name")
-            or row.get("fullname")
-            or ""
+            row.get("id") or row.get("post_id") or row.get("name") or row.get("fullname") or ""
         ).strip()
         if source_id.startswith("t3_"):
             source_id = source_id.removeprefix("t3_")
@@ -336,5 +388,7 @@ async def search_reddit_posts(query: str, limit: int = 24, time_filter: str = "w
         if len(deduped) >= limit:
             break
 
-    logger.info("social_reddit.search.success", query_preview=cleaned_query[:80], count=len(deduped))
+    logger.info(
+        "social_reddit.search.success", query_preview=cleaned_query[:80], count=len(deduped)
+    )
     return deduped

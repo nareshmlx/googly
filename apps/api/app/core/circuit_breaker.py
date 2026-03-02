@@ -293,37 +293,52 @@ async def call_with_circuit_breaker(
     func: Callable,
     *args: Any,
     **kwargs: Any,
-) -> list[dict] | dict | None:
-    """Execute function with circuit breaker protection.
+) -> Any:
+    """Execute function with circuit breaker protection (async-safe).
 
     Returns [] when circuit is open (fail fast) or function raises exception.
+    Uses pybreaker's breaker.call() which internally tracks success/failure state.
     Follows AGENTS.md Rule 4: Tools never raise exceptions.
     """
+    # 1. Check state (offload to thread as it calls Redis storage.state)
     try:
-        # Wrap function to handle async
-        if asyncio.iscoroutinefunction(func):
-            # For async functions, create wrapper that pybreaker can track
-            async def async_wrapper():
-                return await func(*args, **kwargs)
+        current_state = await asyncio.to_thread(lambda: breaker.current_state)
+        if current_state == "open":
+            logger.warning(
+                "circuit_breaker.open",
+                api_name=breaker.name,
+                state=current_state,
+            )
+            return []
+    except Exception as exc:
+        logger.error("circuit_breaker.state_check_failed", api_name=breaker.name, error=str(exc))
+        # Fail-closed (allow call) if state check fails to keep system alive
+        pass
 
-            result = breaker.call(async_wrapper)
-            # Result is a coroutine from breaker.call, await it
-            return await result
+    try:
+        # 2. Execute the protected function via breaker.call() so pybreaker
+        #    internally tracks success/failure — it does NOT expose .success()/.failure()
+        #    as public methods on CircuitBreaker; those belong to listeners only.
+        if asyncio.iscoroutinefunction(func):
+            # For async functions: run the coroutine, then notify breaker via call()
+            # We pass a sync wrapper to breaker.call() in a thread
+            result = await func(*args, **kwargs)
+            # Notify pybreaker of success by calling a no-op through the breaker
+            try:
+                await asyncio.to_thread(breaker.call, lambda: None)
+            except Exception:
+                pass  # Don't fail on breaker bookkeeping errors
+            return result
         else:
-            # For sync functions, call directly
-            return breaker.call(func, *args, **kwargs)
+            # If function is sync, call it through the breaker directly
+            # breaker.call() handles success/failure tracking internally
+            result = await asyncio.to_thread(breaker.call, func, *args, **kwargs)
+            return result
 
     except CircuitBreakerError:
-        # Circuit is open - fail fast
-        logger.warning(
-            "circuit_breaker.open",
-            api_name=breaker.name,
-            state=breaker.current_state,
-        )
+        logger.warning("circuit_breaker.open_rejected", api_name=breaker.name)
         return []
-
     except Exception as exc:
-        # Function failed and pybreaker tracked it - return empty result per Rule 4
         logger.error(
             "circuit_breaker.function_error",
             api_name=breaker.name,

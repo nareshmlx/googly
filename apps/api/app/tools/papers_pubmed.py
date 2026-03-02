@@ -14,6 +14,7 @@ Integrated with production infrastructure: rate limiting, circuit breaker, cachi
 """
 
 import hashlib
+import json
 import time
 
 import httpx
@@ -21,7 +22,7 @@ import structlog
 
 from app.core.cache import TwoTierCache
 from app.core.circuit_breaker import call_with_circuit_breaker, pubmed_breaker
-from app.core.config import CacheKeys, settings
+from app.core.config import settings
 from app.core.dedup import deduplicate_request
 from app.core.metrics import api_call_duration_seconds, api_calls_total
 from app.core.rate_limiter import pubmed_limiter, rate_limited_call
@@ -96,10 +97,10 @@ def _best_available_content(paper: dict, title: str, authors: list[str]) -> str:
     return title
 
 
-def _cache_key(query: str) -> str:
-    """Generate deterministic cache key for a query."""
+def _cache_key(project_id: str, query: str) -> str:
+    """Generate deterministic project-scoped cache key for a query."""
     query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()[:16]
-    return f"{CacheKeys.PAPERS_PUBMED}:{query_hash}"
+    return f"search:cache:{project_id}:pubmed:papers:{query_hash}"
 
 
 async def _fetch_ids_internal(query: str) -> list[str]:
@@ -276,43 +277,52 @@ async def _search_impl(query: str) -> list[dict]:
     return normalized
 
 
-async def _search_pubmed_impl(query: str, cache_key: str) -> list[dict]:
+async def _search_pubmed_impl(project_id: str, query: str, cache_key: str) -> list[dict]:
     """
     Internal implementation (called by dedup layer).
-
-    Handles cache check, API call, and cache write.
+    Handles cache check, API call, and cache write with stale fallback.
     """
-    # Initialize cache (lazy singleton pattern)
     redis_client = await get_redis()
     cache = TwoTierCache(redis_client)
 
-    # Check cache first (using normalized query)
+    # 1. Primary Cache Check (Fresh result)
     cached = await cache.get(cache_key)
     if cached is not None:
-        logger.info("search_pubmed.cache.hit", result_count=len(cached.get("results", [])))
         return cached.get("results", [])
 
-    # Wrap entire search operation in circuit breaker
+    # 2. Fetch from API
     async def _fetch_impl() -> list[dict]:
         return await _search_impl(query)
 
-    result = await call_with_circuit_breaker(
-        pubmed_breaker,
-        _fetch_impl,
-    )
+    result = await call_with_circuit_breaker(pubmed_breaker, _fetch_impl)
 
-    # Circuit breaker returns [] on failure, or list[dict] on success
-    if result is None or not isinstance(result, list):
-        result = []
-
-    # Cache successful results (TTL from config - research papers don't change frequently)
+    # 3. Success -> Cache and Return
     if result:
         await cache.set(cache_key, {"results": result}, ttl=settings.CACHE_TTL_PAPERS)
+        # Store a "stale" copy that lasts longer
+        stale_key = f"{cache_key}:stale"
+        await redis_client.setex(
+            stale_key, settings.CACHE_TTL_STALE, json.dumps({"results": result})
+        )
+        return result
 
-    return result
+    # 4. Failure -> Serve Stale Fallback
+    stale_key = f"{cache_key}:stale"
+    stale_raw = await redis_client.get(stale_key)
+    if stale_raw:
+        logger.warning(
+            "search_pubmed.api_failed.serving_stale", project_id=project_id, query=query[:50]
+        )
+        try:
+            return json.loads(stale_raw).get("results", [])
+        except json.JSONDecodeError:
+            pass
+
+    return []
 
 
 async def search_pubmed(
+    project_id: str,
     query: str,
     *,
     must_match_terms: list[str] | None = None,
@@ -367,13 +377,13 @@ async def search_pubmed(
         )
     logger.info("search_pubmed.start", query_preview=effective_query[:80])
 
-    # Generate cache key (used for both dedup and cache)
-    cache_key = _cache_key(effective_query)
+    # Generate cache key (instrumented with project_id for multi-tenant security)
+    cache_key = _cache_key(project_id, effective_query)
 
     # Deduplicate concurrent identical requests
     result = await deduplicate_request(
         cache_key,
-        lambda: _search_pubmed_impl(effective_query, cache_key),
+        lambda: _search_pubmed_impl(project_id, effective_query, cache_key),
     )
 
     logger.info("search_pubmed.complete", result_count=len(result))

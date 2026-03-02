@@ -59,13 +59,20 @@ async def chat(
     )
 
     async def event_generator():
-        async for chunk in stream_response(
-            query=request.query,
-            project_id=request.project_id,
-            user_id=user_id,
-            session_id=session_id,
-        ):
-            yield chunk
+        try:
+            async for chunk in stream_response(
+                query=request.query,
+                project_id=request.project_id,
+                user_id=user_id,
+                session_id=session_id,
+            ):
+                yield chunk
+        except Exception as exc:
+            logger.exception("chat.sse_stream_error", session_id=session_id)
+            import json
+
+            yield f"data: {json.dumps({'error': 'An unexpected stream error occurred.', 'details': str(exc)})}\n\n"
+            yield "data: [DONE]\n\n"
 
     return StreamingResponse(
         event_generator(),

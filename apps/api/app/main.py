@@ -1,8 +1,9 @@
 from contextlib import asynccontextmanager
 
 import structlog
-from fastapi import Depends, FastAPI
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 
 from app.core.arq import close_arq_pool
 from app.core.auth import verify_internal_token
@@ -72,6 +73,7 @@ def create_app() -> FastAPI:
     )
 
     app.add_middleware(RequestIDMiddleware)
+    app.add_middleware(GZipMiddleware, minimum_size=1000)
 
     from app.api.v1 import chat, kb, projects, users
 
@@ -80,7 +82,7 @@ def create_app() -> FastAPI:
     app.include_router(kb.router, prefix="/api/v1/kb", tags=["kb"])
     app.include_router(users.router, prefix="/api/v1/users", tags=["users"])
 
-    @app.get("/health", dependencies=[Depends(verify_internal_token)])
+    @app.get("/health")
     async def health_check():
         """
         Liveness + readiness check.
@@ -118,6 +120,16 @@ def create_app() -> FastAPI:
             status.HTTP_200_OK if (db_ok and redis_ok) else status.HTTP_503_SERVICE_UNAVAILABLE
         )
         return JSONResponse(content=body, status_code=http_status)
+
+    @app.get("/healthz")
+    async def healthz():
+        """
+        Lightweight liveness check without authentication.
+
+        Use this for Kubernetes liveness/readiness probes when
+        APIM_INTERNAL_TOKEN is configured.
+        """
+        return {"status": "ok"}
 
     return app
 

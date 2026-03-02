@@ -1,5 +1,7 @@
 """YouTube retrieval tool using EnsembleData keyword search endpoint."""
 
+import hashlib
+import json
 import re
 
 import httpx
@@ -10,7 +12,7 @@ from app.core.config import settings
 logger = structlog.get_logger(__name__)
 
 YOUTUBE_MAX_RESULTS = 100
-YOUTUBE_TIMEOUT_SECONDS = 20.0
+YOUTUBE_TIMEOUT_SECONDS = 45.0
 ENSEMBLE_BASE_FALLBACK = "https://ensembledata.com/apis"
 
 
@@ -97,27 +99,27 @@ def _text_from_runs(value: object) -> str:
 
 
 def _normalize_row(row: dict) -> dict:
-    """Flatten common YouTube result wrappers like videoRenderer."""
+    """Flatten common YouTube result wrappers like videoRenderer or handle raw objects."""
     if "videoRenderer" in row and isinstance(row.get("videoRenderer"), dict):
         vr = row["videoRenderer"]
-        thumbnails = ((vr.get("thumbnail") or {}).get("thumbnails") or [])
+        thumbnails = (vr.get("thumbnail") or {}).get("thumbnails") or []
         thumbnail_url = ""
         if isinstance(thumbnails, list) and thumbnails:
-            first = thumbnails[0]
+            # Prefer larger thumbnails if available
+            first = thumbnails[-1] if len(thumbnails) > 1 else thumbnails[0]
             if isinstance(first, dict):
                 thumbnail_url = str(first.get("url") or "").strip()
-        watch_url = (
-            (vr.get("navigationEndpoint") or {}).get("commandMetadata", {}).get("webCommandMetadata", {}).get("url")
-            or ""
-        )
+
+        watch_url = (vr.get("navigationEndpoint") or {}).get("commandMetadata", {}).get(
+            "webCommandMetadata", {}
+        ).get("url") or ""
         if watch_url and str(watch_url).startswith("/"):
             watch_url = f"https://www.youtube.com{watch_url}"
-        title = _text_from_runs(vr.get("title"))
-        description = _text_from_runs(vr.get("descriptionSnippet")) or title
+
         return {
             "video_id": str(vr.get("videoId") or "").strip(),
-            "title": title,
-            "description": description,
+            "title": _text_from_runs(vr.get("title")),
+            "description": _text_from_runs(vr.get("descriptionSnippet")),
             "channel_name": _text_from_runs(vr.get("longBylineText")),
             "thumbnail_url": thumbnail_url,
             "video_url": str(watch_url).strip(),
@@ -126,15 +128,71 @@ def _normalize_row(row: dict) -> dict:
             "comment_count": "",
             "like_count": "",
         }
-    return row
+
+    # Fallback: if row is already an object (sometimes happens with "get_additional_info=True" or different endpoints)
+    if "video_id" in row or "videoId" in row:
+        return row
+
+    return {}
+
+
+def _cache_key(project_id: str, query: str, max_results: int) -> str:
+    """Generate a deterministic, project-scoped cache key for YouTube searches."""
+    query_hash = hashlib.sha256(f"{query}:{max_results}".encode()).hexdigest()[:16]
+    return f"search:cache:{project_id}:social_youtube:videos:{query_hash}"
 
 
 async def search_youtube_videos(
+    project_id: str,
+    query: str,
+    max_results: int = 20,
+    redis=None,
+) -> list[dict]:
+    """Retrieve YouTube videos for a topic with project-scoped caching."""
+    cleaned_query = str(query or "").strip()
+    if not cleaned_query:
+        return []
+
+    # Check cache first
+    cache_key = _cache_key(project_id, cleaned_query, max_results)
+    stale_key = f"{cache_key}:stale"
+    if redis:
+        try:
+            cached = await redis.get(cache_key)
+            if cached:
+                return json.loads(cached)
+        except Exception:
+            logger.warning("social_youtube.cache_read_failed", project_id=project_id)
+
+    try:
+        results = await _search_youtube_videos_impl(cleaned_query, max_results)
+        if redis and results:
+            try:
+                await redis.setex(cache_key, settings.CACHE_TTL_SOCIAL, json.dumps(results))
+                await redis.setex(stale_key, settings.CACHE_TTL_STALE, json.dumps(results))
+            except Exception:
+                logger.warning("social_youtube.cache_write_failed", project_id=project_id)
+        return results
+    except Exception as exc:
+        if redis:
+            try:
+                stale = await redis.get(stale_key)
+                if stale:
+                    logger.info(
+                        "social_youtube.serving_stale", project_id=project_id, error=str(exc)
+                    )
+                    return json.loads(stale)
+            except Exception:
+                pass
+        raise
+
+
+async def _search_youtube_videos_impl(
     query: str,
     max_results: int = 20,
 ) -> list[dict]:
-    """Retrieve YouTube videos for a topic and normalize output records."""
-    cleaned_query = str(query or "").strip()
+    """Internal implementation of YouTube video retrieval."""
+    cleaned_query = query
     if not cleaned_query:
         return []
 
@@ -149,13 +207,13 @@ async def search_youtube_videos(
         max_results=bounded_max,
     )
 
-    params = {
+    params: dict[str, str | int | float | bool | None] = {
         "keyword": cleaned_query,
         "depth": int(settings.INGEST_YOUTUBE_SEARCH_DEPTH),
         "period": "week",
         "sorting": "relevance",
         "get_additional_info": False,
-        "token": settings.ENSEMBLE_API_TOKEN,
+        "token": str(settings.ENSEMBLE_API_TOKEN),
     }
 
     payload: object | None = None
@@ -197,6 +255,9 @@ async def search_youtube_videos(
     seen_ids: set[str] = set()
     for row in rows:
         normalized = _normalize_row(row)
+        if not normalized:
+            continue
+
         video_url = str(
             normalized.get("video_url")
             or normalized.get("url")
@@ -248,5 +309,7 @@ async def search_youtube_videos(
         if len(results) >= bounded_max:
             break
 
-    logger.info("social_youtube.search.success", query_preview=cleaned_query[:80], count=len(results))
+    logger.info(
+        "social_youtube.search.success", query_preview=cleaned_query[:80], count=len(results)
+    )
     return results

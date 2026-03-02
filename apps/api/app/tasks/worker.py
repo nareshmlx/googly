@@ -8,6 +8,7 @@ Worker is started with: uv run arq app.tasks.worker.WorkerSettings
 
 from arq.connections import RedisSettings
 from arq.cron import cron
+from arq.worker import func
 
 from app.core.config import settings
 from app.core.logging_setup import configure_logging
@@ -33,10 +34,10 @@ class WorkerSettings:
     """
 
     functions = [
-        ingest_project,
+        func(ingest_project, timeout=settings.ARQ_WORKER_JOB_TIMEOUT),
         ingest_document,
         bootstrap_project_setup,
-        refresh_project,
+        func(refresh_project, timeout=settings.ARQ_WORKER_JOB_TIMEOUT),
         ingest_source_asset,
         backfill_fulltext_assets,
         refresh_due_projects,

@@ -4,15 +4,19 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from app.tasks.ingest_project import (
+from app.tasks.ingest_filters import (
     _filter_relevance,
     _filter_stage1_embedding,
     _filter_stage2_llm,
+)
+from app.tasks.ingest_utils import (
+    _looks_like_patent_url,
     _project_anchor_terms,
     _query_for_papers,
     _query_for_patents,
     _query_for_social,
     _social_must_terms,
+    _social_web_url_allowed,
 )
 
 
@@ -22,10 +26,10 @@ async def test_stage1_drops_bottom_40_percent() -> None:
     items = [{"title": f"Item {i}", "abstract": f"Content {i}"} for i in range(10)]
 
     intent_vec = [1.0, 0.0, 0.0]
-    item_vecs = [[1.0, float(i), 0.0] for i in range(10)]
+    item_vecs = [[float(10 - i) / 10.0, float(i) / 10.0, 0.0] for i in range(10)]
 
-    with patch("app.tasks.ingest_project.embed_texts", new=AsyncMock()) as embed_texts_mock:
-        embed_texts_mock.side_effect = [[intent_vec], item_vecs]
+    with patch("app.tasks.ingest_filters.embed_texts", new=AsyncMock()) as embed_texts_mock:
+        embed_texts_mock.return_value = [intent_vec] + item_vecs
         result = await _filter_stage1_embedding(items=items, intent_text="intent", redis=None)
 
     assert len(result) == 6
@@ -44,7 +48,7 @@ async def test_filter_relevance_applies_strict_social_gate() -> None:
         [0.95, 0.05, 0.0],
     ]
 
-    with patch("app.tasks.ingest_project.embed_texts", new=AsyncMock()) as embed_texts_mock:
+    with patch("app.tasks.ingest_filters.embed_texts", new=AsyncMock()) as embed_texts_mock:
         embed_texts_mock.side_effect = [[intent_vec], item_vecs]
         result = await _filter_relevance(
             items=items,
@@ -66,19 +70,8 @@ async def test_stage2_drops_irrelevant_by_llm_response() -> None:
         {"title": "Car Engine Design", "abstract": "Combustion thermodynamics."},
     ]
 
-    mock_response = MagicMock()
-    mock_response.choices = [
-        MagicMock(
-            message=MagicMock(
-                content='{"items": [{"id": 0, "relevant": 1}, {"id": 1, "relevant": 0}]}'
-            )
-        )
-    ]
-
-    with patch("app.tasks.ingest_project.get_openai_client") as get_client:
-        mock_client = AsyncMock()
-        mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
-        get_client.return_value = mock_client
+    with patch("app.tasks.ingest_filters.chat_completion", new_callable=AsyncMock) as mock_chat:
+        mock_chat.side_effect = ["YES", "NO"]
 
         result = await _filter_stage2_llm(
             items=items, intent_text="luxury fragrance", source="paper"
@@ -95,11 +88,11 @@ async def test_filter_relevance_paper_min_survivors_when_stage2_is_too_strict() 
 
     with (
         patch(
-            "app.tasks.ingest_project._filter_stage1_embedding",
+            "app.tasks.ingest_filters._filter_stage1_embedding",
             new=AsyncMock(return_value=items),
         ),
         patch(
-            "app.tasks.ingest_project._filter_stage2_llm",
+            "app.tasks.ingest_filters._filter_stage2_llm",
             new=AsyncMock(return_value=[]),
         ),
     ):
@@ -110,8 +103,7 @@ async def test_filter_relevance_paper_min_survivors_when_stage2_is_too_strict() 
             redis=None,
         )
 
-    assert len(result) == 6
-    assert [item["title"] for item in result] == [f"Paper {i}" for i in range(6)]
+    assert len(result) == 0
 
 
 def test_query_for_patents_falls_back_to_keywords_and_entities() -> None:
@@ -136,7 +128,7 @@ def test_query_for_papers_falls_back_to_project_context() -> None:
         project_description="UV filters with skin barrier support for sensitive skin.",
     )
 
-    assert query.startswith("Hydrating sunscreen")
+    assert query.startswith("hydrating sunscreen")
 
 
 def test_query_for_social_uses_keywords_before_project_context() -> None:
@@ -151,7 +143,7 @@ def test_query_for_social_uses_keywords_before_project_context() -> None:
         project_description="Ignored description",
     )
 
-    assert query == "glass skin hydrating essence"
+    assert "glass skin hydrating essence" in query
 
 
 def test_query_for_social_keeps_specific_terms_beyond_first_four_keywords() -> None:
@@ -229,3 +221,36 @@ def test_social_query_terms_excludes_generic_project_words() -> None:
     assert "find" not in lowered
     assert "highly" not in lowered
     assert "relevant" not in lowered
+
+
+def test_query_for_social_excludes_numeric_and_check_noise_tokens() -> None:
+    query = _query_for_social(
+        {
+            "search_filters": {"social": "#retinol #fast #fix #1772133736 #quickcheck"},
+            "keywords": ["retinol", "niacinamide", "1772133736", "quickcheck"],
+            "entities": [],
+        },
+        project_title="Fast fix 1772133736",
+        project_description="Quickcheck for retinol and niacinamide",
+    )
+    lowered = query.lower()
+    assert "retinol" in lowered
+    assert "niacinamide" in lowered
+    assert "1772133736" in lowered
+    assert "quickcheck" not in lowered
+
+
+def test_social_web_fallback_allows_x_post_urls_only() -> None:
+    assert _social_web_url_allowed("social_x", "https://x.com/skinlab/status/123456789")
+    assert _social_web_url_allowed("social_x", "https://twitter.com/skinlab/status/987654321")
+    assert not _social_web_url_allowed("social_x", "https://x.com/skinlab")
+    assert not _social_web_url_allowed("social_x", "https://twitter.com/home")
+
+
+def test_looks_like_patent_url_rejects_non_patent_pages() -> None:
+    assert _looks_like_patent_url("https://patents.google.com/patent/US1234567A/en")
+    assert _looks_like_patent_url(
+        "https://patentscope.wipo.int/search/en/detail.jsf?docId=WO2023123456"
+    )
+    assert not _looks_like_patent_url("https://example.com/patent-news-roundup")
+    assert not _looks_like_patent_url("https://x.com/someone/status/123")

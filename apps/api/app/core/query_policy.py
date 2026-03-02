@@ -157,113 +157,11 @@ def _specificity_from_query(query: str, intent: dict, explicit_specific_signals:
     return "broad"
 
 
-def build_query_policy(query: str, intent: dict | None = None) -> QueryPolicy:
-    """Build a deterministic query policy from user query and structured intent."""
-    intent = intent or {}
-    normalized_query = re.sub(r"\s+", " ", str(query or "").strip())
-    entities = intent.get("entities") or []
-    explicit_must_terms = intent.get("must_match_terms") or []
-    entity_terms = [
-        _normalize_phrase(e)
-        for e in entities
-        if isinstance(e, str) and _normalize_phrase(e).lower() not in _META_TERMS
-    ]
-    must_match_terms = _dedupe_keep_order(
-        entity_terms + [_normalize_phrase(e) for e in explicit_must_terms if isinstance(e, str)]
-    )
-    if not must_match_terms:
-        must_match_terms = _entity_candidates_from_query(normalized_query)
-
-    optional_terms = []
-    for value in (intent.get("expanded_terms") or []):
-        if isinstance(value, str):
-            optional_terms.append(_normalize_phrase(value))
-    for value in (intent.get("keywords") or []):
-        if isinstance(value, str):
-            optional_terms.append(_normalize_phrase(value))
-    optional_terms = [
-        term
-        for term in _dedupe_keep_order(optional_terms)
-        if term and term.lower() not in {v.lower() for v in must_match_terms}
-    ][:8]
-
-    domain = str(intent.get("domain") or "").strip().lower()
-    intent_domain_terms = []
-    for value in (intent.get("domain_terms") or []):
-        if isinstance(value, str):
-            intent_domain_terms.append(_normalize_phrase(value))
-    intent_domain_terms = _dedupe_keep_order(intent_domain_terms)
-    domain_terms = intent_domain_terms if intent_domain_terms else _DOMAIN_CONTEXT_TERMS.get(domain, [])
-    query_type = str(intent.get("query_type") or "general").strip().lower()
-    explicit_specific_signals = bool(entity_terms or explicit_must_terms or re.search(r'"[^"]+"', normalized_query))
-    query_specificity = _specificity_from_query(normalized_query, intent, explicit_specific_signals)
-
-    return QueryPolicy(
-        original_query=str(query or ""),
-        normalized_query=normalized_query,
-        must_match_terms=must_match_terms,
-        optional_terms=optional_terms,
-        domain_terms=domain_terms,
-        query_type=query_type or "general",
-        query_specificity=query_specificity,
-    )
-
-
-def build_source_query(policy: QueryPolicy, source: str) -> str:
-    """Build source-specific query text from a normalized query policy."""
-    source_key = str(source or "").strip().lower()
-    must_terms = policy.must_match_terms
-    optional = policy.optional_terms
-    domain_terms = policy.domain_terms
-
-    if source_key == "pubmed":
-        must_clause = ""
-        if must_terms:
-            must_expr = " OR ".join(f'"{term}"[Title/Abstract]' for term in must_terms)
-            must_clause = f"({must_expr})"
-        else:
-            must_clause = f'"{policy.normalized_query}"[Title/Abstract]'
-
-        optional_all = optional + domain_terms
-        if optional_all:
-            optional_expr = " OR ".join(f'"{term}"[Title/Abstract]' for term in optional_all)
-            return f"{must_clause} AND ({optional_expr})"
-        return must_clause
-
-    if source_key == "arxiv":
-        if must_terms:
-            pieces = [f'ti:"{term}" OR abs:"{term}"' for term in must_terms]
-            core = " OR ".join(f"({piece})" for piece in pieces)
-            if optional:
-                optional_expr = " OR ".join(f'all:"{term}"' for term in optional[:2])
-                return f"({core}) AND ({optional_expr})"
-            return core
-        return f'all:"{policy.normalized_query}"'
-
-    if source_key in {"semantic_scholar", "openalex", "exa", "tavily", "perigon"}:
-        if not policy.is_specific and policy.normalized_query:
-            return policy.normalized_query
-        pieces = [f'"{term}"' for term in must_terms] if policy.is_specific else must_terms
-        pieces.extend(optional)
-        pieces.extend(domain_terms)
-        query = " ".join(piece for piece in pieces if piece).strip()
-        return query or policy.normalized_query
-
-    if source_key in {"patentsview", "lens"}:
-        if not policy.is_specific and policy.normalized_query:
-            return policy.normalized_query
-        pieces = must_terms
-        pieces.extend(optional[:3])
-        pieces.extend(domain_terms)
-        query = " ".join(piece for piece in pieces if piece).strip()
-        return query or policy.normalized_query
-
-    return policy.normalized_query
-
-
 def lexical_entity_coverage(text: str, must_match_terms: list[str]) -> float:
     """Return the fraction of must-match terms present in the given text."""
-    terms = [_normalize_phrase(term).lower() for term in must_match_terms if _normalize_phrase(term)]
+    terms = [
+        _normalize_phrase(term).lower() for term in must_match_terms if _normalize_phrase(term)
+    ]
     if not terms:
         return 1.0
     haystack = re.sub(r"\s+", " ", str(text or "").lower())

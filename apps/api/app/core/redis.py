@@ -4,12 +4,12 @@ import redis.asyncio as redis
 import structlog
 
 from app.core.config import settings
-from app.core.constants import DatabasePool
 
 logger = structlog.get_logger(__name__)
 
 _redis_client: redis.Redis | None = None
-_redis_lock: asyncio.Lock | None = None
+# Create lock eagerly at module level — safe since Python 3.10
+_redis_lock = asyncio.Lock()
 
 
 async def get_redis() -> redis.Redis:
@@ -17,9 +17,7 @@ async def get_redis() -> redis.Redis:
 
     Double-checked locking prevents the TOCTOU race under high concurrency.
     """
-    global _redis_client, _redis_lock
-    if _redis_lock is None:
-        _redis_lock = asyncio.Lock()
+    global _redis_client
 
     if _redis_client is None:
         async with _redis_lock:
@@ -34,7 +32,14 @@ async def get_redis() -> redis.Redis:
                     settings.REDIS_URL,
                     encoding="utf-8",
                     decode_responses=True,
-                    max_connections=DatabasePool.MAX_SIZE,
+                    # Use a larger pool than DatabasePool.MAX_SIZE (50) — the
+                    # ingestion worker fans out to 15+ parallel source tools,
+                    # each making multiple Redis calls (rate limiter, embed
+                    # cache, status writes, circuit breaker).  Under load that
+                    # easily exceeds 50 concurrent connections and raises
+                    # ConnectionError: Too many connections.
+                    # Redis connections are cheap lightweight sockets; 200 is safe.
+                    max_connections=200,
                 )
                 await _redis_client.ping()
                 logger.info("redis.connected")

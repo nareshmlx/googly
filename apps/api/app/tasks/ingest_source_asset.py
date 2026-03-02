@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -199,7 +200,15 @@ async def ingest_source_asset(ctx: dict, asset_id: str) -> None:
             )
             return
 
-        metadata = dict(asset.get("metadata") or {})
+        # Parse metadata - database stores it as JSON string
+        metadata_raw = asset.get("metadata")
+        if isinstance(metadata_raw, str):
+            metadata = json.loads(metadata_raw) if metadata_raw else {}
+        elif isinstance(metadata_raw, dict):
+            metadata = metadata_raw
+        else:
+            metadata = {}
+
         raw_doc = map_fulltext_raw_document(
             project_id=str(asset["project_id"]),
             user_id=str(asset["user_id"]),

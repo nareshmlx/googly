@@ -32,10 +32,7 @@ from app.agents.intent import build_intent_agent
 from app.agents.patent import build_patent_agent
 from app.agents.project_relevance import build_project_relevance_agent
 from app.agents.query_enhancer import build_query_enhancer_agent
-from app.agents.research import build_research_agent
-from app.agents.search_fallback import build_search_fallback_agent
 from app.agents.synthesis import build_synthesis_agent
-from app.agents.trend import build_trend_agent
 from app.core.config import settings
 from app.core.dedup_papers import deduplicate_papers
 from app.core.metrics import (
@@ -63,9 +60,6 @@ _intent_agent = None
 _query_enhancer_agent = None
 _synthesis_agent = None
 _project_relevance_agent = None
-_search_fallback_agent = None
-_research_agent = None
-_trend_agent = None
 _patent_agent = None
 
 
@@ -95,27 +89,6 @@ def _get_project_relevance_agent():
     if _project_relevance_agent is None:
         _project_relevance_agent = build_project_relevance_agent()
     return _project_relevance_agent
-
-
-def _get_search_fallback_agent():
-    global _search_fallback_agent
-    if _search_fallback_agent is None:
-        _search_fallback_agent = build_search_fallback_agent()
-    return _search_fallback_agent
-
-
-def _get_research_agent():
-    global _research_agent
-    if _research_agent is None:
-        _research_agent = build_research_agent()
-    return _research_agent
-
-
-def _get_trend_agent():
-    global _trend_agent
-    if _trend_agent is None:
-        _trend_agent = build_trend_agent()
-    return _trend_agent
 
 
 def _get_patent_agent():
@@ -338,11 +311,6 @@ def _build_academic_query(query: str, intent: dict) -> str:
         if domain in {"cosmetics", "beauty_market_intelligence", "fragrance", "skincare"}:
             text = f"{text} skincare cosmetics".strip()
     return text
-
-
-def _clean_openalex_query(query: str, intent: dict) -> str:
-    """Compatibility alias for legacy tests/callers."""
-    return _build_academic_query(query, intent)
 
 
 def build_academic_query(query: str, intent: dict) -> str:
@@ -597,7 +565,9 @@ def _max_coverage_for_kb(kb_results: list[dict], must_match_terms: list[str]) ->
     return best
 
 
-def _filter_papers_by_entity_coverage(papers: list[dict], must_match_terms: list[str]) -> list[dict]:
+def _filter_papers_by_entity_coverage(
+    papers: list[dict], must_match_terms: list[str]
+) -> list[dict]:
     """Keep papers with sufficient lexical coverage for specific queries."""
     if not papers or not must_match_terms:
         return papers
@@ -854,32 +824,13 @@ async def run_query(
     # from a specific site (e.g. Fragrantica), so domain-filtered web search via
     # Tavily/Exa is more appropriate than Perigon or PatentsView which cannot
     # filter by domain.
-    if query_type in {"trend", "social"} and not target_domain:
-        # Route trend/social queries to TrendAgent for tool-driven analysis.
-        logger.info(
-            "orchestrator.routing_to_trend_agent",
-            query=cleaned_query[:80],
-            query_type=query_type,
-        )
-        try:
-            trend_agent = _get_trend_agent()
-            trend_result = await trend_agent.arun(cleaned_query)
-            trend_content = trend_result.content if trend_result and trend_result.content else ""
+    #
+    # NOTE: TrendAgent removed - trend/social queries now use KB + Fallback + Synthesis
+    # Project creation already ingests social data to KB, so runtime queries use that data.
+    # If KB is empty, the fallback (Tavily, Exa, Perigon) will handle it.
+    # This saves significant EnsembleData credits at runtime.
 
-            if trend_content:
-                # Stream the trend analysis result directly
-                yield f"data: {json.dumps({'token': trend_content})}\n\n"
-                yield "data: [DONE]\n\n"
-                logger.info("orchestrator.trend_agent_success", result_length=len(trend_content))
-                return
-            else:
-                logger.warning("orchestrator.trend_agent_empty_result")
-                # Fall through to normal KB flow
-        except Exception:
-            logger.exception("orchestrator.trend_agent_error")
-            # Fall through to normal KB flow on error
-
-    elif query_type == "patent" and not target_domain:
+    if query_type == "patent" and not target_domain:
         # Route to PatentAgent for patent search
         logger.info("orchestrator.routing_to_patent_agent", query=cleaned_query[:80])
         try:
@@ -923,18 +874,21 @@ async def run_query(
             # Use cleaned query directly - no query_policy transformation needed
             return await asyncio.gather(
                 search_semantic_scholar(
+                    primary_project_id,
                     research_query,
                     must_match_terms=intent.get("must_match_terms", []),
                     domain_terms=intent.get("domain_terms", []),
                     query_specificity=intent.get("query_specificity", "broad"),
                 ),
                 search_arxiv(
+                    primary_project_id,
                     research_query,
                     must_match_terms=intent.get("must_match_terms", []),
                     domain_terms=intent.get("domain_terms", []),
                     query_specificity=intent.get("query_specificity", "broad"),
                 ),
                 search_pubmed(
+                    primary_project_id,
                     research_query,
                     must_match_terms=intent.get("must_match_terms", []),
                     domain_terms=intent.get("domain_terms", []),
@@ -978,12 +932,7 @@ async def run_query(
     # even if cosine similarity crossed threshold.
     is_specific_query = intent.get("query_specificity") == "specific"
     must_match_terms = intent.get("must_match_terms", [])
-    if (
-        kb_results is not None
-        and is_specific_query
-        and must_match_terms
-        and not target_domain
-    ):
+    if kb_results is not None and is_specific_query and must_match_terms and not target_domain:
         kb_coverage = _max_coverage_for_kb(kb_results, must_match_terms)
         if kb_coverage < settings.QUERY_ENTITY_MATCH_THRESHOLD:
             logger.info(
@@ -1015,14 +964,17 @@ async def run_query(
             # Call all 3 search tools in parallel with fault tolerance
             search_results = await asyncio.gather(
                 search_tavily(
+                    primary_project_id,
                     cleaned_query,
                     include_domains=include_domains,
                 ),
                 search_exa(
+                    primary_project_id,
                     cleaned_query,
                     include_domains=include_domains,
                 ),
                 search_perigon(
+                    primary_project_id,
                     cleaned_query,
                     must_match_terms=intent.get("must_match_terms", []),
                     domain_terms=intent.get("domain_terms", []),
@@ -1134,7 +1086,7 @@ async def run_query(
                     threshold=settings.EXA_FALLBACK_THRESHOLD,
                 )
                 try:
-                    exa_papers = await search_exa(research_query)
+                    exa_papers = await search_exa(primary_project_id, research_query)
                     if exa_papers:
                         research_tool_calls_total.labels(tool="exa").inc()
                         exa_called = True

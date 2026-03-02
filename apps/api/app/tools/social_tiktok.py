@@ -14,6 +14,8 @@ try/except so any SDK-level exception is caught and logged gracefully.
 """
 
 import asyncio
+import hashlib
+import json
 from typing import Literal
 
 import httpx
@@ -158,7 +160,9 @@ def _fetch_keyword_sync(
         return [_map_video(v) for v in _extract_items(result)]
     except Exception as exc:
         try:
-            logger.exception("social_tiktok.keyword_fetch.failed", query=query, exact_match=exact_match)
+            logger.exception(
+                "social_tiktok.keyword_fetch.failed", query=query, exact_match=exact_match
+            )
         except Exception:
             logger.error(
                 "social_tiktok.keyword_fetch.failed_fallback",
@@ -185,7 +189,67 @@ def _dedupe_videos(batches: list[list[dict]], *, max_results: int) -> list[dict]
     return deduped
 
 
+def _cache_key(
+    project_id: str, hashtags: str, keyword_queries: list[str] | None, max_results: int
+) -> str:
+    """Generate a deterministic, project-scoped cache key for TikTok searches."""
+    kw_str = ",".join(sorted(keyword_queries)) if keyword_queries else ""
+    query_hash = hashlib.sha256(f"{hashtags}:{kw_str}:{max_results}".encode()).hexdigest()[:16]
+    return f"search:cache:{project_id}:social_tiktok:posts:{query_hash}"
+
+
 async def fetch_tiktok_posts(
+    project_id: str,
+    hashtags: str = "",
+    *,
+    keyword_queries: list[str] | None = None,
+    exact_match: bool = False,
+    period: Literal["0", "1", "7", "30", "90", "180"] = "30",
+    max_results: int = 50,
+    redis=None,
+) -> list[dict]:
+    """Fetch TikTok videos with project-scoped caching."""
+    # Check cache first
+    cache_key = _cache_key(project_id, hashtags, keyword_queries, max_results)
+    stale_key = f"{cache_key}:stale"
+    if redis:
+        try:
+            cached = await redis.get(cache_key)
+            if cached:
+                return json.loads(cached)
+        except Exception:
+            logger.warning("social_tiktok.cache_read_failed", project_id=project_id)
+
+    try:
+        results = await _fetch_tiktok_posts_impl(
+            hashtags=hashtags,
+            keyword_queries=keyword_queries,
+            exact_match=exact_match,
+            period=period,
+            max_results=max_results,
+        )
+        if redis and results:
+            try:
+                await redis.setex(cache_key, settings.CACHE_TTL_SOCIAL, json.dumps(results))
+                await redis.setex(stale_key, settings.CACHE_TTL_STALE, json.dumps(results))
+            except Exception:
+                logger.warning("social_tiktok.cache_write_failed", project_id=project_id)
+        return results
+    except Exception as exc:
+        if redis:
+            try:
+                stale = await redis.get(stale_key)
+                if stale:
+                    logger.info(
+                        "social_tiktok.serving_stale", project_id=project_id, error=str(exc)
+                    )
+                    return json.loads(stale)
+            except Exception:
+                pass
+        raise
+
+
+async def _fetch_tiktok_posts_impl(
     hashtags: str = "",
     *,
     keyword_queries: list[str] | None = None,
@@ -193,6 +257,7 @@ async def fetch_tiktok_posts(
     period: Literal["0", "1", "7", "30", "90", "180"] = "30",
     max_results: int = 50,
 ) -> list[dict]:
+    """Internal implementation of TikTok video retrieval."""
     """
     Fetch TikTok videos matching the given hashtags via the EnsembleData SDK.
 

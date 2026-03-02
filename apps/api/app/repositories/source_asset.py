@@ -134,11 +134,11 @@ async def mark_extract_result(
         await conn.execute(
             """
             UPDATE knowledge_source_assets
-            SET extract_status = $2,
+            SET extract_status = $2::varchar,
                 extracted_chars = $3,
                 extracted_pages = $4,
-                error_code = CASE WHEN $2 = 'success' THEN NULL ELSE NULLIF($5, '') END,
-                error_message = CASE WHEN $2 = 'success' THEN NULL ELSE NULLIF($6, '') END,
+                error_code = CASE WHEN $2::text = 'success' THEN NULL ELSE NULLIF($5::text, '') END,
+                error_message = CASE WHEN $2::text = 'success' THEN NULL ELSE NULLIF($6::text, '') END,
                 updated_at = $7
             WHERE id = $1::uuid
             """,

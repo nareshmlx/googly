@@ -1,5 +1,6 @@
 """KB router — document upload and status endpoints."""
 
+import base64
 from uuid import uuid4
 
 import structlog
@@ -88,7 +89,10 @@ async def upload_document(
 
     try:
         redis = await get_redis()
-        await redis.setex(staging_key, RedisTTL.UPLOAD_STAGING.value, content_bytes)
+        # Base64-encode binary content to survive Redis decode_responses=True
+        # Without this, PDF/DOCX bytes are silently corrupted by UTF-8 decoding
+        encoded = base64.b64encode(content_bytes).decode("ascii")
+        await redis.setex(staging_key, RedisTTL.UPLOAD_STAGING.value, encoded)
         await arq_pool.enqueue_job(
             "ingest_document",
             upload_id,

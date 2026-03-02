@@ -13,6 +13,7 @@ from hashlib import sha256
 
 import structlog
 from arq import ArqRedis
+from arq.jobs import deserialize_result
 
 from app.core.config import settings
 from app.core.constants import RedisKeys, RedisTTL
@@ -117,19 +118,34 @@ async def get_project_ingest_status(project_id: str) -> dict:
         ):
             job_id = str(redis_payload.get("job_id") or "").strip()
             try:
-                if await redis_client.exists(f"arq:result:{job_id}"):
+                result_key = f"arq:result:{job_id}"
+                result_raw = await redis_client.get(result_key)
+                if result_raw:
                     now = datetime.now(UTC).isoformat()
-                    redis_payload["status"] = "empty"
-                    redis_payload["total_chunks"] = 0
+                    result = deserialize_result(result_raw)
+                    success = bool(getattr(result, "success", False))
+                    redis_payload["status"] = (
+                        "ready"
+                        if success and kb_chunk_count > 0
+                        else "empty"
+                        if success
+                        else "failed"
+                    )
+                    redis_payload["total_chunks"] = kb_chunk_count if kb_chunk_count > 0 else 0
                     redis_payload["finished_at"] = (
-                        redis_payload.get("finished_at")
-                        or refreshed_at
-                        or now
+                        redis_payload.get("finished_at") or refreshed_at or now
                     )
                     redis_payload["updated_at"] = now
-                    redis_payload["message"] = (
-                        "Ingestion finished with no documents. Check source API connectivity/keys."
-                    )
+                    if success:
+                        redis_payload["message"] = (
+                            "Ingestion complete."
+                            if kb_chunk_count > 0
+                            else "Ingestion finished with no documents. Check source API connectivity/keys."
+                        )
+                    else:
+                        redis_payload["message"] = (
+                            "Ingestion failed in background worker. Check worker logs."
+                        )
                     await redis_client.setex(
                         status_key,
                         RedisTTL.PROJECT_INGEST_STATUS.value,
@@ -149,7 +165,9 @@ async def get_project_ingest_status(project_id: str) -> dict:
     return {
         "project_id": project_id,
         "status": "ready" if kb_chunk_count > 0 else "unknown",
-        "message": "Ingestion complete." if kb_chunk_count > 0 else "No recent ingest status found.",
+        "message": "Ingestion complete."
+        if kb_chunk_count > 0
+        else "No recent ingest status found.",
         "queued_at": None,
         "started_at": None,
         "updated_at": refreshed_at,
@@ -436,7 +454,9 @@ async def create_project(
             timeout_seconds=settings.PROJECT_CREATE_INTENT_TIMEOUT,
         )
         fallback = description[:200]
-        fallback_terms = [token.lower() for token in re.findall(r"[a-zA-Z0-9]+", fallback) if len(token) >= 4]
+        fallback_terms = [
+            token.lower() for token in re.findall(r"[a-zA-Z0-9]+", fallback) if len(token) >= 4
+        ]
         fallback_terms = list(dict.fromkeys(fallback_terms))[:6]
         fallback_tiktok = " ".join(f"#{token}" for token in fallback_terms[:4]).strip()
         fallback_instagram = " ".join(fallback_terms[:3]).strip()
@@ -536,6 +556,10 @@ async def get_discover_feed(project_id: str) -> list[dict]:
         youtube=sum(1 for r in rows if r["source"] == "social_youtube"),
         reddit=sum(1 for r in rows if r["source"] == "social_reddit"),
         x=sum(1 for r in rows if r["source"] == "social_x"),
+        paper=sum(1 for r in rows if r["source"] == "paper"),
+        patent=sum(1 for r in rows if r["source"] == "patent"),
+        news=sum(1 for r in rows if r["source"] == "news"),
+        search=sum(1 for r in rows if r["source"] == "search"),
     )
     return rows
 

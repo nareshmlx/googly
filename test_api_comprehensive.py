@@ -4,14 +4,29 @@ Comprehensive API endpoint testing script.
 Tests all endpoints and verifies data flow through DB and Redis.
 """
 
+import os
 import asyncio
 import httpx
-import json
 import sys
+import time
+import jwt
 from datetime import datetime
 
-BASE_URL = "http://localhost:8003"
-AUTH_TOKEN = "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIwMDAwMDAwMC0wMDAwLTAwMDAtMDAwMC0wMDAwMDAwMDAwMDAiLCJnb29nbHlfdGllciI6ImZyZWUifQ.wqUTdfKu1gZzveanQiQaFUOD-GedGbRtyIoGojHPkA4"
+BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000")
+
+
+def get_auth_token():
+    payload = {
+        "sub": "test-user-001",
+        "exp": int(time.time()) + 3600,
+        "googly_tier": "free",
+        "user_id": "00000000-0000-0000-0000-000000000001",
+    }
+    encoded = jwt.encode(payload, "secret", algorithm="HS256")
+    return f"Bearer {encoded}"
+
+
+AUTH_TOKEN = get_auth_token()
 
 # Color codes for output
 GREEN = "\033[92m"
@@ -216,20 +231,20 @@ async def test_chat_streaming(client: httpx.AsyncClient, project_id: str):
                         break
 
                 log_test(
-                    f"POST /api/v1/chat/ (stream)",
+                    "POST /api/v1/chat/ (stream)",
                     "PASS",
                     f"Received {chunks_received} chunks",
                 )
                 return True
             else:
                 log_test(
-                    f"POST /api/v1/chat/ (stream)",
+                    "POST /api/v1/chat/ (stream)",
                     "FAIL",
                     f"Status: {response.status_code}",
                 )
                 return False
     except Exception as e:
-        log_test(f"POST /api/v1/chat/ (stream)", "FAIL", f"Exception: {str(e)}")
+        log_test("POST /api/v1/chat/ (stream)", "FAIL", f"Exception: {str(e)}")
         return False
 
 
@@ -265,7 +280,7 @@ async def test_kb_upload_status(client: httpx.AsyncClient, project_id: str):
 async def main():
     """Run all tests."""
     print(f"\n{'=' * 60}")
-    print(f"GOOGLY API COMPREHENSIVE ENDPOINT TEST")
+    print("GOOGLY API COMPREHENSIVE ENDPOINT TEST")
     print(f"{'=' * 60}\n")
 
     async with httpx.AsyncClient(timeout=60.0) as client:
@@ -285,7 +300,7 @@ async def main():
 
         # Test 3: Projects
         print("\n--- Project Management Tests ---")
-        projects = await test_list_projects(client)
+        await test_list_projects(client)
 
         # Create a new project for testing
         new_project = await test_create_project(client)
@@ -316,7 +331,7 @@ async def main():
 
     # Summary
     print(f"\n{'=' * 60}")
-    print(f"TEST SUMMARY")
+    print("TEST SUMMARY")
     print(f"{'=' * 60}\n")
 
     passed = sum(1 for r in test_results if r["status"] == "PASS")

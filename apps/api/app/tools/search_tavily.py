@@ -10,6 +10,7 @@ Integrated with production infrastructure: rate limiting, circuit breaker, cachi
 """
 
 import hashlib
+import json
 import time
 
 import httpx
@@ -17,7 +18,7 @@ import structlog
 
 from app.core.cache import TwoTierCache
 from app.core.circuit_breaker import call_with_circuit_breaker, tavily_breaker
-from app.core.config import CacheKeys, settings
+from app.core.config import settings
 from app.core.dedup import deduplicate_request
 from app.core.metrics import api_call_duration_seconds, api_calls_total
 from app.core.rate_limiter import rate_limited_call, tavily_limiter
@@ -35,15 +36,11 @@ _MAX_RESULTS_DOMAIN = 7
 _SEARCH_DEPTH_DOMAIN = "advanced"
 
 
-def _cache_key(query: str, domains: list[str] | None = None) -> str:
-    """Generate deterministic cache key for a query, optionally scoped to domains.
-
-    Domain-filtered requests produce a different key than unfiltered ones so
-    "techcrunch.com + retinol" never hits the cache entry for bare "retinol".
-    """
+def _cache_key(project_id: str, query: str, domains: list[str] | None = None) -> str:
+    """Generate deterministic project-scoped cache key for a query."""
     raw = query + str(sorted(domains or []))
     query_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
-    return f"{CacheKeys.SEARCH_TAVILY}:{query_hash}"
+    return f"search:cache:{project_id}:tavily:search:{query_hash}"
 
 
 async def _search_with_retry(query: str, include_domains: list[str] | None = None) -> dict | None:
@@ -158,44 +155,54 @@ async def _search_impl(query: str, include_domains: list[str] | None = None) -> 
 
 
 async def _search_tavily_impl(
-    query: str, cache_key: str, include_domains: list[str] | None = None
+    project_id: str, query: str, cache_key: str, include_domains: list[str] | None = None
 ) -> list[dict]:
     """
     Internal implementation (called by dedup layer).
-
-    Handles cache check, API call, and cache write.
+    Handles cache check, API call, and cache write with stale fallback.
     """
-    # Initialize cache (lazy singleton pattern)
     redis_client = await get_redis()
     cache = TwoTierCache(redis_client)
 
-    # Check cache first
+    # 1. Primary Cache Check (Fresh result)
     cached = await cache.get(cache_key)
     if cached is not None:
-        logger.info("search_tavily.cache.hit", result_count=len(cached.get("results", [])))
         return cached.get("results", [])
 
-    # Wrap entire search operation in circuit breaker
+    # 2. Fetch from API
     async def _fetch_impl() -> list[dict]:
         return await _search_impl(query, include_domains=include_domains)
 
-    result = await call_with_circuit_breaker(
-        tavily_breaker,
-        _fetch_impl,
-    )
+    result = await call_with_circuit_breaker(tavily_breaker, _fetch_impl)
 
-    # Circuit breaker returns [] on failure, or list[dict] on success
-    if result is None or not isinstance(result, list):
-        result = []
-
-    # Cache successful results (TTL from config for web search)
+    # 3. Success -> Cache and Return
     if result:
         await cache.set(cache_key, {"results": result}, ttl=settings.CACHE_TTL_SEARCH)
+        # Store a "stale" copy that lasts longer
+        stale_key = f"{cache_key}:stale"
+        await redis_client.setex(
+            stale_key, settings.CACHE_TTL_STALE, json.dumps({"results": result})
+        )
+        return result
 
-    return result
+    # 4. Failure -> Serve Stale Fallback
+    stale_key = f"{cache_key}:stale"
+    stale_raw = await redis_client.get(stale_key)
+    if stale_raw:
+        logger.warning(
+            "search_tavily.api_failed.serving_stale", project_id=project_id, query=query[:50]
+        )
+        try:
+            return json.loads(stale_raw).get("results", [])
+        except json.JSONDecodeError:
+            pass
+
+    return []
 
 
-async def search_tavily(query: str, include_domains: list[str] | None = None) -> list[dict]:
+async def search_tavily(
+    project_id: str, query: str, include_domains: list[str] | None = None
+) -> list[dict]:
     """
     Search the web using Tavily API with the given query string.
 
@@ -247,14 +254,13 @@ async def search_tavily(query: str, include_domains: list[str] | None = None) ->
         include_domains=include_domains,
     )
 
-    # Generate cache key (used for both dedup and cache); domains are included
-    # so domain-filtered queries never share a cache entry with bare queries.
-    cache_key = _cache_key(query, domains=include_domains)
+    # Generate cache key (instrumented with project_id for multi-tenant security)
+    cache_key = _cache_key(project_id, query, domains=include_domains)
 
     # Deduplicate concurrent identical requests
     result = await deduplicate_request(
         cache_key,
-        lambda: _search_tavily_impl(query, cache_key, include_domains=include_domains),
+        lambda: _search_tavily_impl(project_id, query, cache_key, include_domains=include_domains),
     )
 
     logger.info("search_tavily.complete", result_count=len(result))

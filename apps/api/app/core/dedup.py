@@ -10,9 +10,8 @@ This prevents API rate limit exhaustion and improves performance.
 Integrated with AGENTS.md Rule 7 (designed for 10k concurrent users).
 """
 
-import asyncio
 from collections.abc import Awaitable, Callable
-from typing import Any, TypeVar
+from typing import TypeVar
 
 import structlog
 
@@ -20,70 +19,56 @@ logger = structlog.get_logger(__name__)
 
 T = TypeVar("T")
 
-# Global dict: query_hash -> asyncio.Future
-# This is safe because asyncio is single-threaded (no race conditions)
-_inflight_requests: dict[str, asyncio.Future[Any]] = {}
-_inflight_lock = asyncio.Lock()
 
-
-async def deduplicate_request(
-    key: str,
-    fn: Callable[[], Awaitable[T]],
-) -> T:
+async def deduplicate_request(key: str, fn: Callable[[], Awaitable[T]]) -> T:
     """
-    Deduplicate concurrent identical requests.
+    Deduplicate concurrent identical requests across all worker pods globally.
 
-    If multiple callers request the same key simultaneously:
-    - First caller executes fn()
-    - Other callers wait for the first one to complete
-    - All callers receive the same result
-
-    Args:
-        key: Unique identifier for this request (e.g., cache key)
-        fn: Async function to call if this is the first request
-
-    Returns:
-        Result of fn()
-
-    Raises:
-        Exception: If fn() raises an exception, all waiting callers receive it
-
-    Example:
-        result = await deduplicate_request(
-            "papers:semantic_scholar:abc123",
-            lambda: search_semantic_scholar_impl("machine learning", "papers:semantic_scholar:abc123")
-        )
+    Uses a Redis lock to elect a primary worker for a given request.
+    Secondary workers poll Redis for the result.
     """
-    # Check if this request is already in flight
-    async with _inflight_lock:
-        if key in _inflight_requests:
-            # Another request for this key is already in flight
-            logger.debug("dedup.waiting", key=key[:50])
-            future = _inflight_requests[key]
-            is_first_request = False
-        else:
-            # This is the first request for this key
-            logger.debug("dedup.first_request", key=key[:50])
-            future = asyncio.Future()
-            _inflight_requests[key] = future
-            is_first_request = True
+    import json
 
-    # If we're the first request, execute the function
-    if is_first_request:
+    from app.core.redis import get_redis
+
+    redis = await get_redis()
+    lock_key = f"sys:dedup:lock:{key}"
+    result_key = f"sys:dedup:res:{key}"
+
+    # Try to become the primary worker
+    acquired = await redis.set(lock_key, "1", nx=True, ex=120)
+    if acquired:
+        logger.debug("dedup.first_request", key=key[:50])
         try:
             result = await fn()
-            future.set_result(result)
+            # Serialize and broadcast result globally
+            await redis.setex(result_key, 60, json.dumps({"status": "ok", "data": result}))
             logger.debug("dedup.completed", key=key[:50])
+            return result
         except Exception as exc:
-            future.set_exception(exc)
+            await redis.setex(result_key, 60, json.dumps({"status": "error", "message": str(exc)}))
             logger.warning("dedup.error", key=key[:50], error=str(exc))
             raise
         finally:
-            # Clean up the future from inflight dict
-            async with _inflight_lock:
-                _inflight_requests.pop(key, None)
+            await redis.delete(lock_key)
     else:
-        # We're a waiter, just await the future
-        logger.debug("dedup.reused", key=key[:50])
+        # We are a secondary worker, poll for globally resolved result
+        import asyncio
 
-    return await future
+        logger.debug("dedup.waiting_globally", key=key[:50])
+        for _ in range(600):  # Wait up to 60 seconds
+            raw = await redis.get(result_key)
+            if raw:
+                try:
+                    payload = json.loads(raw)
+                    if payload.get("status") == "error":
+                        raise Exception(payload.get("message", "Unknown error in primary worker"))
+                    logger.debug("dedup.reused", key=key[:50])
+                    return payload.get("data")  # type: ignore
+                except json.JSONDecodeError:
+                    pass
+            await asyncio.sleep(0.1)
+
+        # Fallback if primary process died before writing result
+        logger.warning("dedup.timeout_fallback", key=key[:50])
+        return await fn()

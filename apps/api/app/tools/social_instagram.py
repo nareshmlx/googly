@@ -11,6 +11,8 @@ SDK calls are synchronous — wrapped with asyncio.to_thread throughout.
 """
 
 import asyncio
+import hashlib
+import json
 
 import httpx
 import structlog
@@ -56,20 +58,56 @@ def _as_int(value: object) -> int:
     return 0
 
 
-async def instagram_search(text: str) -> list[dict]:
-    """
-    Search Instagram for users, hashtags, or topics via EnsembleData SDK.
+def _cache_key(project_id: str, tool: str, **kwargs) -> str:
+    """Generate a deterministic, project-scoped cache key for Instagram tools."""
+    sorted_kwargs = sorted(kwargs.items())
+    kw_str = ",".join(f"{k}:{v}" for k, v in sorted_kwargs)
+    query_hash = hashlib.sha256(kw_str.encode()).hexdigest()[:16]
+    return f"search:cache:{project_id}:social_instagram:{tool}:{query_hash}"
 
-    Used at project creation to discover user accounts matching the project's
-    social search filter (e.g., "#veganfashion #sustainablefashion").
 
-    The API returns a "users" list where each entry wraps the user object under
-    a nested "user" key: {"position": 0, "user": {"pk": "...", "username": ...}}.
-    This function unwraps that nesting and returns the inner user dicts directly.
+async def instagram_search(project_id: str, text: str, redis=None) -> list[dict]:
+    """Search Instagram for users, hashtags, or topics with caching."""
+    cleaned_text = str(text or "").strip()
+    if not cleaned_text:
+        return []
 
-    Returns a list of user dicts on success.
-    Returns [] on any failure — never raises.
-    """
+    cache_key = _cache_key(project_id, "search", text=cleaned_text)
+    stale_key = f"{cache_key}:stale"
+    if redis:
+        try:
+            cached = await redis.get(cache_key)
+            if cached:
+                return json.loads(cached)
+        except Exception:
+            logger.warning("social_instagram.cache_read_failed", project_id=project_id)
+
+    try:
+        results = await _instagram_search_impl(cleaned_text)
+        if redis and results:
+            try:
+                await redis.setex(cache_key, settings.CACHE_TTL_SOCIAL, json.dumps(results))
+                await redis.setex(stale_key, settings.CACHE_TTL_STALE, json.dumps(results))
+            except Exception:
+                logger.warning("social_instagram.cache_write_failed", project_id=project_id)
+        return results
+    except Exception as exc:
+        if redis:
+            try:
+                stale = await redis.get(stale_key)
+                if stale:
+                    logger.info(
+                        "social_instagram.serving_stale", project_id=project_id, error=str(exc)
+                    )
+                    return json.loads(stale)
+            except Exception:
+                pass
+        raise
+
+
+async def _instagram_search_impl(text: str) -> list[dict]:
+    """Internal implementation of Instagram search."""
+
     if not settings.ENSEMBLE_API_TOKEN:
         logger.warning("social_instagram.no_token")
         return []
@@ -100,54 +138,56 @@ async def instagram_search(text: str) -> list[dict]:
         return []
 
 
-async def instagram_search_multi(queries: list[str]) -> list[dict]:
-    """
-    Search Instagram for users across multiple short queries and deduplicate.
-
-    Used as a fallback when the primary instagram search filter returns 0 accounts.
-    Each query is searched independently; results are deduplicated by the "pk" field
-    so the same account appearing under multiple queries is only returned once.
-
-    Queries should be SHORT — 1–3 words each. Long strings reliably return 0 results
-    from the EnsembleData SDK. Pass individual keywords, not combined phrases.
-
-    Returns a combined list of unique user dicts on success.
-    Returns [] on any failure — never raises.
-    """
-    if not queries:
-        return []
-
-    cleaned = [q.strip() for q in queries if q and q.strip()]
-    if not cleaned:
-        return []
-
-    results_per_query = await asyncio.gather(
-        *(instagram_search(query) for query in cleaned),
-        return_exceptions=False,
-    )
-
-    seen_pks: set[str] = set()
-    combined: list[dict] = []
-    for results in results_per_query:
-        for user in results:
-            pk = str(user.get("pk") or user.get("id") or "")
-            if pk and pk not in seen_pks:
-                seen_pks.add(pk)
-                combined.append(user)
-
-    logger.info(
-        "social_instagram.search_multi.done",
-        query_count=len(cleaned),
-        unique_accounts=len(combined),
-    )
-    return combined
-
-
 async def instagram_user_posts(
+    project_id: str,
+    user_id: int,
+    depth: int = 1,
+    oldest_timestamp: int | None = None,
+    redis=None,
+) -> list[dict]:
+    """Fetch posts for an Instagram user with caching."""
+    cache_key = _cache_key(
+        project_id, "user_posts", user_id=user_id, depth=depth, oldest=oldest_timestamp
+    )
+    stale_key = f"{cache_key}:stale"
+    if redis:
+        try:
+            cached = await redis.get(cache_key)
+            if cached:
+                return json.loads(cached)
+        except Exception:
+            logger.warning("social_instagram.cache_read_failed", project_id=project_id)
+
+    try:
+        results = await _instagram_user_posts_impl(user_id, depth, oldest_timestamp)
+        if redis and results:
+            try:
+                await redis.setex(cache_key, settings.CACHE_TTL_SOCIAL, json.dumps(results))
+                await redis.setex(stale_key, settings.CACHE_TTL_STALE, json.dumps(results))
+            except Exception:
+                logger.warning("social_instagram.cache_write_failed", project_id=project_id)
+        return results
+    except Exception as exc:
+        if redis:
+            try:
+                stale = await redis.get(stale_key)
+                if stale:
+                    logger.info(
+                        "social_instagram.serving_stale", project_id=project_id, error=str(exc)
+                    )
+                    return json.loads(stale)
+            except Exception:
+                pass
+        raise
+
+
+async def _instagram_user_posts_impl(
     user_id: int,
     depth: int = 1,
     oldest_timestamp: int | None = None,
 ) -> list[dict]:
+    """Internal implementation of Instagram user posts retrieval."""
+
     """
     Fetch posts for an Instagram user via EnsembleData SDK instagram.user_posts.
 
@@ -221,10 +261,55 @@ async def instagram_user_posts(
 
 
 async def instagram_user_reels(
+    project_id: str,
+    user_id: int,
+    depth: int = 1,
+    oldest_timestamp: int | None = None,
+    redis=None,
+) -> list[dict]:
+    """Fetch video reels for an Instagram user with caching."""
+    cache_key = _cache_key(
+        project_id, "user_reels", user_id=user_id, depth=depth, oldest=oldest_timestamp
+    )
+    stale_key = f"{cache_key}:stale"
+    if redis:
+        try:
+            cached = await redis.get(cache_key)
+            if cached:
+                return json.loads(cached)
+        except Exception:
+            logger.warning("social_instagram.cache_read_failed", project_id=project_id)
+
+    try:
+        results = await _instagram_user_reels_impl(user_id, depth, oldest_timestamp)
+        if redis and results:
+            try:
+                await redis.setex(cache_key, settings.CACHE_TTL_SOCIAL, json.dumps(results))
+                await redis.setex(stale_key, settings.CACHE_TTL_STALE, json.dumps(results))
+            except Exception:
+                logger.warning("social_instagram.cache_write_failed", project_id=project_id)
+        return results
+    except Exception as exc:
+        if redis:
+            try:
+                stale = await redis.get(stale_key)
+                if stale:
+                    logger.info(
+                        "social_instagram.serving_stale", project_id=project_id, error=str(exc)
+                    )
+                    return json.loads(stale)
+            except Exception:
+                pass
+        raise
+
+
+async def _instagram_user_reels_impl(
     user_id: int,
     depth: int = 1,
     oldest_timestamp: int | None = None,
 ) -> list[dict]:
+    """Internal implementation of Instagram user reels retrieval."""
+
     """
     Fetch video reels for an Instagram user via EnsembleData SDK instagram.user_reels.
 
@@ -285,9 +370,7 @@ async def instagram_user_reels(
                 or (media.get("edge_liked_by") or {}).get("count")
             )
             view_count = _as_int(
-                media.get("play_count")
-                or media.get("view_count")
-                or media.get("video_view_count")
+                media.get("play_count") or media.get("view_count") or media.get("video_view_count")
             )
 
             items.append(
@@ -318,115 +401,6 @@ async def instagram_user_reels(
         return []
 
 
-async def instagram_user_basic_stats(user_id: int) -> dict:
-    """
-    Fetch basic public profile stats for an Instagram user.
-
-    Returns a normalised dict:
-      - followers (int)
-      - following (int)
-      - username (str)
-      - full_name (str)
-
-    Returns {} on failure.
-    """
-    if not settings.ENSEMBLE_API_TOKEN:
-        logger.warning("social_instagram.no_token")
-        return {}
-    if not _sdk_available():
-        return {}
-
-    logger.info("social_instagram.basic_stats.start", user_id=user_id)
-    try:
-        client = EDClient(token=settings.ENSEMBLE_API_TOKEN)
-        result = await asyncio.to_thread(lambda: client.instagram.user_basic_stats(user_id=user_id))
-        data = result.data or {}
-        if not isinstance(data, dict):
-            logger.warning(
-                "social_instagram.basic_stats.unexpected_shape",
-                user_id=user_id,
-                type=str(type(data)),
-            )
-            return {}
-        stats = {
-            "followers": _as_int(data.get("followers")),
-            "following": _as_int(data.get("following")),
-            "username": str(data.get("username") or ""),
-            "full_name": str(data.get("full_name") or ""),
-        }
-        logger.info(
-            "social_instagram.basic_stats.success",
-            user_id=user_id,
-            followers=stats["followers"],
-        )
-        return stats
-    except Exception:
-        logger.exception("social_instagram.basic_stats.unexpected_error", user_id=user_id)
-        return {}
-
-
-async def instagram_post_info(code: str) -> dict:
-    """
-    Fetch detailed stats for a single Instagram post/reel by shortcode.
-
-    Returns a normalised dict:
-      - like_count (int)
-      - view_count (int)
-      - video_url (str)
-      - cover_url (str)
-
-    Returns {} on failure.
-    """
-    if not settings.ENSEMBLE_API_TOKEN:
-        logger.warning("social_instagram.no_token")
-        return {}
-    if not _sdk_available():
-        return {}
-
-    if not code:
-        return {}
-
-    logger.info("social_instagram.post_info.start", code=code)
-    try:
-        client = EDClient(token=settings.ENSEMBLE_API_TOKEN)
-        result = await asyncio.to_thread(
-            lambda: client.instagram.post_info_and_comments(code=code, num_comments=0)
-        )
-        data = result.data or {}
-        if not isinstance(data, dict):
-            logger.warning(
-                "social_instagram.post_info.unexpected_shape",
-                code=code,
-                type=str(type(data)),
-            )
-            return {}
-
-        like_count = _as_int(
-            (data.get("edge_media_preview_like") or {}).get("count")
-            or (data.get("edge_liked_by") or {}).get("count")
-            or data.get("like_count")
-        )
-        view_count = _as_int(
-            data.get("video_view_count") or data.get("video_play_count") or data.get("view_count")
-        )
-        details = {
-            "like_count": like_count,
-            "view_count": view_count,
-            "video_url": str(data.get("video_url") or ""),
-            "cover_url": str(data.get("thumbnail_src") or data.get("display_url") or ""),
-        }
-        logger.info(
-            "social_instagram.post_info.success",
-            code=code,
-            like_count=like_count,
-            view_count=view_count,
-        )
-        return details
-    except Exception:
-        logger.exception("social_instagram.post_info.unexpected_error", code=code)
-        return {}
-
-
 def _extract_caption_text(node: dict) -> str:
     """Extract caption text from varying Instagram payload shapes."""
     caption_obj = node.get("caption")
@@ -454,14 +428,32 @@ def _extract_hashtag_posts_payload(payload: object) -> tuple[list[dict], str | N
     next_cursor = payload.get("nextCursor") or payload.get("next_cursor") or payload.get("cursor")
 
     if isinstance(data, dict):
-        candidate_posts = data.get("posts") or data.get("items") or data.get("data") or []
+        recent_posts = data.get("recent_posts")
+        top_posts = data.get("top_posts")
+        candidate_posts = (
+            data.get("posts")
+            or data.get("items")
+            or data.get("data")
+            or recent_posts
+            or top_posts
+            or []
+        )
+        if (isinstance(recent_posts, list) or isinstance(top_posts, list)) and not isinstance(
+            candidate_posts, list
+        ):
+            candidate_posts = []
+        if isinstance(recent_posts, list) or isinstance(top_posts, list):
+            merged_posts: list[dict] = []
+            if isinstance(top_posts, list):
+                merged_posts.extend([p for p in top_posts if isinstance(p, dict)])
+            if isinstance(recent_posts, list):
+                merged_posts.extend([p for p in recent_posts if isinstance(p, dict)])
+            if merged_posts:
+                candidate_posts = merged_posts
         if isinstance(candidate_posts, list):
             raw_posts = candidate_posts
         next_cursor = (
-            data.get("nextCursor")
-            or data.get("next_cursor")
-            or data.get("cursor")
-            or next_cursor
+            data.get("nextCursor") or data.get("next_cursor") or data.get("cursor") or next_cursor
         )
     elif isinstance(data, list):
         raw_posts = data
@@ -474,10 +466,61 @@ def _extract_hashtag_posts_payload(payload: object) -> tuple[list[dict], str | N
 
 
 async def instagram_hashtag_posts(
+    project_id: str,
+    hashtag: str,
+    cursor: str | None = None,
+    get_author_info: bool = True,
+    redis=None,
+) -> tuple[list[dict], str | None]:
+    """Fetch Instagram posts for a hashtag with caching."""
+    cache_key = _cache_key(
+        project_id, "hashtag_posts", hashtag=hashtag, cursor=cursor, author=get_author_info
+    )
+    stale_key = f"{cache_key}:stale"
+    if redis:
+        try:
+            cached = await redis.get(cache_key)
+            if cached:
+                # Cache stores a tuple as list [posts, cursor]
+                data = json.loads(cached)
+                return data[0], data[1]
+        except Exception:
+            logger.warning("social_instagram.cache_read_failed", project_id=project_id)
+
+    try:
+        items, next_cursor = await _instagram_hashtag_posts_impl(hashtag, cursor, get_author_info)
+        if redis and items:
+            try:
+                await redis.setex(
+                    cache_key, settings.CACHE_TTL_SOCIAL, json.dumps([items, next_cursor])
+                )
+                await redis.setex(
+                    stale_key, settings.CACHE_TTL_STALE, json.dumps([items, next_cursor])
+                )
+            except Exception:
+                logger.warning("social_instagram.cache_write_failed", project_id=project_id)
+        return items, next_cursor
+    except Exception as exc:
+        if redis:
+            try:
+                stale = await redis.get(stale_key)
+                if stale:
+                    data = json.loads(stale)
+                    logger.info(
+                        "social_instagram.serving_stale", project_id=project_id, error=str(exc)
+                    )
+                    return data[0], data[1]
+            except Exception:
+                pass
+        raise
+
+
+async def _instagram_hashtag_posts_impl(
     hashtag: str,
     cursor: str | None = None,
     get_author_info: bool = True,
 ) -> tuple[list[dict], str | None]:
+    """Internal implementation of Instagram hashtag posts retrieval."""
     """
     Fetch Instagram posts for a hashtag using EnsembleData hashtag endpoint.
 
@@ -583,9 +626,7 @@ async def instagram_hashtag_posts(
                     or (node.get("edge_liked_by") or {}).get("count")
                 )
                 view_count = _as_int(
-                    node.get("play_count")
-                    or node.get("view_count")
-                    or node.get("video_view_count")
+                    node.get("play_count") or node.get("view_count") or node.get("video_view_count")
                 )
 
                 items.append(

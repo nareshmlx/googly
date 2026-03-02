@@ -12,18 +12,22 @@ from app.core.constants import DatabasePool
 logger = structlog.get_logger(__name__)
 
 _pool: asyncpg.Pool | None = None
-_pool_lock: asyncio.Lock | None = None
+# Create lock eagerly at module level — asyncio.Lock() is safe to instantiate
+# outside a running event loop since Python 3.10 (no longer binds to a loop).
+_pool_lock = asyncio.Lock()
 Base = declarative_base()
 
 
 def _parse_db_url(url: str) -> dict[str, Any]:
     """Parse DATABASE_URL into asyncpg connection parameters.
 
-    Strips the SQLAlchemy driver prefix (postgresql+asyncpg://) so urlparse
-    returns a clean hostname.  asyncpg.create_pool does not accept a DSN with
-    a driver suffix.
+    Strips SQLAlchemy driver prefixes (postgresql+asyncpg://, postgresql+psycopg://)
+    so urlparse returns a clean hostname.  asyncpg.create_pool does not accept
+    a DSN with a driver suffix.
     """
-    normalised = url.replace("postgresql+asyncpg://", "postgresql://")
+    import re
+
+    normalised = re.sub(r"^postgresql\+\w+://", "postgresql://", url)
     parsed = urlparse(normalised)
     return {
         "host": parsed.hostname or "localhost",
@@ -40,12 +44,7 @@ async def get_db_pool() -> asyncpg.Pool:
     Double-checked locking with asyncio.Lock prevents the TOCTOU race where
     two concurrent requests both observe _pool is None and each create a pool.
     """
-    global _pool, _pool_lock
-    if _pool_lock is None:
-        # Safe: GIL ensures this assignment is atomic in CPython.
-        # In the extremely unlikely case two coroutines both reach this line
-        # before either assigns, the second assignment is a no-op (same object).
-        _pool_lock = asyncio.Lock()
+    global _pool
 
     if _pool is None:
         async with _pool_lock:

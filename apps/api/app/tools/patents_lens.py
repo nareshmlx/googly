@@ -10,6 +10,7 @@ Integrated with production infrastructure: rate limiting, circuit breaker, cachi
 """
 
 import hashlib
+import json
 import time
 
 import httpx
@@ -17,7 +18,7 @@ import structlog
 
 from app.core.cache import TwoTierCache
 from app.core.circuit_breaker import call_with_circuit_breaker, lens_breaker
-from app.core.config import CacheKeys, settings
+from app.core.config import settings
 from app.core.dedup import deduplicate_request
 from app.core.metrics import api_call_duration_seconds, api_calls_total
 from app.core.rate_limiter import lens_limiter, rate_limited_call
@@ -42,10 +43,10 @@ async def _get_http_client() -> httpx.AsyncClient:
     return _http_client
 
 
-def _cache_key(query: str) -> str:
-    """Generate deterministic cache key for a query."""
+def _cache_key(project_id: str, query: str) -> str:
+    """Generate deterministic project-scoped cache key for a query."""
     query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()[:16]
-    return f"{CacheKeys.PATENTS_LENS}:{query_hash}"
+    return f"search:cache:{project_id}:lens:patents:{query_hash}"
 
 
 async def _search_with_retry(query: str) -> dict | None:
@@ -248,45 +249,51 @@ async def _search_impl(query: str) -> list[dict]:
     return normalized
 
 
-async def _search_lens_impl(query: str, cache_key: str) -> list[dict]:
+async def _search_lens_impl(project_id: str, query: str, cache_key: str) -> list[dict]:
     """
     Internal implementation (called by dedup layer).
-
-    Handles cache check, API call, and cache write.
-    This function is only called once even if 1000 users search
-    for the same query simultaneously.
+    Handles cache check, API call, and cache write with stale fallback.
     """
-    # Initialize cache (lazy singleton pattern)
     redis_client = await get_redis()
     cache = TwoTierCache(redis_client)
 
-    # Check cache first (using normalized query)
+    # 1. Primary Cache Check (Fresh result)
     cached = await cache.get(cache_key)
     if cached is not None:
-        logger.info("patents_lens.cache.hit", result_count=len(cached.get("results", [])))
         return cached.get("results", [])
 
-    # Wrap entire search operation in circuit breaker
+    # 2. Fetch from API
     async def _fetch_impl() -> list[dict]:
         return await _search_impl(query)
 
-    result = await call_with_circuit_breaker(
-        lens_breaker,
-        _fetch_impl,
-    )
+    result = await call_with_circuit_breaker(lens_breaker, _fetch_impl)
 
-    # Circuit breaker returns [] on failure, or list[dict] on success
-    if result is None or not isinstance(result, list):
-        result = []
-
-    # Cache successful results (TTL from config - patents don't change frequently)
+    # 3. Success -> Cache and Return
     if result:
         await cache.set(cache_key, {"results": result}, ttl=settings.CACHE_TTL_PATENTS)
+        # Store a "stale" copy that lasts longer
+        stale_key = f"{cache_key}:stale"
+        await redis_client.setex(
+            stale_key, settings.CACHE_TTL_STALE, json.dumps({"results": result})
+        )
+        return result
 
-    return result
+    # 4. Failure -> Serve Stale Fallback
+    stale_key = f"{cache_key}:stale"
+    stale_raw = await redis_client.get(stale_key)
+    if stale_raw:
+        logger.warning(
+            "patents_lens.api_failed.serving_stale", project_id=project_id, query=query[:50]
+        )
+        try:
+            return json.loads(stale_raw).get("results", [])
+        except json.JSONDecodeError:
+            pass
+
+    return []
 
 
-async def search_lens(query: str) -> list[dict]:
+async def search_lens(project_id: str, query: str) -> list[dict]:
     """
     Search for patents using Lens.org API with the given query string.
 
@@ -337,13 +344,13 @@ async def search_lens(query: str) -> list[dict]:
 
     logger.info("patents_lens.start", query_preview=query[:80])
 
-    # Generate cache key (used for both dedup and cache)
-    cache_key = _cache_key(query)
+    # Generate cache key (instrumented with project_id for multi-tenant security)
+    cache_key = _cache_key(project_id, query)
 
     # Deduplicate concurrent identical requests
     result = await deduplicate_request(
         cache_key,
-        lambda: _search_lens_impl(query, cache_key),
+        lambda: _search_lens_impl(project_id, query, cache_key),
     )
 
     logger.info("patents_lens.complete", result_count=len(result))

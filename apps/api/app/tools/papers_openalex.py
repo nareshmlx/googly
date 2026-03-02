@@ -10,6 +10,7 @@ Integrated with production infrastructure: rate limiting, circuit breaker, cachi
 """
 
 import hashlib
+import json
 import re
 from datetime import UTC, datetime
 
@@ -220,10 +221,10 @@ def _reconstruct_abstract(inverted_index: dict | None) -> str:
     return " ".join(word for _, word in word_positions)
 
 
-def _cache_key(query: str) -> str:
-    """Generate deterministic cache key for a query."""
+def _cache_key(project_id: str, query: str) -> str:
+    """Generate deterministic project-scoped cache key for a query."""
     query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()[:16]
-    return f"papers:openalex:{query_hash}"
+    return f"search:cache:{project_id}:openalex:papers:{query_hash}"
 
 
 async def _get_works_with_retry(params: dict) -> dict | None:
@@ -254,43 +255,53 @@ async def _get_works_with_retry(params: dict) -> dict | None:
     return result
 
 
-async def _fetch_papers_openalex_impl(query: str, cache_key: str) -> list[dict]:
+async def _fetch_papers_openalex_impl(project_id: str, query: str, cache_key: str) -> list[dict]:
     """
     Internal implementation (called by dedup layer).
-
-    Handles cache check, API call, and cache write.
+    Handles cache check, API call, and cache write with stale fallback.
     """
-    # Initialize cache (lazy singleton pattern)
     redis_client = await get_redis()
     cache = TwoTierCache(redis_client)
 
-    # Check cache first
+    # 1. Primary Cache Check (Fresh result)
     cached = await cache.get(cache_key)
     if cached is not None:
-        logger.info("papers_openalex.cache.hit", paper_count=len(cached.get("papers", [])))
         return cached.get("papers", [])
 
-    # Wrap entire fetch operation in circuit breaker
+    # 2. Fetch from API
     async def _fetch_impl() -> list[dict]:
         return await _fetch_papers_impl(query)
 
-    result = await call_with_circuit_breaker(
-        openalex_breaker,
-        _fetch_impl,
-    )
+    result = await call_with_circuit_breaker(openalex_breaker, _fetch_impl)
 
-    # Circuit breaker returns [] on failure, or list[dict] on success
-    if result is None or not isinstance(result, list):
-        result = []
-
-    # Cache successful results using configured papers TTL.
+    # 3. Success -> Cache and Return
     if result:
         await cache.set(cache_key, {"papers": result}, ttl=settings.CACHE_TTL_PAPERS)
+        # Store a "stale" copy that lasts longer
+        stale_key = f"{cache_key}:stale"
+        await redis_client.setex(
+            stale_key, settings.CACHE_TTL_STALE, json.dumps({"papers": result})
+        )
+        return result
 
-    return result
+    # 4. Failure -> Serve Stale Fallback
+    stale_key = f"{cache_key}:stale"
+    stale_raw = await redis_client.get(stale_key)
+    if stale_raw and isinstance(stale_raw, str | bytes):
+        logger.warning(
+            "papers_openalex.api_failed.serving_stale",
+            project_id=project_id,
+            query=query[:50],
+        )
+        try:
+            return json.loads(stale_raw).get("papers", [])
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    return []
 
 
-async def fetch_papers(query: str) -> list[dict]:
+async def fetch_papers(project_id: str, query: str) -> list[dict]:
     """
     Fetch research papers from OpenAlex matching the given query string.
 
@@ -321,13 +332,13 @@ async def fetch_papers(query: str) -> list[dict]:
     """
     logger.info("papers_openalex.fetch.start", query_preview=query[:80])
 
-    # Generate cache key (used for both dedup and cache)
-    cache_key = _cache_key(query)
+    # Generate cache key (instrumented with project_id for multi-tenant security)
+    cache_key = _cache_key(project_id, query)
 
     # Deduplicate concurrent identical requests
     result = await deduplicate_request(
         cache_key,
-        lambda: _fetch_papers_openalex_impl(query, cache_key),
+        lambda: _fetch_papers_openalex_impl(project_id, query, cache_key),
     )
 
     logger.info("papers_openalex.fetch.success", paper_count=len(result))
@@ -494,12 +505,18 @@ async def _fetch_papers_impl(query: str) -> list[dict]:
                 "abstract": abstract,
                 "publication_year": work.get("publication_year") or 0,
                 "doi": doi,
-                "url": primary_location.get("landing_page_url") if isinstance(primary_location, dict) else "",
-                "pdf_url": primary_location.get("pdf_url") if isinstance(primary_location, dict) else "",
+                "url": primary_location.get("landing_page_url")
+                if isinstance(primary_location, dict)
+                else "",
+                "pdf_url": primary_location.get("pdf_url")
+                if isinstance(primary_location, dict)
+                else "",
                 "open_access_url": (
                     best_oa_location.get("pdf_url") if isinstance(best_oa_location, dict) else ""
                 ),
-                "is_open_access": bool(open_access.get("is_oa")) if isinstance(open_access, dict) else False,
+                "is_open_access": bool(open_access.get("is_oa"))
+                if isinstance(open_access, dict)
+                else False,
                 "cited_by_count": cited_by_count,
                 "type": work_type,
                 "source_name": source.get("display_name") if isinstance(source, dict) else "",
@@ -526,11 +543,7 @@ async def _fetch_papers_impl(query: str) -> list[dict]:
         ranked.append((score, query_overlap, specific_overlap, phrase_bonus, paper))
 
     pre_positive_count = len([item for item in ranked if item[0] > 0])
-    strict_ranked = [
-        item
-        for item in ranked
-        if item[0] > 0 and (not specific_terms or item[2] > 0)
-    ]
+    strict_ranked = [item for item in ranked if item[0] > 0 and (not specific_terms or item[2] > 0)]
     positive_ranked = [item for item in ranked if item[0] > 0]
     if len(strict_ranked) >= _TARGET_PAPER_COUNT:
         ranked_pool = strict_ranked

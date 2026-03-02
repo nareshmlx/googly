@@ -219,7 +219,7 @@ async def extract_intent(
     sample_text: str | None = None,
 ) -> dict:
     """
-    Extract structured intent from a project description using gpt-5-mini.
+    Extract structured intent from a project description using the configured LLM.
 
     sample_text is optional — pass the first few hundred characters of an
     uploaded document to give the model more context at project creation time.
@@ -255,7 +255,7 @@ async def extract_intent(
     try:
         client = _get_client()
         response = await client.chat.completions.create(
-            model="gpt-5-mini",
+            model=settings.INTENT_MODEL,
             messages=[
                 {"role": "system", "content": _EXTRACT_SYSTEM},
                 {"role": "user", "content": prompt},
@@ -332,7 +332,7 @@ async def refine_intent(
     try:
         client = _get_client()
         response = await client.chat.completions.create(
-            model="gpt-5-mini",
+            model=settings.INTENT_MODEL,
             messages=[
                 {"role": "system", "content": _REFINE_SYSTEM},
                 {"role": "user", "content": prompt},
@@ -432,7 +432,9 @@ def merge_intents(description_intent: dict, document_intent: dict) -> dict:
     merged_filters = dict(base_filters)
 
     for key in ("news", "papers", "patents"):
-        merged_filters[key] = _enrich_text_filter(base_filters.get(key, ""), doc_filters.get(key, ""))
+        merged_filters[key] = _enrich_text_filter(
+            base_filters.get(key, ""), doc_filters.get(key, "")
+        )
 
     for key in ("tiktok", "social", "instagram"):
         merged_filters[key] = str(base_filters.get(key) or doc_filters.get(key) or "").strip()
@@ -519,7 +521,9 @@ def _expand_related_keywords(domain: str, seed_keywords: list[str]) -> list[str]
             related.extend(hints)
     if not related:
         seed_joined = " ".join(seed_keywords).lower()
-        if any(token in seed_joined for token in ("retinol", "niacinamide", "skincare", "cosmetic")):
+        if any(
+            token in seed_joined for token in ("retinol", "niacinamide", "skincare", "cosmetic")
+        ):
             related.extend(_RELATED_KEYWORD_HINTS["skincare"])
     return related
 

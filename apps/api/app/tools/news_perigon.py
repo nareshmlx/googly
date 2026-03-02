@@ -10,6 +10,7 @@ Integrated with production infrastructure: rate limiting, circuit breaker, cachi
 """
 
 import hashlib
+import json
 import time
 from datetime import UTC, datetime, timedelta
 
@@ -18,7 +19,7 @@ import structlog
 
 from app.core.cache import TwoTierCache
 from app.core.circuit_breaker import call_with_circuit_breaker, perigon_breaker
-from app.core.config import CacheKeys, settings
+from app.core.config import settings
 from app.core.dedup import deduplicate_request
 from app.core.metrics import api_call_duration_seconds, api_calls_total
 from app.core.rate_limiter import perigon_limiter, rate_limited_call
@@ -56,10 +57,10 @@ def _build_perigon_categories(domain_terms: list[str] | None) -> str:
     return _CATEGORIES
 
 
-def _cache_key(query: str) -> str:
-    """Generate deterministic cache key for a query."""
+def _cache_key(project_id: str, query: str) -> str:
+    """Generate deterministic project-scoped cache key for a query."""
     query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()[:16]
-    return f"{CacheKeys.NEWS_PERIGON}:{query_hash}"
+    return f"search:cache:{project_id}:perigon:news:{query_hash}"
 
 
 async def _search_with_retry(query: str, category: str) -> dict | None:
@@ -176,45 +177,54 @@ async def _search_impl(query: str, category: str) -> list[dict]:
     return normalized
 
 
-async def _search_perigon_impl(query: str, cache_key: str, category: str) -> list[dict]:
+async def _search_perigon_impl(
+    project_id: str, query: str, cache_key: str, category: str
+) -> list[dict]:
     """
     Internal implementation (called by dedup layer).
-
-    Handles cache check, API call, and cache write.
-    This function is only called once even if 1000 users search
-    for the same query simultaneously.
+    Handles cache check, API call, and cache write with stale fallback.
     """
-    # Initialize cache (lazy singleton pattern)
     redis_client = await get_redis()
     cache = TwoTierCache(redis_client)
 
-    # Check cache first (using normalized query)
+    # 1. Primary Cache Check (Fresh result)
     cached = await cache.get(cache_key)
     if cached is not None:
-        logger.info("news_perigon.cache.hit", result_count=len(cached.get("results", [])))
         return cached.get("results", [])
 
-    # Wrap entire search operation in circuit breaker
+    # 2. Fetch from API
     async def _fetch_impl() -> list[dict]:
         return await _search_impl(query, category)
 
-    result = await call_with_circuit_breaker(
-        perigon_breaker,
-        _fetch_impl,
-    )
+    result = await call_with_circuit_breaker(perigon_breaker, _fetch_impl)
 
-    # Circuit breaker returns [] on failure, or list[dict] on success
-    if result is None or not isinstance(result, list):
-        result = []
-
-    # Cache successful results (TTL from config for news - shorter than web search)
+    # 3. Success -> Cache and Return
     if result:
         await cache.set(cache_key, {"results": result}, ttl=settings.CACHE_TTL_NEWS)
+        # Store a "stale" copy that lasts longer (Win #4 in analysis report)
+        stale_key = f"{cache_key}:stale"
+        await redis_client.setex(
+            stale_key, settings.CACHE_TTL_STALE, json.dumps({"results": result})
+        )
+        return result
 
-    return result
+    # 4. Failure/Empty -> Serve Stale Fallback
+    stale_key = f"{cache_key}:stale"
+    stale_raw = await redis_client.get(stale_key)
+    if stale_raw:
+        logger.warning(
+            "news_perigon.api_failed.serving_stale", project_id=project_id, query=query[:50]
+        )
+        try:
+            return json.loads(stale_raw).get("results", [])
+        except json.JSONDecodeError:
+            pass
+
+    return []
 
 
 async def search_perigon(
+    project_id: str,
     query: str,
     *,
     must_match_terms: list[str] | None = None,
@@ -275,13 +285,13 @@ async def search_perigon(
 
     logger.info("news_perigon.start", query_preview=effective_query[:80], category=category)
 
-    # Generate cache key (used for both dedup and cache)
-    cache_key = _cache_key(f"{effective_query}|{category}")
+    # Generate cache key (instrumented with project_id for multi-tenant security)
+    cache_key = _cache_key(project_id, f"{effective_query}|{category}")
 
     # Deduplicate concurrent identical requests
     result = await deduplicate_request(
         cache_key,
-        lambda: _search_perigon_impl(effective_query, cache_key, category),
+        lambda: _search_perigon_impl(project_id, effective_query, cache_key, category),
     )
 
     logger.info("news_perigon.complete", result_count=len(result))
