@@ -186,7 +186,15 @@ async def _schedule_fulltext_enrichment(ctx: dict, pool, documents: list[RawDocu
     for doc in documents:
         if doc.source not in {"paper", "patent"}:
             continue
-        metadata = dict(doc.metadata or {})
+        # Parse metadata - may be JSON string from database
+        metadata_raw = doc.metadata
+        if isinstance(metadata_raw, str):
+            import json
+            metadata = json.loads(metadata_raw) if metadata_raw else {}
+        elif isinstance(metadata_raw, dict):
+            metadata = metadata_raw
+        else:
+            metadata = {}
         if str(metadata.get("content_level") or "abstract") == "fulltext":
             continue
 

@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "agno": {
+      "source": "agno-agi/agno-skills",
+      "sourceType": "github",
+      "computedHash": "7611cd3190f46e5168f0a1ebb3ac565b119fcce6a2990417c979e23ac44e1671"
+    }
+  }
+}

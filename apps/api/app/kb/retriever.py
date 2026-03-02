@@ -137,19 +137,30 @@ async def retrieve(
     # Using settings.KB_SCORE_THRESHOLD as the single source of truth — the old
     # KbScoreThreshold.DEFAULT constant was a duplicate that could drift.
     best_score = float(rows[0]["score"])
-    results = [
-        {
+    results = []
+    for row in rows:
+        if float(row["score"]) < settings.KB_SCORE_THRESHOLD:
+            continue
+
+        # Parse metadata — can be JSON string or dict from database
+        metadata_raw = row["metadata"]
+        if isinstance(metadata_raw, str):
+            metadata = json.loads(metadata_raw) if metadata_raw else {}
+        elif isinstance(metadata_raw, dict):
+            metadata = metadata_raw
+        else:
+            metadata = {}
+
+        results.append({
             "id": row["id"],
             "project_id": row["project_id"],
             "source": row["source"],
             "title": row["title"],
             "content": row["content"],
-            "metadata": dict(row["metadata"]) if row["metadata"] else {},
+            "metadata": metadata,
             "score": round(float(row["score"]), 4),
-        }
-        for row in rows
-        if float(row["score"]) >= settings.KB_SCORE_THRESHOLD
-    ]
+        })
+
 
     if not results:
         logger.info(

@@ -57,7 +57,7 @@ class Settings(BaseSettings):
     AZURE_STORAGE_ACCOUNT_URL: str | None = None
 
     EMBEDDING_BATCH_SIZE: int = 100
-    KB_SCORE_THRESHOLD: float = 0.70
+    KB_SCORE_THRESHOLD: float = 0.40  # Lowered from 0.70 - use KB more aggressively before web fallback
     INGEST_MAX_ACCOUNTS: int = 10
     INGEST_INSTAGRAM_ACCOUNT_CANDIDATES: int = 15
     INGEST_INSTAGRAM_REELS_PER_ACCOUNT: int = 6

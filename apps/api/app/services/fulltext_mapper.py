@@ -19,7 +19,14 @@ def map_fulltext_raw_document(
     page_count: int,
 ) -> RawDocument:
     """Build a fulltext RawDocument preserving source metadata and idempotent source_id."""
-    metadata = dict(base_metadata or {})
+    # Parse metadata - may be JSON string from database
+    if isinstance(base_metadata, str):
+        import json
+        metadata = json.loads(base_metadata) if base_metadata else {}
+    elif isinstance(base_metadata, dict):
+        metadata = dict(base_metadata or {})
+    else:
+        metadata = {}
     metadata.update(
         {
             "content_level": "fulltext",

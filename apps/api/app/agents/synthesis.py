@@ -19,6 +19,9 @@ Rules:
   If no URL is available, fall back to plain text: [Source: title]
 - NEVER infer, guess, or generate a URL — only use URLs that appear verbatim in the provided context.
   If the context has no URL for a source, write [title] without any link rather than inventing one.
+- Cite ALL source types when used: research papers (with DOI/OpenAlex links), patents, web articles,
+  news, social media, or any other content. Every claim should trace back to a cited source.
+- When citing research papers, include the year inline: [Paper Title (2023)](doi-link)
 - Deduplicate — if multiple specialists found the same fact, cite the best source once
 - Rank information by relevance to the user's query
 - Write in clear, professional prose — no bullet dumps unless the query calls for lists

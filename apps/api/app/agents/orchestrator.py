@@ -222,7 +222,7 @@ def _looks_like_research_query(query: str) -> bool:
 
 
 def _format_openalex_context(papers: list[dict]) -> str:
-    """Format OpenAlex papers into synthesis context blocks."""
+    """Format OpenAlex papers into synthesis context blocks with clickable citation links."""
     parts: list[str] = []
     for paper in papers:
         title = str(paper.get("title") or "Untitled paper")
@@ -232,11 +232,21 @@ def _format_openalex_context(papers: list[dict]) -> str:
         abstract = str(paper.get("abstract") or paper.get("content") or "").strip()
         summary = abstract[:1200] if abstract else "Abstract unavailable."
         doi = str(paper.get("doi") or "")
-        source_label = paper_id or title
-        meta_line = f"publication_year={year}"
+
+        # Build citation link — prefer DOI, fallback to OpenAlex ID
         if doi:
-            meta_line += f" doi={doi}"
-        parts.append(f"[Source: {source_label} (paper)]\ntitle={title}\n{meta_line}\n{summary}")
+            # Strip "https://doi.org/" prefix if present to get clean DOI
+            clean_doi = doi.replace("https://doi.org/", "")
+            citation_url = f"https://doi.org/{clean_doi}"
+            source_header = f"[{title}]({citation_url}) (paper, {year})"
+        elif paper_id:
+            # OpenAlex ID format: https://openalex.org/W123456789
+            citation_url = f"https://openalex.org/{paper_id}" if not paper_id.startswith("http") else paper_id
+            source_header = f"[{title}]({citation_url}) (paper, {year})"
+        else:
+            source_header = f"[Source: {title} (paper, {year})]"
+
+        parts.append(f"{source_header}\n{summary}")
     return "\n\n---\n\n".join(parts)
 
 
@@ -797,7 +807,10 @@ async def run_query(
     is_research_query = bool(intent.get("is_research_query", False)) or _looks_like_research_query(
         cleaned_query
     )
-    exclude_papers = not openalex_enabled or not is_research_query
+    # Include papers for all queries if OpenAlex is enabled — let relevance score
+    # determine if they're shown. This allows papers/patents to be cited even for
+    # non-research queries (e.g. "acne treatments" might have relevant dermatology papers).
+    exclude_papers = not openalex_enabled
 
     # Extract optional domain filter from intent (set when user names a specific
     # website or publication, e.g. "what does TechCrunch say about retinol?").
@@ -805,6 +818,25 @@ async def run_query(
     # to academic tools (arXiv, PubMed, Semantic Scholar) which don't support it.
     target_domain: str | None = intent.get("target_domain")
     include_domains: list[str] | None = [target_domain] if target_domain else None
+
+    # Detect explicit web search request (user wants fresh/live web results, not KB)
+    query_lower = cleaned_query.lower()
+    force_web_search = any(
+        phrase in query_lower
+        for phrase in [
+            "search web",
+            "search the web",
+            "google",
+            "search online",
+            "look up online",
+            "find online",
+            "check online",
+            "latest",
+            "recent",
+            "news about",
+            "current",
+        ]
+    )
 
     logger.info(
         "orchestrator.intent_and_relevance",
@@ -815,6 +847,7 @@ async def run_query(
         query_specificity=intent.get("query_specificity"),
         is_research_query=is_research_query,
         exclude_papers=exclude_papers,
+        force_web_search=force_web_search,
         relevant_project_ids=relevant_project_ids,
         target_domain=target_domain,
     )
@@ -903,18 +936,23 @@ async def run_query(
             query_preview=research_query[:80],
         )
 
-    try:
-        kb_results = await retrieve(
-            query=cleaned_query, project_ids=relevant_project_ids, exclude_papers=exclude_papers
-        )
-    except Exception:
-        # Cancel academic_task before propagating — otherwise the pending Task is
-        # garbage-collected and Python logs "Task was destroyed but it is pending!".
-        if academic_task is not None:
-            academic_task.cancel()
-            academic_task = None
-        logger.exception("orchestrator.kb_retrieve_error", query_preview=cleaned_query[:80])
-        raise
+    # Skip KB if user explicitly requested web search (e.g. "search web for X", "google X")
+    if force_web_search:
+        logger.info("orchestrator.kb_skipped_explicit_web_search", query_preview=cleaned_query[:80])
+        kb_results = None
+    else:
+        try:
+            kb_results = await retrieve(
+                query=cleaned_query, project_ids=relevant_project_ids, exclude_papers=exclude_papers
+            )
+        except Exception:
+            # Cancel academic_task before propagating — otherwise the pending Task is
+            # garbage-collected and Python logs "Task was destroyed but it is pending!".
+            if academic_task is not None:
+                academic_task.cancel()
+                academic_task = None
+            logger.exception("orchestrator.kb_retrieve_error", query_preview=cleaned_query[:80])
+            raise
 
     # When the user names a specific site (target_domain is set), the intent is
     # "fetch live content from that site" — KB content is irrelevant regardless of
@@ -1196,13 +1234,29 @@ async def run_query(
                 author = (
                     metadata.get("username")
                     or metadata.get("author_username")
+                    or metadata.get("author")
                     or str(title).lstrip("@")
                 )
-                context_parts.append(
-                    f"[Source: {title} ({source}, relevance: {score:.2f})]\n"
-                    f"author={author} likes={likes} views={views}\n"
-                    f"{chunk['content']}"
-                )
+                # Extract URL for social media sources — enables citations
+                social_url = (
+                    metadata.get("url") or metadata.get("source_url") or metadata.get("link") or ""
+                ).strip()
+
+                if social_url:
+                    # Format with clickable link for proper citation
+                    source_header = f"[{title}]({social_url}) ({source}, relevance: {score:.2f})"
+                    context_parts.append(
+                        f"{source_header}\n"
+                        f"author={author} likes={likes} views={views}\n"
+                        f"{chunk['content']}"
+                    )
+                else:
+                    # Fallback if no URL available
+                    context_parts.append(
+                        f"[Source: {title} ({source}, relevance: {score:.2f})]\n"
+                        f"author={author} likes={likes} views={views}\n"
+                        f"{chunk['content']}"
+                    )
             else:
                 # Surface any URL stored at ingest time so the synthesis agent can
                 # cite specific pages rather than falling back to homepage guesses.
