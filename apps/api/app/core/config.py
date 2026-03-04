@@ -57,7 +57,60 @@ class Settings(BaseSettings):
     AZURE_STORAGE_ACCOUNT_URL: str | None = None
 
     EMBEDDING_BATCH_SIZE: int = 100
-    KB_SCORE_THRESHOLD: float = 0.40  # Lowered from 0.70 - use KB more aggressively before web fallback
+    CHAT_RATE_LIMIT: int = 100
+    CHAT_RATE_WINDOW_SECONDS: int = 60
+    KB_SCORE_THRESHOLD: float = (
+        0.40  # Lowered from 0.70 - use KB more aggressively before web fallback
+    )
+    KB_RETRIEVAL_TOP_K: int = 15  # Default top-k for internal KB retrieval (legacy, used when per-source quotas are disabled)
+
+    # === Per-Source Retrieval Quotas ===
+    # When KB_RETRIEVAL_PER_SOURCE_QUOTAS is True, retrieval runs one KNN scan per
+    # source bucket and caps each bucket at its quota. This prevents high-volume sources
+    # (social) from dominating the context and guarantees a floor for papers/patents/uploads.
+    # Total effective top-k = sum of all quotas = 20.
+    # Slack (underfilled buckets) is NOT redistributed — simpler and avoids over-representing
+    # any single source when others have limited relevant content.
+    KB_RETRIEVAL_PER_SOURCE_QUOTAS: bool = Field(
+        default=True,
+        description="Enable per-source bucket retrieval to prevent social dominance in KB context.",
+    )
+    KB_RETRIEVAL_TOTAL_K: int = Field(
+        default=20,
+        ge=5,
+        le=100,
+        description="Total chunk cap when per-source quotas are enabled (sum of all bucket quotas).",
+    )
+    KB_RETRIEVAL_QUOTA_SOCIAL: int = Field(
+        default=5,
+        ge=0,
+        le=50,
+        description="Max chunks from social sources (tiktok, instagram, x, reddit, youtube) per retrieval.",
+    )
+    KB_RETRIEVAL_QUOTA_PAPERS: int = Field(
+        default=5,
+        ge=0,
+        le=50,
+        description="Max chunks from paper sources per retrieval.",
+    )
+    KB_RETRIEVAL_QUOTA_WEB_NEWS: int = Field(
+        default=8,
+        ge=0,
+        le=50,
+        description="Max chunks from web/news/search sources (web, news, search) per retrieval. 'search' = Tavily/Exa results. Raised to 8 to accommodate three merged source types.",
+    )
+    KB_RETRIEVAL_QUOTA_PATENTS: int = Field(
+        default=3,
+        ge=0,
+        le=50,
+        description="Max chunks from patent sources per retrieval.",
+    )
+    KB_RETRIEVAL_QUOTA_UPLOADS: int = Field(
+        default=2,
+        ge=0,
+        le=50,
+        description="Max chunks from user upload sources per retrieval.",
+    )
     INGEST_MAX_ACCOUNTS: int = 10
     INGEST_INSTAGRAM_ACCOUNT_CANDIDATES: int = 15
     INGEST_INSTAGRAM_REELS_PER_ACCOUNT: int = 6
@@ -90,6 +143,8 @@ class Settings(BaseSettings):
     AGNO_TELEMETRY: bool = False
 
     CORS_ORIGINS: list[str] = ["http://localhost:3000", "https://app.googly.io"]
+    CORS_MAX_AGE_SECONDS: int = 3600
+    GZIP_MINIMUM_SIZE_BYTES: int = 1000
     KB_MAX_FILE_SIZE: int = 10 * 1024 * 1024  # 10 MB — keep low until Blob Storage is wired
 
     # === Research Tool Optimization (Phase 3) ===
@@ -192,12 +247,22 @@ class Settings(BaseSettings):
         le=10,
         description="Maximum pagination pages fetched per subreddit during ingest.",
     )
+    INGEST_REDDIT_MAX_POSTS_PER_SUBREDDIT: int = Field(
+        default=40,
+        ge=1,
+        le=100,
+        description="Maximum posts fetched per subreddit endpoint call.",
+    )
     INGEST_YOUTUBE_SEARCH_DEPTH: int = Field(
         default=2,
         ge=1,
         le=10,
         description="Depth/pages requested from Ensemble YouTube keyword search.",
     )
+    SOCIAL_REDDIT_TIMEOUT_SECONDS: float = 20.0
+    SOCIAL_X_TIMEOUT_SECONDS: float = 20.0
+    SOCIAL_YOUTUBE_TIMEOUT_SECONDS: float = 45.0
+    SOCIAL_INSTAGRAM_TIMEOUT_SECONDS: float = 10.0
     INGEST_SOCIAL_MIN_RELEVANCE_MATCHES: int = Field(
         default=1,
         ge=0,
@@ -215,6 +280,54 @@ class Settings(BaseSettings):
         ge=1,
         le=100,
         description="Maximum social items kept per source after filtering/reranking.",
+    )
+    INGEST_FILTER_STAGE1_KEEP_RATIO: float = Field(
+        default=0.6,
+        ge=0.1,
+        le=1.0,
+        description="Top ratio of candidates retained by stage-1 embedding relevance filter.",
+    )
+    INGEST_SOCIAL_RECENCY_FALLBACK_SCORE: float = Field(
+        default=0.4,
+        ge=0.0,
+        le=1.0,
+        description="Fallback recency score when source timestamp parsing fails.",
+    )
+    INGEST_SOCIAL_RECENCY_DECAY_DAYS_TIKTOK: float = Field(
+        default=21.0,
+        ge=1.0,
+        le=365.0,
+        description="Recency decay horizon (days) for TikTok social scoring.",
+    )
+    INGEST_SOCIAL_RECENCY_DECAY_DAYS_X: float = Field(
+        default=14.0,
+        ge=1.0,
+        le=365.0,
+        description="Recency decay horizon (days) for X social scoring.",
+    )
+    INGEST_SOCIAL_RECENCY_DECAY_DAYS_REDDIT: float = Field(
+        default=28.0,
+        ge=1.0,
+        le=365.0,
+        description="Recency decay horizon (days) for Reddit social scoring.",
+    )
+    INGEST_SOCIAL_RECENCY_DECAY_DAYS_YOUTUBE: float = Field(
+        default=21.0,
+        ge=1.0,
+        le=365.0,
+        description="Recency decay horizon (days) for YouTube social scoring.",
+    )
+    INGEST_SOCIAL_RECENCY_DECAY_DAYS_INSTAGRAM: float = Field(
+        default=30.0,
+        ge=1.0,
+        le=365.0,
+        description="Recency decay horizon (days) for Instagram social scoring.",
+    )
+    INGEST_INSTAGRAM_GLOBAL_REELS_MIN_FLOOR: int = Field(
+        default=20,
+        ge=1,
+        le=200,
+        description="Minimum candidate reel floor before applying global Instagram reel cap.",
     )
     INGEST_SOCIAL_LLM_FILTER_ENABLED: bool = Field(
         default=True,
@@ -282,6 +395,10 @@ class Settings(BaseSettings):
         le=3600,
         description="ARQ worker job timeout in seconds.",
     )
+    ARQ_WORKER_MAX_JOBS: int = 20
+    ARQ_WORKER_HEALTH_CHECK_INTERVAL: int = 30
+    ARQ_REFRESH_CRON_HOURS: tuple[int, ...] = (0, 6, 12, 18)
+    CHAT_HISTORY_RETENTION_DAYS: int = 90
     INGEST_SOCIAL_RAW_TARGET_TOTAL: int = Field(
         default=120,
         ge=20,
@@ -360,6 +477,30 @@ class Settings(BaseSettings):
         le=300.0,
         description="Timeout for resolving/fetching one fulltext source asset.",
     )
+    FULLTEXT_HTTP_MAX_KEEPALIVE: int = Field(
+        default=20,
+        ge=1,
+        le=200,
+        description="Max keepalive HTTP connections for fulltext fetch client.",
+    )
+    FULLTEXT_HTTP_MAX_CONNECTIONS: int = Field(
+        default=50,
+        ge=1,
+        le=500,
+        description="Max total HTTP connections for fulltext fetch client.",
+    )
+    FULLTEXT_RETRY_BASE_DELAY_SECONDS: int = Field(
+        default=30,
+        ge=1,
+        le=600,
+        description="Base retry delay for fulltext asset retries.",
+    )
+    FULLTEXT_RETRY_MAX_DELAY_SECONDS: int = Field(
+        default=300,
+        ge=1,
+        le=3600,
+        description="Max retry delay for fulltext asset retries.",
+    )
     FULLTEXT_MAX_ENRICHMENT_ATTEMPTS: int = Field(
         default=3,
         ge=1,
@@ -382,6 +523,47 @@ class Settings(BaseSettings):
         le=900.0,
         description="HTTP timeout for Ensemble TikTok full keyword search endpoint.",
     )
+    PERIGON_DAYS_LOOKBACK: int = 30
+    PERIGON_TIMEOUT_SECONDS: float = 15.0
+    TAVILY_TIMEOUT_SECONDS: float = 15.0
+    EXA_TIMEOUT_SECONDS: float = 15.0
+    PAPERS_PUBMED_TIMEOUT_SECONDS: float = 15.0
+    PAPERS_ARXIV_TIMEOUT_SECONDS: float = 15.0
+    PAPERS_SEMANTIC_SCHOLAR_TIMEOUT_SECONDS: float = 15.0
+    PAPERS_OPENALEX_TIMEOUT_SECONDS: float = 10.0
+    PATENTS_PATENTSVIEW_TIMEOUT_SECONDS: float = 15.0
+    PATENTS_LENS_TIMEOUT_SECONDS: float = 20.0
+    INTENT_EXTRACT_TIMEOUT_SECONDS: float = 30.0
+    TAVILY_MAX_RESULTS: int = 15
+    TAVILY_MAX_RESULTS_DOMAIN: int = 7
+    EXA_NUM_RESULTS: int = 10
+    EXA_MAX_CHARACTERS: int = 1000
+    EXA_MAX_CHARACTERS_DOMAIN: int = 2000
+    PAPERS_MAX_RESULTS: int = 20
+    OPENALEX_TARGET_PAPER_COUNT: int = 20
+    OPENALEX_QUERY_VARIANT_LIMIT: int = 3
+    OPENALEX_PER_PAGE: int = 50
+    OPENALEX_STRICT_PAGES: tuple[int, ...] = (1, 2)
+    OPENALEX_LATEST_LOOKBACK_YEARS: int = 7
+    OPENALEX_LATEST_MIN_YEAR: int = 2018
+    SOCIAL_X_MAX_RESULTS: int = 100
+    SOCIAL_YOUTUBE_MAX_RESULTS: int = 100
+    SOCIAL_REDDIT_DEFAULT_LIMIT: int = 24
+    PAPER_TITLE_DEDUP_THRESHOLD: float = Field(
+        default=0.85,
+        ge=0.5,
+        le=1.0,
+        description="Fuzzy threshold for cross-source paper title deduplication.",
+    )
+    FULLTEXT_BACKFILL_BATCH_SIZE: int = Field(
+        default=100,
+        ge=1,
+        le=1000,
+        description="Default batch size for fulltext backfill cursor scans.",
+    )
+    PROJECT_DISCOVER_LIMIT: int = 500
+    PROJECT_UPLOAD_SUMMARIES_LIMIT: int = 40
+    SEARCH_QUERY_MAX_LEN: int = 1000
 
     # === Cache TTL Configuration ===
     CACHE_TTL_PAPERS: int = Field(
@@ -404,6 +586,30 @@ class Settings(BaseSettings):
         ge=1,
         description="Cache TTL for intent extraction results (1 hour). "
         "Identical queries skip the LLM entirely on cache hit.",
+    )
+    DEDUP_LOCK_TTL_SECONDS: int = Field(
+        default=120,
+        ge=1,
+        le=3600,
+        description="TTL for request deduplication lock keys.",
+    )
+    DEDUP_RESULT_TTL_SECONDS: int = Field(
+        default=60,
+        ge=1,
+        le=3600,
+        description="TTL for deduplicated request result payloads.",
+    )
+    DEDUP_WAIT_MAX_ATTEMPTS: int = Field(
+        default=600,
+        ge=1,
+        le=10000,
+        description="Max polling attempts for secondary deduplicated requests.",
+    )
+    DEDUP_WAIT_POLL_SECONDS: float = Field(
+        default=0.1,
+        ge=0.01,
+        le=5.0,
+        description="Polling sleep interval for secondary deduplicated requests.",
     )
 
     # === Routing Config (Query Type → API List) ===
@@ -484,32 +690,16 @@ class Settings(BaseSettings):
             raise ValueError("L1_CACHE_SIZE must be <= 100000 entries (memory safety)")
         return v
 
-
-# === Cache Key Prefixes (AGENTS.md Rule 5: No hardcoded strings) ===
-class CacheKeys:
-    """Standardized cache key prefixes for all tools.
-
-    Format: <category>:<provider>
-    - Papers: academic papers and research
-    - Patents: patent databases
-    - Search: web search engines
-    - News: news aggregators
-    - Social: social media platforms
-    """
-
-    PAPERS_SEMANTIC_SCHOLAR = "papers:semantic_scholar"
-    PAPERS_ARXIV = "papers:arxiv"
-    PAPERS_PUBMED = "papers:pubmed"
-    PATENTS_PATENTSVIEW = "patents:patentsview"
-    PATENTS_LENS = "patents:lens"
-    SEARCH_TAVILY = "search:tavily"
-    SEARCH_EXA = "search:exa"
-    NEWS_PERIGON = "news:perigon"
-    SOCIAL_INSTAGRAM = "social:instagram"
-    SOCIAL_TIKTOK = "social:tiktok"
-    SOCIAL_YOUTUBE = "social:youtube"
-    SOCIAL_REDDIT = "social:reddit"
-    SOCIAL_X = "social:x"
+    @field_validator("ARQ_REFRESH_CRON_HOURS")
+    @classmethod
+    def validate_arq_refresh_cron_hours(cls, v: tuple[int, ...]) -> tuple[int, ...]:
+        """Validate worker refresh cron hours as unique values in [0, 23]."""
+        if not v:
+            raise ValueError("ARQ_REFRESH_CRON_HOURS must include at least one hour")
+        normalized = tuple(sorted(set(v)))
+        if any(hour < 0 or hour > 23 for hour in normalized):
+            raise ValueError("ARQ_REFRESH_CRON_HOURS values must be between 0 and 23")
+        return normalized
 
 
 settings = Settings()

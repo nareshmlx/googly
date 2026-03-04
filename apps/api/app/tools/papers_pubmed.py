@@ -13,7 +13,6 @@ Two-step API process:
 Integrated with production infrastructure: rate limiting, circuit breaker, caching, retry.
 """
 
-import hashlib
 import json
 import time
 
@@ -21,10 +20,12 @@ import httpx
 import structlog
 
 from app.core.cache import TwoTierCache
+from app.core.cache_keys import build_search_cache_key, build_stale_cache_key
 from app.core.circuit_breaker import call_with_circuit_breaker, pubmed_breaker
 from app.core.config import settings
 from app.core.dedup import deduplicate_request
 from app.core.metrics import api_call_duration_seconds, api_calls_total
+from app.core.query_sanitize import sanitize_query
 from app.core.rate_limiter import pubmed_limiter, rate_limited_call
 from app.core.redis import get_redis
 from app.core.retry import retry_with_backoff
@@ -33,8 +34,6 @@ logger = structlog.get_logger(__name__)
 
 _SEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 _SUMMARY_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
-_TIMEOUT = 15.0  # seconds (per request, 2 requests total)
-_MAX_RESULTS = 20
 
 # Module-level HTTP client pool (reused across requests to prevent memory leak)
 _http_client: httpx.AsyncClient | None = None
@@ -44,7 +43,7 @@ async def _get_http_client() -> httpx.AsyncClient:
     """Get or create shared HTTP client pool for module."""
     global _http_client
     if _http_client is None:
-        _http_client = httpx.AsyncClient(timeout=_TIMEOUT)
+        _http_client = httpx.AsyncClient(timeout=settings.PAPERS_PUBMED_TIMEOUT_SECONDS)
     return _http_client
 
 
@@ -99,8 +98,12 @@ def _best_available_content(paper: dict, title: str, authors: list[str]) -> str:
 
 def _cache_key(project_id: str, query: str) -> str:
     """Generate deterministic project-scoped cache key for a query."""
-    query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()[:16]
-    return f"search:cache:{project_id}:pubmed:papers:{query_hash}"
+    return build_search_cache_key(
+        project_id=project_id,
+        provider="pubmed",
+        query_type="papers",
+        parts=[query],
+    )
 
 
 async def _fetch_ids_internal(query: str) -> list[str]:
@@ -114,7 +117,7 @@ async def _fetch_ids_internal(query: str) -> list[str]:
     params: dict[str, str | int] = {
         "db": "pubmed",
         "term": query,
-        "retmax": _MAX_RESULTS,
+        "retmax": settings.PAPERS_MAX_RESULTS,
         "retmode": "json",
     }
     # Add API key if available
@@ -210,7 +213,7 @@ async def _search_impl(query: str) -> list[dict]:
         api_calls_total.labels(api_name="pubmed", status="timeout").inc()
         logger.warning(
             "search_pubmed.timeout",
-            timeout=_TIMEOUT,
+            timeout=settings.PAPERS_PUBMED_TIMEOUT_SECONDS,
             query_preview=query[:80],
         )
         return []
@@ -257,6 +260,19 @@ async def _search_impl(query: str) -> list[dict]:
             title = str(paper.get("title") or "")
             content = _best_available_content(paper, title, authors)
 
+            # Extract DOI
+            doi = ""
+            eloc = str(paper.get("elocationid") or "")
+            if "doi: " in eloc.lower():
+                doi = eloc.lower().split("doi: ")[1].split(" ")[0].strip()
+
+            if not doi:
+                # Try articleids
+                for aid in paper.get("articleids", []):
+                    if isinstance(aid, dict) and aid.get("idtype") == "doi":
+                        doi = aid.get("value", "")
+                        break
+
             normalized.append(
                 {
                     "title": title,
@@ -267,6 +283,7 @@ async def _search_impl(query: str) -> list[dict]:
                     "pmid": str(pmid),
                     "source": "pubmed",
                     "journal": paper.get("source", ""),
+                    "doi": doi,
                 }
             )
         except Exception:
@@ -300,14 +317,14 @@ async def _search_pubmed_impl(project_id: str, query: str, cache_key: str) -> li
     if result:
         await cache.set(cache_key, {"results": result}, ttl=settings.CACHE_TTL_PAPERS)
         # Store a "stale" copy that lasts longer
-        stale_key = f"{cache_key}:stale"
+        stale_key = build_stale_cache_key(cache_key)
         await redis_client.setex(
             stale_key, settings.CACHE_TTL_STALE, json.dumps({"results": result})
         )
         return result
 
     # 4. Failure -> Serve Stale Fallback
-    stale_key = f"{cache_key}:stale"
+    stale_key = build_stale_cache_key(cache_key)
     stale_raw = await redis_client.get(stale_key)
     if stale_raw:
         logger.warning(
@@ -360,13 +377,16 @@ async def search_pubmed(
     Never raises.
     """
     # Sanitize and normalize query BEFORE cache key generation (prevents cache key collision)
-    query = query.strip().lower()
-    if not query:
-        logger.warning("search_pubmed.empty_query")
+    sanitized_query = sanitize_query(
+        query,
+        logger=logger,
+        empty_event="search_pubmed.empty_query",
+        too_long_event="search_pubmed.query_too_long",
+        lower=True,
+    )
+    if sanitized_query is None:
         return []
-    if len(query) > 1000:
-        logger.warning("search_pubmed.query_too_long", original_length=len(query))
-        query = query[:1000]
+    query = sanitized_query
 
     effective_query = _build_pubmed_query(query, must_match_terms, domain_terms)
     if str(query_specificity or "").lower() == "specific" and must_match_terms:

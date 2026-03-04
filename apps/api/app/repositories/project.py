@@ -15,7 +15,16 @@ from uuid import uuid4
 import asyncpg
 import structlog
 
+from app.core.config import settings
+from app.core.db import get_db_pool
+
 logger = structlog.get_logger(__name__)
+
+
+async def _with_service_pool(fn, *args, **kwargs):
+    """Execute a pool-injected repository function using the shared DB pool."""
+    pool = await get_db_pool()
+    return await fn(pool, *args, **kwargs)
 
 
 async def insert_project(
@@ -84,6 +93,42 @@ async def insert_project(
     return dict(row)
 
 
+async def insert_project_for_service(
+    user_id: str,
+    title: str,
+    description: str,
+    refresh_strategy: str,
+    tiktok_enabled: bool,
+    instagram_enabled: bool,
+    youtube_enabled: bool,
+    reddit_enabled: bool,
+    x_enabled: bool,
+    papers_enabled: bool,
+    patents_enabled: bool,
+    perigon_enabled: bool,
+    tavily_enabled: bool,
+    exa_enabled: bool,
+) -> dict:
+    """Insert project with internally managed pool for service-layer calls."""
+    return await _with_service_pool(
+        insert_project,
+        user_id=user_id,
+        title=title,
+        description=description,
+        refresh_strategy=refresh_strategy,
+        tiktok_enabled=tiktok_enabled,
+        instagram_enabled=instagram_enabled,
+        youtube_enabled=youtube_enabled,
+        reddit_enabled=reddit_enabled,
+        x_enabled=x_enabled,
+        papers_enabled=papers_enabled,
+        patents_enabled=patents_enabled,
+        perigon_enabled=perigon_enabled,
+        tavily_enabled=tavily_enabled,
+        exa_enabled=exa_enabled,
+    )
+
+
 async def fetch_project(
     pool: asyncpg.Pool,
     project_id: str,
@@ -135,6 +180,112 @@ async def fetch_project_by_id(
     return dict(row) if row else None
 
 
+async def fetch_project_for_service(project_id: str, user_id: str) -> dict | None:
+    """Fetch project for service-layer ownership checks with internal pool."""
+    return await _with_service_pool(fetch_project, project_id, user_id)
+
+
+async def fetch_project_by_id_for_service(project_id: str) -> dict | None:
+    """Fetch project by ID with internally managed pool for service-layer calls."""
+    return await _with_service_pool(fetch_project_by_id, project_id)
+
+
+async def get_project_for_ingestion(
+    pool: asyncpg.Pool,
+    project_id: str,
+) -> dict | None:
+    """Fetch ingest-critical project fields for ingestion workers."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id::text, user_id::text, title, description, structured_intent,
+                   tiktok_enabled, instagram_enabled, youtube_enabled, reddit_enabled, x_enabled,
+                   papers_enabled, patents_enabled, perigon_enabled, tavily_enabled, exa_enabled
+            FROM projects
+            WHERE id = $1::uuid
+            """,
+            project_id,
+        )
+    return dict(row) if row else None
+
+
+async def get_project_for_ingestion_for_service(project_id: str) -> dict | None:
+    """Fetch ingestion project fields with internally managed pool."""
+    return await _with_service_pool(get_project_for_ingestion, project_id)
+
+
+async def project_exists(
+    pool: asyncpg.Pool,
+    project_id: str,
+) -> bool:
+    """Return True when the project exists."""
+    async with pool.acquire() as conn:
+        exists = await conn.fetchval("SELECT 1 FROM projects WHERE id = $1::uuid", project_id)
+    return bool(exists)
+
+
+async def project_exists_for_service(project_id: str) -> bool:
+    """Check project existence with internally managed pool."""
+    return await _with_service_pool(project_exists, project_id)
+
+
+async def get_chunk_count(
+    pool: asyncpg.Pool,
+    project_id: str,
+) -> int:
+    """Return total knowledge chunk count for a project."""
+    async with pool.acquire() as conn:
+        count = await conn.fetchval(
+            "SELECT COUNT(*)::int FROM knowledge_chunks WHERE project_id = $1::uuid",
+            project_id,
+        )
+    return int(count or 0)
+
+
+async def get_chunk_count_for_service(project_id: str) -> int:
+    """Return chunk count with internally managed pool."""
+    return await _with_service_pool(get_chunk_count, project_id)
+
+
+async def get_project_last_refreshed(
+    pool: asyncpg.Pool,
+    project_id: str,
+) -> datetime | None:
+    """Return project's last_refreshed_at timestamp if the project exists."""
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT last_refreshed_at FROM projects WHERE id = $1::uuid",
+            project_id,
+        )
+
+
+async def get_project_last_refreshed_for_service(project_id: str) -> datetime | None:
+    """Return last refresh timestamp with internally managed pool."""
+    return await _with_service_pool(get_project_last_refreshed, project_id)
+
+
+async def get_projects_due_for_refresh(pool: asyncpg.Pool) -> list[dict]:
+    """Return projects due for daily/weekly refresh runs."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id::text, last_refreshed_at FROM projects
+            WHERE
+                (refresh_strategy = 'daily'
+                 AND (last_refreshed_at IS NULL OR last_refreshed_at < NOW() - INTERVAL '1 day'))
+            OR
+                (refresh_strategy = 'weekly'
+                 AND (last_refreshed_at IS NULL OR last_refreshed_at < NOW() - INTERVAL '7 days'))
+            """
+        )
+    return [dict(row) for row in rows]
+
+
+async def get_projects_due_for_refresh_for_service() -> list[dict]:
+    """List projects due for refresh with internally managed pool."""
+    return await _with_service_pool(get_projects_due_for_refresh)
+
+
 async def fetch_project_papers_enabled(
     pool: asyncpg.Pool,
     project_id: str,
@@ -154,6 +305,11 @@ async def fetch_project_papers_enabled(
             project_id,
         )
     return bool(value) if value is not None else None
+
+
+async def fetch_project_papers_enabled_for_chat(project_id: str) -> bool | None:
+    """Repository convenience wrapper for chat service to avoid direct pool access."""
+    return await _with_service_pool(fetch_project_papers_enabled, project_id)
 
 
 async def list_projects(
@@ -183,6 +339,16 @@ async def list_projects(
     return [dict(r) for r in rows]
 
 
+async def list_projects_for_service(user_id: str) -> list[dict]:
+    """List projects with internally managed pool for service-layer calls."""
+    return await _with_service_pool(list_projects, user_id)
+
+
+async def list_projects_summary_for_chat(user_id: str) -> list[dict]:
+    """Repository convenience wrapper for chat service to avoid direct pool access."""
+    return await _with_service_pool(list_projects_summary, user_id)
+
+
 async def list_projects_summary(
     pool: asyncpg.Pool,
     user_id: str,
@@ -209,15 +375,13 @@ async def list_projects_summary(
 async def fetch_discover_feed(
     pool: asyncpg.Pool,
     project_id: str,
-    limit: int = 500,
+    limit: int = settings.PROJECT_DISCOVER_LIMIT,
     offset: int = 0,
 ) -> list[dict]:
     """
     Retrieve Discover feed rows scored by relevance, recency, and quality.
 
-    Uses project intent embedding cosine similarity when available.
-    Falls back to recency-only ranking when no intent embedding exists.
-    Supports pagination for scalable feed rendering.
+    Now queries 'knowledge_documents' directly for deduplication and performance.
     """
     async with pool.acquire() as conn, conn.transaction():
         await conn.execute(
@@ -226,159 +390,75 @@ async def fetch_discover_feed(
         rows = await conn.fetch(
             """
             WITH project_embedding AS (
-                SELECT intent_embedding
-                FROM projects
-                WHERE id = $1::uuid
+                SELECT intent_embedding FROM projects WHERE id = $1::uuid
             ),
             project_flags AS (
                 SELECT
-                    tiktok_enabled,
-                    instagram_enabled,
-                    youtube_enabled,
-                    reddit_enabled,
-                    x_enabled,
-                    papers_enabled,
-                    patents_enabled,
-                    perigon_enabled,
-                    tavily_enabled,
-                    exa_enabled
-                FROM projects
-                WHERE id = $1::uuid
+                    tiktok_enabled, instagram_enabled, youtube_enabled,
+                    reddit_enabled, x_enabled, papers_enabled, patents_enabled,
+                    perigon_enabled, exa_enabled, tavily_enabled
+                FROM projects WHERE id = $1::uuid
             ),
-            scored AS (
-                SELECT
-                    kc.id::text AS item_id,
-                    kc.source,
-                    kc.title,
-                    kc.content AS summary,
-                    kc.metadata,
-                    kc.created_at,
+                scored_documents AS (
+                    SELECT DISTINCT ON (kd.id)
+                    kd.id AS item_id,
+                    kd.source,
+                    kd.source_id,
+                    kd.source_id AS base_source_id, -- Backward compatibility
+                    COALESCE(kd.title, '') AS title,
+                    COALESCE(kd.summary, '') AS summary,
+                    kd.metadata,
+                    kd.created_at,
+                    -- Relevance: cosine similarity with project intent
                     CASE
-                        WHEN pe.intent_embedding IS NOT NULL
-                        THEN 1.0 - (kc.embedding <=> pe.intent_embedding)
+                        WHEN pe.intent_embedding IS NOT NULL AND kc.embedding IS NOT NULL
+                        THEN 1 - (kc.embedding <=> pe.intent_embedding)
                         ELSE 0.5
                     END AS relevance,
-                    EXP(
-                        -EXTRACT(EPOCH FROM (NOW() - kc.created_at)) / (30.0 * 86400)
-                    ) AS recency,
-                    CASE kc.source
+                    -- Recency: linear decay over 30 days
+                    GREATEST(0, 1.0 - (EXTRACT(EPOCH FROM (NOW() - kd.created_at)) / (30 * 24 * 3600))) AS recency,
+                    -- Quality: source-specific engagement normalization
+                    CASE kd.source
                         WHEN 'paper' THEN
                             LEAST(
                                 1.0,
-                                LOG(
-                                    1
-                                    + GREATEST(
-                                        0,
+                                (
+                                    (
                                         CASE
-                                            WHEN (kc.metadata->>'citation_count') ~ '^-?[0-9]+$'
-                                            THEN (kc.metadata->>'citation_count')::int
+                                            WHEN COALESCE(kd.metadata->>'citation_count', '') ~ '^-?[0-9]+$'
+                                            THEN (kd.metadata->>'citation_count')::int
                                             ELSE 0
                                         END
-                                    )
-                                ) / 10.0
-                            )
-                        WHEN 'patent' THEN
-                            EXP(
-                                -GREATEST(
-                                    0,
-                                    EXTRACT(YEAR FROM NOW()) - CASE
-                                        WHEN (kc.metadata->>'year') ~ '^[0-9]{4}$'
-                                        THEN (kc.metadata->>'year')::int
-                                        WHEN (kc.metadata->>'date') ~ '^[0-9]{4}'
-                                        THEN LEFT(kc.metadata->>'date', 4)::int
-                                        ELSE 2022
-                                    END
-                                ) / 5.0
-                            )
-                        WHEN 'social_tiktok' THEN
-                            LEAST(
-                                1.0,
-                                LOG(
-                                    1
-                                    + GREATEST(
-                                        0,
+                                    ) / 100.0
+                                ) + (
+                                    (
                                         CASE
-                                            WHEN (kc.metadata->>'likes') ~ '^-?[0-9]+$'
-                                            THEN (kc.metadata->>'likes')::int
+                                            WHEN COALESCE(kd.metadata->>'influential_citation_count', '') ~ '^-?[0-9]+$'
+                                            THEN (kd.metadata->>'influential_citation_count')::int
                                             ELSE 0
                                         END
-                                    )
-                                    + GREATEST(
-                                        0,
-                                        CASE
-                                            WHEN (kc.metadata->>'views') ~ '^-?[0-9]+$'
-                                            THEN (kc.metadata->>'views')::int
-                                            ELSE 0
-                                        END
-                                    )
-                                ) / 20.0
-                            )
-                        WHEN 'social_instagram' THEN
-                            LEAST(
-                                1.0,
-                                LOG(
-                                    1
-                                    + GREATEST(
-                                        0,
-                                        CASE
-                                            WHEN (kc.metadata->>'likes') ~ '^-?[0-9]+$'
-                                            THEN (kc.metadata->>'likes')::int
-                                            ELSE 0
-                                        END
-                                    )
-                                    + GREATEST(
-                                        0,
-                                        CASE
-                                            WHEN (kc.metadata->>'views') ~ '^-?[0-9]+$'
-                                            THEN (kc.metadata->>'views')::int
-                                            ELSE 0
-                                        END
-                                    )
-                                ) / 20.0
-                            )
-                        WHEN 'social_youtube' THEN
-                            LEAST(
-                                1.0,
-                                LOG(
-                                    1
-                                    + GREATEST(
-                                        0,
-                                        CASE
-                                            WHEN (kc.metadata->>'likes') ~ '^-?[0-9]+$'
-                                            THEN (kc.metadata->>'likes')::int
-                                            ELSE 0
-                                        END
-                                    )
-                                    + GREATEST(
-                                        0,
-                                        CASE
-                                            WHEN (kc.metadata->>'views') ~ '^-?[0-9]+$'
-                                            THEN (kc.metadata->>'views')::int
-                                            ELSE 0
-                                        END
-                                    )
-                                ) / 20.0
+                                    ) / 10.0
+                                )
                             )
                         WHEN 'social_reddit' THEN
                             LEAST(
                                 1.0,
                                 LOG(
-                                    1
-                                    + GREATEST(
+                                    1 + GREATEST(
                                         0,
-                                        CASE
-                                            WHEN (kc.metadata->>'score') ~ '^-?[0-9]+$'
-                                            THEN (kc.metadata->>'score')::int
-                                            ELSE 0
-                                        END
-                                    )
-                                    + GREATEST(
-                                        0,
-                                        CASE
-                                            WHEN (kc.metadata->>'comments') ~ '^-?[0-9]+$'
-                                            THEN (kc.metadata->>'comments')::int
-                                            ELSE 0
-                                        END
+                                        (
+                                            CASE
+                                                WHEN COALESCE(kd.metadata->>'score', '') ~ '^-?[0-9]+$'
+                                                THEN (kd.metadata->>'score')::int
+                                                ELSE 0
+                                            END
+                                        ) + (
+                                            CASE
+                                                WHEN COALESCE(kd.metadata->>'comments', '') ~ '^-?[0-9]+$'
+                                                THEN (kd.metadata->>'comments')::int
+                                                ELSE 0
+                                            END
+                                        )
                                     )
                                 ) / 20.0
                             )
@@ -386,63 +466,78 @@ async def fetch_discover_feed(
                             LEAST(
                                 1.0,
                                 LOG(
-                                    1
-                                    + GREATEST(
+                                    1 + GREATEST(
                                         0,
-                                        CASE
-                                            WHEN (kc.metadata->>'likes') ~ '^-?[0-9]+$'
-                                            THEN (kc.metadata->>'likes')::int
-                                            ELSE 0
-                                        END
-                                    )
-                                    + GREATEST(
-                                        0,
-                                        CASE
-                                            WHEN (kc.metadata->>'retweets') ~ '^-?[0-9]+$'
-                                            THEN (kc.metadata->>'retweets')::int
-                                            ELSE 0
-                                        END
+                                        (
+                                            CASE
+                                                WHEN COALESCE(kd.metadata->>'likes', '') ~ '^-?[0-9]+$'
+                                                THEN (kd.metadata->>'likes')::int
+                                                ELSE 0
+                                            END
+                                        ) + (
+                                            CASE
+                                                WHEN COALESCE(kd.metadata->>'retweets', '') ~ '^-?[0-9]+$'
+                                                THEN (kd.metadata->>'retweets')::int
+                                                ELSE 0
+                                            END
+                                        )
                                     )
                                 ) / 20.0
                             )
                         WHEN 'search' THEN
                             CASE
-                                WHEN (kc.metadata->>'score') ~ '^-?[0-9]+(\\.[0-9]+)?$'
-                                THEN (kc.metadata->>'score')::float
+                                WHEN COALESCE(kd.metadata->>'score', '') ~ '^-?[0-9]*\\.?[0-9]+$'
+                                THEN (kd.metadata->>'score')::double precision
                                 ELSE 0.5
                             END
                         ELSE 0.5
                     END AS quality
-                FROM knowledge_chunks AS kc
+                FROM knowledge_documents AS kd
                 CROSS JOIN project_embedding AS pe
                 CROSS JOIN project_flags AS pf
-                WHERE kc.project_id = $1::uuid
-                  AND kc.source IN (
-                      'social_tiktok',
-                      'social_instagram',
-                      'social_youtube',
-                      'social_reddit',
-                      'social_x',
-                      'paper',
-                      'patent',
-                      'news',
-                      'search'
-                  )
+                LEFT JOIN LATERAL (
+                    SELECT c.embedding, c.metadata
+                    FROM knowledge_chunks AS c
+                    WHERE c.document_id = kd.id
+                      AND COALESCE(c.metadata->>'content_level', 'abstract') <> 'fulltext'
+                    ORDER BY
+                        CASE
+                            WHEN pe.intent_embedding IS NOT NULL AND c.embedding IS NOT NULL
+                            THEN c.embedding <=> pe.intent_embedding
+                            ELSE NULL
+                        END ASC NULLS LAST
+                    LIMIT 1
+                ) AS kc ON TRUE
+                WHERE kd.project_id = $1::uuid
                   AND (
-                      (kc.source = 'social_tiktok' AND pf.tiktok_enabled)
-                      OR (kc.source = 'social_instagram' AND pf.instagram_enabled)
-                      OR (kc.source = 'social_youtube' AND pf.youtube_enabled)
-                      OR (kc.source = 'social_reddit' AND pf.reddit_enabled)
-                      OR (kc.source = 'social_x' AND pf.x_enabled)
-                      OR (kc.source = 'paper' AND pf.papers_enabled)
-                      OR (kc.source = 'patent' AND pf.patents_enabled)
-                      OR (kc.source = 'news' AND pf.perigon_enabled)
-                      OR (kc.source = 'search' AND (pf.tavily_enabled OR pf.exa_enabled))
+                      (kd.source = 'social_tiktok' AND pf.tiktok_enabled)
+                      OR (kd.source = 'social_instagram' AND pf.instagram_enabled)
+                      OR (kd.source = 'social_youtube' AND pf.youtube_enabled)
+                      OR (kd.source = 'social_reddit' AND pf.reddit_enabled)
+                      OR (kd.source = 'social_x' AND pf.x_enabled)
+                      OR (kd.source = 'paper' AND pf.papers_enabled)
+                      OR (kd.source = 'patent' AND pf.patents_enabled)
+                      OR (kd.source = 'news' AND pf.perigon_enabled)
+                      OR (kd.source = 'search' AND (pf.tavily_enabled OR pf.exa_enabled))
                   )
+                ORDER BY kd.id, relevance DESC
+            ),
+            final_ranked AS (
+                SELECT
+                    *,
+                    CASE
+                        WHEN source = 'paper' THEN (relevance * 0.65 + quality * 0.30 + recency * 0.05)
+                        WHEN source = 'patent' THEN (relevance * 0.60 + quality * 0.30 + recency * 0.10)
+                        WHEN source LIKE 'social_%' THEN (relevance * 0.40 + quality * 0.40 + recency * 0.20)
+                        ELSE (relevance * 0.50 + quality * 0.15 + recency * 0.35)
+                    END AS score
+                FROM scored_documents
             )
             SELECT
                 item_id,
                 source,
+                source_id,
+                base_source_id,
                 title,
                 summary,
                 metadata,
@@ -450,23 +545,8 @@ async def fetch_discover_feed(
                 relevance,
                 recency,
                 quality,
-                 CASE
-                    WHEN pe_exists.has_embedding AND source = 'paper'
-                    THEN (relevance * 0.65 + quality * 0.30 + recency * 0.05)
-                    WHEN pe_exists.has_embedding AND source = 'patent'
-                    THEN (relevance * 0.60 + quality * 0.30 + recency * 0.10)
-                    WHEN pe_exists.has_embedding
-                    THEN (relevance * 0.60 + quality * 0.15 + recency * 0.25)
-                    WHEN source = 'paper'
-                    THEN (quality * 0.85 + recency * 0.15)
-                    WHEN source = 'patent'
-                    THEN (quality * 0.80 + recency * 0.20)
-                    WHEN source LIKE 'social_%'
-                    THEN (quality * 0.40 + recency * 0.60)
-                    ELSE (quality * 0.20 + recency * 0.80)
-                END AS score
-            FROM scored
-            CROSS JOIN (SELECT EXISTS(SELECT 1 FROM project_embedding WHERE intent_embedding IS NOT NULL) AS has_embedding) AS pe_exists
+                score
+            FROM final_ranked
             ORDER BY score DESC
             LIMIT $2 OFFSET $3
             """,
@@ -475,6 +555,15 @@ async def fetch_discover_feed(
             offset,
         )
     return [dict(r) for r in rows]
+
+
+async def fetch_discover_feed_for_service(
+    project_id: str,
+    limit: int = settings.PROJECT_DISCOVER_LIMIT,
+    offset: int = 0,
+) -> list[dict]:
+    """Fetch discover feed with internally managed pool for service-layer calls."""
+    return await _with_service_pool(fetch_discover_feed, project_id, limit=limit, offset=offset)
 
 
 async def update_project_intent_embedding(
@@ -494,6 +583,14 @@ async def update_project_intent_embedding(
             project_id,
             str(embedding),
         )
+
+
+async def update_project_intent_embedding_for_service(
+    project_id: str,
+    embedding: list[float],
+) -> None:
+    """Store project intent embedding with internally managed pool for services."""
+    await _with_service_pool(update_project_intent_embedding, project_id, embedding)
 
 
 async def update_project_intent(
@@ -518,6 +615,14 @@ async def update_project_intent(
             json.dumps(structured_intent),
             project_id,
         )
+
+
+async def update_project_intent_for_service(
+    project_id: str,
+    structured_intent: dict,
+) -> None:
+    """Update structured intent with internally managed pool for services."""
+    await _with_service_pool(update_project_intent, project_id, structured_intent)
 
 
 async def update_project_kb_stats(
@@ -547,6 +652,15 @@ async def update_project_kb_stats(
         )
 
 
+async def update_project_kb_stats_for_service(
+    project_id: str,
+    chunk_count: int,
+    refreshed_at: datetime,
+) -> None:
+    """Update KB stats with internally managed pool."""
+    await _with_service_pool(update_project_kb_stats, project_id, chunk_count, refreshed_at)
+
+
 async def increment_project_kb_stats(
     pool: asyncpg.Pool,
     project_id: str,
@@ -567,6 +681,15 @@ async def increment_project_kb_stats(
             refreshed_at,
             project_id,
         )
+
+
+async def increment_project_kb_stats_for_service(
+    project_id: str,
+    chunk_delta: int,
+    refreshed_at: datetime,
+) -> None:
+    """Increment KB stats with internally managed pool."""
+    await _with_service_pool(increment_project_kb_stats, project_id, chunk_delta, refreshed_at)
 
 
 async def delete_project(
@@ -595,23 +718,9 @@ async def delete_project(
     return (result or "DELETE 0").split()[-1] != "0"
 
 
-async def update_project_metadata(
-    pool: asyncpg.Pool,
-    project_id: str,
-    metadata: dict,
-) -> None:
-    """Overwrite project metadata JSON and bump updated_at."""
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE projects
-            SET metadata = $1::jsonb,
-                updated_at = NOW()
-            WHERE id = $2::uuid
-            """,
-            json.dumps(metadata),
-            project_id,
-        )
+async def delete_project_for_service(project_id: str, user_id: str) -> bool:
+    """Delete project with internally managed pool for service-layer calls."""
+    return await _with_service_pool(delete_project, project_id, user_id)
 
 
 async def update_project_setup_status_metadata(
@@ -633,12 +742,20 @@ async def update_project_setup_status_metadata(
         )
 
 
+async def update_project_setup_status_metadata_for_service(
+    project_id: str,
+    setup_status: dict,
+) -> None:
+    """Persist setup status with internally managed pool for service-layer calls."""
+    await _with_service_pool(update_project_setup_status_metadata, project_id, setup_status)
+
+
 async def fetch_upload_chunk_summaries(
     pool: asyncpg.Pool,
     project_id: str,
     upload_ids: list[str],
     *,
-    limit: int = 40,
+    limit: int = settings.PROJECT_UPLOAD_SUMMARIES_LIMIT,
 ) -> list[str]:
     """Return recent upload chunk snippets for provided upload IDs."""
     if not upload_ids:
@@ -664,3 +781,15 @@ async def fetch_upload_chunk_summaries(
     return [
         str(row.get("content") or "")[:300] for row in rows if str(row.get("content") or "").strip()
     ]
+
+
+async def fetch_upload_chunk_summaries_for_service(
+    project_id: str,
+    upload_ids: list[str],
+    *,
+    limit: int = settings.PROJECT_UPLOAD_SUMMARIES_LIMIT,
+) -> list[str]:
+    """Return upload chunk summaries with internally managed pool."""
+    return await _with_service_pool(
+        fetch_upload_chunk_summaries, project_id, upload_ids, limit=limit
+    )

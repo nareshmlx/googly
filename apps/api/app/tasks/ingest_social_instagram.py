@@ -241,8 +241,12 @@ async def _fetch_instagram_reels_from_candidates(
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     for batch in results:
+        if isinstance(batch, asyncio.CancelledError):
+            raise
         if isinstance(batch, Exception):
             continue
+        if isinstance(batch, BaseException):
+            raise batch
         for reel in batch:
             uid = reel.get("user", {}).get("pk") or reel.get("owner", {}).get("id")
             if uid:
@@ -254,9 +258,15 @@ async def _fetch_instagram_reels_from_candidates(
                 except (TypeError, ValueError):
                     pass
             reels_out.append(reel)
-            if len(reels_out) >= max(20, settings.INGEST_INSTAGRAM_GLOBAL_REELS_LIMIT):
+            if len(reels_out) >= max(
+                settings.INGEST_INSTAGRAM_GLOBAL_REELS_MIN_FLOOR,
+                settings.INGEST_INSTAGRAM_GLOBAL_REELS_LIMIT,
+            ):
                 break
-        if len(reels_out) >= max(20, settings.INGEST_INSTAGRAM_GLOBAL_REELS_LIMIT):
+        if len(reels_out) >= max(
+            settings.INGEST_INSTAGRAM_GLOBAL_REELS_MIN_FLOOR,
+            settings.INGEST_INSTAGRAM_GLOBAL_REELS_LIMIT,
+        ):
             break
 
     logger.info(
@@ -357,9 +367,13 @@ async def _ingest_instagram(
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for batch in results:
+            if isinstance(batch, asyncio.CancelledError):
+                raise
             if isinstance(batch, Exception):
                 logger.exception("ingest_instagram.hashtag_gather_failed", project_id=project_id)
                 continue
+            if isinstance(batch, BaseException):
+                raise batch
             all_posts.extend(batch)
 
         # OPTIMIZATION: Filter for videos only if enabled
@@ -395,6 +409,7 @@ async def _ingest_instagram(
 
     # OPTIMIZATION: Skip expensive user lookup + reels if using hashtag-only mode
     # Hashtag posts with video filter already give us video content from many accounts
+    all_reels: list[dict]
     if settings.INGEST_INSTAGRAM_USE_HASHTAG_ONLY:
         logger.info(
             "ingest_instagram.hashtag_only_mode",
@@ -416,16 +431,20 @@ async def _ingest_instagram(
             author_scores, key=lambda author: author_scores.get(author, 0), reverse=True
         )[: max(1, settings.INGEST_INSTAGRAM_ACCOUNTS_TO_FETCH)]
 
-        all_reels: list[dict] = list(all_posts)
+        all_reels = list(all_posts)
         tasks = [
             _fetch_single_candidate(username, project_id, oldest_timestamp, redis)
             for username in top_authors
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for batch in results:
+            if isinstance(batch, asyncio.CancelledError):
+                raise
             if isinstance(batch, Exception):
                 logger.exception("ingest_instagram.top_author_gather_failed", project_id=project_id)
                 continue
+            if isinstance(batch, BaseException):
+                raise batch
             all_reels.extend(batch)
 
     relevance_terms = _build_relevance_terms(intent, social_filter)

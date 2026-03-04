@@ -9,14 +9,10 @@ import time
 import structlog
 from fastapi import HTTPException
 
+from app.core.config import settings
 from app.core.redis import get_redis
 
 logger = structlog.get_logger(__name__)
-
-# Rate limit: 100 requests per 60 seconds (per user)
-CHAT_RATE_LIMIT = 100
-CHAT_WINDOW_SECONDS = 60
-
 
 async def check_user_rate_limit(user_id: str, endpoint: str) -> None:
     """
@@ -34,7 +30,7 @@ async def check_user_rate_limit(user_id: str, endpoint: str) -> None:
     """
     try:
         redis = await get_redis()
-        window = int(time.time()) // CHAT_WINDOW_SECONDS
+        window = int(time.time()) // settings.CHAT_RATE_WINDOW_SECONDS
         key = f"ratelimit:user:{user_id}:{endpoint}:{window}"
 
         # Atomic increment + check
@@ -42,21 +38,25 @@ async def check_user_rate_limit(user_id: str, endpoint: str) -> None:
 
         if count == 1:
             # First request in this window - set expiry
-            await redis.expire(key, CHAT_WINDOW_SECONDS * 2)
+            await redis.expire(key, settings.CHAT_RATE_WINDOW_SECONDS * 2)
 
-        if count > CHAT_RATE_LIMIT:
+        if count > settings.CHAT_RATE_LIMIT:
             logger.warning(
                 "rate_limit.exceeded",
                 user_id=user_id,
                 endpoint=endpoint,
                 count=count,
-                limit=CHAT_RATE_LIMIT,
-                window_seconds=CHAT_WINDOW_SECONDS,
+                limit=settings.CHAT_RATE_LIMIT,
+                window_seconds=settings.CHAT_RATE_WINDOW_SECONDS,
             )
             raise HTTPException(
                 status_code=429,
-                detail=f"Rate limit exceeded. Maximum {CHAT_RATE_LIMIT} requests per {CHAT_WINDOW_SECONDS} seconds.",
-                headers={"Retry-After": str(CHAT_WINDOW_SECONDS)},
+                detail=(
+                    "Rate limit exceeded. Maximum "
+                    f"{settings.CHAT_RATE_LIMIT} requests per "
+                    f"{settings.CHAT_RATE_WINDOW_SECONDS} seconds."
+                ),
+                headers={"Retry-After": str(settings.CHAT_RATE_WINDOW_SECONDS)},
             )
 
         logger.debug(
@@ -64,7 +64,7 @@ async def check_user_rate_limit(user_id: str, endpoint: str) -> None:
             user_id=user_id,
             endpoint=endpoint,
             count=count,
-            limit=CHAT_RATE_LIMIT,
+            limit=settings.CHAT_RATE_LIMIT,
         )
 
     except HTTPException:

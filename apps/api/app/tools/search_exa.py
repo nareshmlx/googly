@@ -9,38 +9,34 @@ Growth plan: 5 req/sec, $0.002 per request (search), $0.006 per request (with co
 Integrated with production infrastructure: rate limiting, circuit breaker, caching, retry.
 """
 
-import hashlib
-import json
 import time
 
 import httpx
 import structlog
 
-from app.core.cache import TwoTierCache
+from app.core.cache_keys import build_search_cache_key
 from app.core.circuit_breaker import call_with_circuit_breaker, exa_breaker
 from app.core.config import settings
 from app.core.dedup import deduplicate_request
+from app.core.external_cache import cached_external_results
 from app.core.metrics import api_call_duration_seconds, api_calls_total
+from app.core.query_sanitize import sanitize_query
 from app.core.rate_limiter import exa_limiter, rate_limited_call
-from app.core.redis import get_redis
 from app.core.retry import retry_with_backoff
 
 logger = structlog.get_logger(__name__)
 
 _EXA_BASE_URL = "https://api.exa.ai/search"
-_TIMEOUT = 15.0  # seconds
-_NUM_RESULTS = 10
-_MAX_CHARACTERS = 1000
-# Domain-filtered queries extract more text per result — the user named a specific
-# site and needs rich content (descriptions, notes, reviews), not short snippets.
-_MAX_CHARACTERS_DOMAIN = 2000
 
 
 def _cache_key(project_id: str, query: str, domains: list[str] | None = None) -> str:
     """Generate deterministic project-scoped cache key for a query."""
-    raw = query + str(sorted(domains or []))
-    query_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
-    return f"search:cache:{project_id}:exa:search:{query_hash}"
+    return build_search_cache_key(
+        project_id=project_id,
+        provider="exa",
+        query_type="search",
+        parts=[query, sorted(domains or [])],
+    )
 
 
 async def _search_with_retry(query: str, include_domains: list[str] | None = None) -> dict | None:
@@ -61,17 +57,21 @@ async def _search_with_retry(query: str, include_domains: list[str] | None = Non
         payload: dict = {
             "query": query,
             "type": "neural",  # Neural/semantic search
-            "numResults": _NUM_RESULTS,
+            "numResults": settings.EXA_NUM_RESULTS,
             "useAutoprompt": True,  # Let Exa optimize query
             "contents": {
                 "text": {
-                    "maxCharacters": _MAX_CHARACTERS_DOMAIN if include_domains else _MAX_CHARACTERS,
+                    "maxCharacters": (
+                        settings.EXA_MAX_CHARACTERS_DOMAIN
+                        if include_domains
+                        else settings.EXA_MAX_CHARACTERS
+                    ),
                 }
             },
         }
         if include_domains:
             payload["includeDomains"] = include_domains
-        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=settings.EXA_TIMEOUT_SECONDS) as client:
             response = await client.post(
                 _EXA_BASE_URL,
                 headers={
@@ -121,7 +121,7 @@ async def _search_impl(query: str, include_domains: list[str] | None = None) -> 
         api_calls_total.labels(api_name="exa", status="timeout").inc()
         logger.warning(
             "search_exa.timeout",
-            timeout=_TIMEOUT,
+            timeout=settings.EXA_TIMEOUT_SECONDS,
             query_preview=query[:80],
         )
         return []
@@ -151,7 +151,11 @@ async def _search_impl(query: str, include_domains: list[str] | None = None) -> 
             # (which request 2000 chars from Exa) are not silently truncated back to 1000.
             text_content = ""
             if isinstance(r.get("text"), str):
-                char_limit = _MAX_CHARACTERS_DOMAIN if include_domains else _MAX_CHARACTERS
+                char_limit = (
+                    settings.EXA_MAX_CHARACTERS_DOMAIN
+                    if include_domains
+                    else settings.EXA_MAX_CHARACTERS
+                )
                 text_content = r["text"][:char_limit]
 
             normalized.append(
@@ -182,43 +186,16 @@ async def _search_exa_impl(
     Internal implementation (called by dedup layer).
     Handles cache check, API call, and cache write with stale fallback.
     """
-    redis_client = await get_redis()
-    cache = TwoTierCache(redis_client)
-
-    # 1. Primary Cache Check (Fresh result)
-    cached = await cache.get(cache_key)
-    if cached is not None:
-        return cached.get("results", [])
-
-    # 2. Fetch from API
     async def _fetch_impl() -> list[dict]:
         return await _search_impl(query, include_domains=include_domains)
 
-    result = await call_with_circuit_breaker(exa_breaker, _fetch_impl)
-
-    # 3. Success -> Cache and Return
-    if result:
-        await cache.set(cache_key, {"results": result}, ttl=settings.CACHE_TTL_SEARCH)
-        # Store a "stale" copy that lasts longer
-        stale_key = f"{cache_key}:stale"
-        await redis_client.setex(
-            stale_key, settings.CACHE_TTL_STALE, json.dumps({"results": result})
-        )
-        return result
-
-    # 4. Failure -> Serve Stale Fallback
-    stale_key = f"{cache_key}:stale"
-    stale_raw = await redis_client.get(stale_key)
-    if stale_raw:
-        logger.warning(
-            "search_exa.api_failed.serving_stale", project_id=project_id, query=query[:50]
-        )
-        try:
-            return json.loads(stale_raw).get("results", [])
-        except json.JSONDecodeError:
-            pass
-
-    return []
+    return await cached_external_results(
+        cache_key=cache_key,
+        fetch_fn=lambda: call_with_circuit_breaker(exa_breaker, _fetch_impl),
+        ttl=settings.CACHE_TTL_SEARCH,
+        stale_event="search_exa.api_failed.serving_stale",
+        stale_context={"project_id": project_id, "query": query[:50]},
+    )
 
 
 async def search_exa(
@@ -263,13 +240,15 @@ async def search_exa(
         return []
 
     # Sanitize query
-    query = query.strip()
-    if not query:
-        logger.warning("search_exa.empty_query")
+    sanitized_query = sanitize_query(
+        query,
+        logger=logger,
+        empty_event="search_exa.empty_query",
+        too_long_event="search_exa.query_too_long",
+    )
+    if sanitized_query is None:
         return []
-    if len(query) > 1000:
-        logger.warning("search_exa.query_too_long", original_length=len(query))
-        query = query[:1000]
+    query = sanitized_query
 
     logger.info(
         "search_exa.start",

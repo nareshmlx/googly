@@ -9,7 +9,6 @@ Free tier: 10,000 requests/month. API key required.
 Integrated with production infrastructure: rate limiting, circuit breaker, caching, retry.
 """
 
-import hashlib
 import json
 import time
 
@@ -17,10 +16,12 @@ import httpx
 import structlog
 
 from app.core.cache import TwoTierCache
+from app.core.cache_keys import build_search_cache_key, build_stale_cache_key
 from app.core.circuit_breaker import call_with_circuit_breaker, lens_breaker
 from app.core.config import settings
 from app.core.dedup import deduplicate_request
 from app.core.metrics import api_call_duration_seconds, api_calls_total
+from app.core.query_sanitize import sanitize_query
 from app.core.rate_limiter import lens_limiter, rate_limited_call
 from app.core.redis import get_redis
 from app.core.retry import retry_with_backoff
@@ -28,8 +29,6 @@ from app.core.retry import retry_with_backoff
 logger = structlog.get_logger(__name__)
 
 _BASE_URL = "https://api.lens.org/patent/search"
-_TIMEOUT = 20.0  # seconds (Lens API can be slower for complex queries)
-_MAX_RESULTS = 20  # Lens recommends 20-100 per request
 
 # Module-level HTTP client pool (reused across requests to prevent memory leak)
 _http_client: httpx.AsyncClient | None = None
@@ -39,14 +38,18 @@ async def _get_http_client() -> httpx.AsyncClient:
     """Get or create shared HTTP client pool for module."""
     global _http_client
     if _http_client is None:
-        _http_client = httpx.AsyncClient(timeout=_TIMEOUT)
+        _http_client = httpx.AsyncClient(timeout=settings.PATENTS_LENS_TIMEOUT_SECONDS)
     return _http_client
 
 
 def _cache_key(project_id: str, query: str) -> str:
     """Generate deterministic project-scoped cache key for a query."""
-    query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()[:16]
-    return f"search:cache:{project_id}:lens:patents:{query_hash}"
+    return build_search_cache_key(
+        project_id=project_id,
+        provider="lens",
+        query_type="patents",
+        parts=[query],
+    )
 
 
 async def _search_with_retry(query: str) -> dict | None:
@@ -84,7 +87,7 @@ async def _search_with_retry(query: str) -> dict | None:
                     "minimum_should_match": 1,
                 }
             },
-            "size": _MAX_RESULTS,
+            "size": settings.PAPERS_MAX_RESULTS,
             "include": [
                 "lens_id",
                 "jurisdiction",
@@ -146,7 +149,7 @@ async def _search_impl(query: str) -> list[dict]:
         api_calls_total.labels(api_name="lens", status="timeout").inc()
         logger.warning(
             "patents_lens.timeout",
-            timeout=_TIMEOUT,
+            timeout=settings.PATENTS_LENS_TIMEOUT_SECONDS,
             query_preview=query[:80],
         )
         return []
@@ -272,14 +275,14 @@ async def _search_lens_impl(project_id: str, query: str, cache_key: str) -> list
     if result:
         await cache.set(cache_key, {"results": result}, ttl=settings.CACHE_TTL_PATENTS)
         # Store a "stale" copy that lasts longer
-        stale_key = f"{cache_key}:stale"
+        stale_key = build_stale_cache_key(cache_key)
         await redis_client.setex(
             stale_key, settings.CACHE_TTL_STALE, json.dumps({"results": result})
         )
         return result
 
     # 4. Failure -> Serve Stale Fallback
-    stale_key = f"{cache_key}:stale"
+    stale_key = build_stale_cache_key(cache_key)
     stale_raw = await redis_client.get(stale_key)
     if stale_raw:
         logger.warning(
@@ -334,13 +337,16 @@ async def search_lens(project_id: str, query: str) -> list[dict]:
         return []
 
     # Sanitize and normalize query BEFORE cache key generation (prevents cache key collision)
-    query = query.strip().lower()
-    if not query:
-        logger.warning("patents_lens.empty_query")
+    sanitized_query = sanitize_query(
+        query,
+        logger=logger,
+        empty_event="patents_lens.empty_query",
+        too_long_event="patents_lens.query_too_long",
+        lower=True,
+    )
+    if sanitized_query is None:
         return []
-    if len(query) > 1000:
-        logger.warning("patents_lens.query_too_long", original_length=len(query))
-        query = query[:1000]
+    query = sanitized_query
 
     logger.info("patents_lens.start", query_preview=query[:80])
 

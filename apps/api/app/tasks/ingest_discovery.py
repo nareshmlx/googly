@@ -1,6 +1,7 @@
 """Discovery source ingestion tasks (Perigon news, Tavily web, Exa web)."""
 
 import asyncio
+
 import structlog
 
 from app.kb.ingester import RawDocument
@@ -17,11 +18,18 @@ async def _ingest_news(
     project_id: str,
     user_id: str,
     intent: dict,
+    project_title: str = "",
+    project_description: str = "",
     redis,
 ) -> list[RawDocument]:
     """Fetch news from Perigon."""
     _ = redis
-    query = _query_for_news_or_web(intent, source="perigon")
+    query_intent = dict(intent or {})
+    if project_title:
+        query_intent.setdefault("project_title", project_title)
+    if project_description:
+        query_intent.setdefault("project_description", project_description)
+    query = _query_for_news_or_web(query_intent, source="perigon")
     if not query:
         return []
 
@@ -32,10 +40,14 @@ async def _ingest_news(
     tasks = [search_perigon(project_id, qv) for qv in variants]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    for qv, batch in zip(variants, results):
+    for qv, batch in zip(variants, results, strict=False):
+        if isinstance(batch, asyncio.CancelledError):
+            raise
         if isinstance(batch, Exception):
             logger.exception("ingest_news.failed", project_id=project_id, query=qv)
             continue
+        if isinstance(batch, BaseException):
+            raise batch
         for story in batch:
             sid = str(story.get("article_id") or story.get("url") or "").strip()
             if not sid or sid.lower() in seen_ids:
@@ -72,52 +84,22 @@ async def _ingest_web_tavily(
     project_id: str,
     user_id: str,
     intent: dict,
+    project_title: str = "",
+    project_description: str = "",
     redis,
 ) -> list[RawDocument]:
     """Fetch web results from Tavily."""
-    _ = redis
-    query = _query_for_news_or_web(intent, source="tavily")
-    if not query:
-        return []
-
-    results: list[dict] = []
-    seen_urls: set[str] = set()
-    variants = list(_query_variants_for_source(intent, query))
-
-    tasks = [search_tavily(project_id, qv) for qv in variants]
-    batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    for qv, batch in zip(variants, batch_results):
-        if isinstance(batch, Exception):
-            logger.exception("ingest_web_tavily.failed", project_id=project_id, query=qv)
-            continue
-        for row in batch:
-            url = str(row.get("url") or "").strip()
-            if not url or url.lower() in seen_urls:
-                continue
-            seen_urls.add(url.lower())
-            results.append(row)
-
-    docs: list[RawDocument] = []
-    for row in results:
-        content = (row.get("content") or row.get("snippet") or "").strip()
-        if not content:
-            continue
-        docs.append(
-            RawDocument(
-                project_id=project_id,
-                user_id=user_id,
-                source="search",
-                source_id=row.get("url", ""),
-                title=row.get("title", ""),
-                content=content,
-                metadata={
-                    "url": row.get("url", ""),
-                    "tool": "tavily",
-                },
-            )
-        )
-    return docs
+    return await _ingest_web_source(
+        project_id=project_id,
+        user_id=user_id,
+        intent=intent,
+        project_title=project_title,
+        project_description=project_description,
+        source_key="tavily",
+        tool_name="tavily",
+        search_fn=search_tavily,
+        error_event="ingest_web_tavily.failed",
+    )
 
 
 async def _ingest_web_exa(
@@ -125,25 +107,60 @@ async def _ingest_web_exa(
     project_id: str,
     user_id: str,
     intent: dict,
+    project_title: str = "",
+    project_description: str = "",
     redis,
 ) -> list[RawDocument]:
     """Fetch web results from Exa."""
-    _ = redis
-    query = _query_for_news_or_web(intent, source="exa")
+    return await _ingest_web_source(
+        project_id=project_id,
+        user_id=user_id,
+        intent=intent,
+        project_title=project_title,
+        project_description=project_description,
+        source_key="exa",
+        tool_name="exa",
+        search_fn=search_exa,
+        error_event="ingest_web_exa.failed",
+    )
+
+
+async def _ingest_web_source(
+    *,
+    project_id: str,
+    user_id: str,
+    intent: dict,
+    project_title: str = "",
+    project_description: str = "",
+    source_key: str,
+    tool_name: str,
+    search_fn,
+    error_event: str,
+) -> list[RawDocument]:
+    """Fetch web results for one search provider and map to RawDocument."""
+    query_intent = dict(intent or {})
+    if project_title:
+        query_intent.setdefault("project_title", project_title)
+    if project_description:
+        query_intent.setdefault("project_description", project_description)
+    query = _query_for_news_or_web(query_intent, source=source_key)
     if not query:
         return []
 
     results: list[dict] = []
     seen_urls: set[str] = set()
     variants = list(_query_variants_for_source(intent, query))
-
-    tasks = [search_exa(project_id, qv) for qv in variants]
+    tasks = [search_fn(project_id, qv) for qv in variants]
     batch_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    for qv, batch in zip(variants, batch_results):
+    for qv, batch in zip(variants, batch_results, strict=False):
+        if isinstance(batch, asyncio.CancelledError):
+            raise
         if isinstance(batch, Exception):
-            logger.exception("ingest_web_exa.failed", project_id=project_id, query=qv)
+            logger.exception(error_event, project_id=project_id, query=qv)
             continue
+        if isinstance(batch, BaseException):
+            raise batch
         for row in batch:
             url = str(row.get("url") or "").strip()
             if not url or url.lower() in seen_urls:
@@ -153,6 +170,9 @@ async def _ingest_web_exa(
 
     docs: list[RawDocument] = []
     for row in results:
+        url = str(row.get("url") or "").strip()
+        if not url:
+            continue
         content = (row.get("content") or row.get("snippet") or "").strip()
         if not content:
             continue
@@ -161,12 +181,12 @@ async def _ingest_web_exa(
                 project_id=project_id,
                 user_id=user_id,
                 source="search",
-                source_id=row.get("url", ""),
+                source_id=url,
                 title=row.get("title", ""),
                 content=content,
                 metadata={
                     "url": row.get("url", ""),
-                    "tool": "exa",
+                    "tool": tool_name,
                 },
             )
         )

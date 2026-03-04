@@ -11,9 +11,10 @@ SDK calls are synchronous — wrapped with asyncio.to_thread throughout.
 """
 
 import asyncio
-import hashlib
 import json
+import os
 
+import certifi
 import httpx
 import structlog
 
@@ -22,10 +23,21 @@ try:
 except ImportError:  # pragma: no cover - environment-dependent optional dependency
     EDClient = None  # type: ignore[assignment]
 
+from app.core.cache_keys import build_search_cache_key, build_stale_cache_key
 from app.core.config import settings
+from app.core.normalize import coerce_int
 
 logger = structlog.get_logger(__name__)
 _SDK_WARNED = False
+
+
+def _ensure_ssl_ca_bundle() -> None:
+    """Ensure a valid CA bundle path exists for SDK/httpx TLS verification."""
+    certifi_path = certifi.where()
+    if certifi_path and os.path.exists(certifi_path):
+        # Only set defaults when caller/operator has not explicitly configured TLS bundle.
+        os.environ.setdefault("SSL_CERT_FILE", certifi_path)
+        os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi_path)
 
 
 def _sdk_available() -> bool:
@@ -39,31 +51,15 @@ def _sdk_available() -> bool:
     return True
 
 
-def _as_int(value: object) -> int:
-    """Coerce SDK numeric fields that can arrive as int/float/string into int."""
-    if isinstance(value, bool) or value is None:
-        return 0
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value)
-    if isinstance(value, str):
-        trimmed = value.strip().replace(",", "")
-        if not trimmed:
-            return 0
-        try:
-            return int(float(trimmed))
-        except ValueError:
-            return 0
-    return 0
-
-
 def _cache_key(project_id: str, tool: str, **kwargs) -> str:
     """Generate a deterministic, project-scoped cache key for Instagram tools."""
     sorted_kwargs = sorted(kwargs.items())
-    kw_str = ",".join(f"{k}:{v}" for k, v in sorted_kwargs)
-    query_hash = hashlib.sha256(kw_str.encode()).hexdigest()[:16]
-    return f"search:cache:{project_id}:social_instagram:{tool}:{query_hash}"
+    return build_search_cache_key(
+        project_id=project_id,
+        provider="social_instagram",
+        query_type=tool,
+        parts=[f"{k}:{v}" for k, v in sorted_kwargs],
+    )
 
 
 async def instagram_search(project_id: str, text: str, redis=None) -> list[dict]:
@@ -73,7 +69,7 @@ async def instagram_search(project_id: str, text: str, redis=None) -> list[dict]
         return []
 
     cache_key = _cache_key(project_id, "search", text=cleaned_text)
-    stale_key = f"{cache_key}:stale"
+    stale_key = build_stale_cache_key(cache_key)
     if redis:
         try:
             cached = await redis.get(cache_key)
@@ -113,6 +109,7 @@ async def _instagram_search_impl(text: str) -> list[dict]:
         return []
     if not _sdk_available():
         return []
+    _ensure_ssl_ca_bundle()
 
     logger.info("social_instagram.search.start", text_preview=text[:60])
     try:
@@ -138,128 +135,6 @@ async def _instagram_search_impl(text: str) -> list[dict]:
         return []
 
 
-async def instagram_user_posts(
-    project_id: str,
-    user_id: int,
-    depth: int = 1,
-    oldest_timestamp: int | None = None,
-    redis=None,
-) -> list[dict]:
-    """Fetch posts for an Instagram user with caching."""
-    cache_key = _cache_key(
-        project_id, "user_posts", user_id=user_id, depth=depth, oldest=oldest_timestamp
-    )
-    stale_key = f"{cache_key}:stale"
-    if redis:
-        try:
-            cached = await redis.get(cache_key)
-            if cached:
-                return json.loads(cached)
-        except Exception:
-            logger.warning("social_instagram.cache_read_failed", project_id=project_id)
-
-    try:
-        results = await _instagram_user_posts_impl(user_id, depth, oldest_timestamp)
-        if redis and results:
-            try:
-                await redis.setex(cache_key, settings.CACHE_TTL_SOCIAL, json.dumps(results))
-                await redis.setex(stale_key, settings.CACHE_TTL_STALE, json.dumps(results))
-            except Exception:
-                logger.warning("social_instagram.cache_write_failed", project_id=project_id)
-        return results
-    except Exception as exc:
-        if redis:
-            try:
-                stale = await redis.get(stale_key)
-                if stale:
-                    logger.info(
-                        "social_instagram.serving_stale", project_id=project_id, error=str(exc)
-                    )
-                    return json.loads(stale)
-            except Exception:
-                pass
-        raise
-
-
-async def _instagram_user_posts_impl(
-    user_id: int,
-    depth: int = 1,
-    oldest_timestamp: int | None = None,
-) -> list[dict]:
-    """Internal implementation of Instagram user posts retrieval."""
-
-    """
-    Fetch posts for an Instagram user via EnsembleData SDK instagram.user_posts.
-
-    depth controls how many pages to scroll (1 = first batch, ~10-12 items).
-    oldest_timestamp stops fetching when a post older than that Unix timestamp
-    is encountered — pass int(last_refreshed_at.timestamp()) on refresh runs
-    to avoid re-ingesting content already in the KB.
-
-    Returns list of post dicts on success. Returns [] on any failure — never raises.
-    """
-    if not settings.ENSEMBLE_API_TOKEN:
-        logger.warning("social_instagram.no_token")
-        return []
-    if not _sdk_available():
-        return []
-
-    logger.info("social_instagram.posts.start", user_id=user_id, depth=depth)
-    try:
-        client = EDClient(token=settings.ENSEMBLE_API_TOKEN)
-        result = await asyncio.to_thread(
-            lambda: client.instagram.user_posts(user_id=user_id, depth=depth)
-        )
-        # EnsembleData response shape: {"count": N, "posts": [{"node": {...}}, ...], "last_cursor": "..."}
-        posts_raw = (result.data or {}).get("posts", [])
-        if not isinstance(posts_raw, list):
-            logger.warning(
-                "social_instagram.posts.unexpected_shape",
-                keys=list((result.data or {}).keys()),
-            )
-            return []
-
-        # Unwrap the GraphQL node envelope and normalise field names
-        items = []
-        for entry in posts_raw:
-            node = entry.get("node") if isinstance(entry, dict) else None
-            if not isinstance(node, dict):
-                continue
-            caption_edges = (node.get("edge_media_to_caption") or {}).get("edges", [])
-            caption = (
-                caption_edges[0].get("node", {}).get("text", "")
-                if caption_edges
-                else (node.get("accessibility_caption") or "")
-            )
-            items.append(
-                {
-                    "shortcode": node.get("shortcode") or node.get("id", ""),
-                    "caption": caption,
-                    "timestamp": node.get("taken_at_timestamp"),
-                    "like_count": (node.get("edge_media_preview_like") or {}).get("count", 0),
-                    "view_count": node.get("video_view_count"),
-                    "display_url": node.get("display_url", ""),
-                    "video_url": node.get("video_url", ""),
-                }
-            )
-
-        # Final-filter: remove items older than oldest_timestamp.
-        # The API may include the stop-trigger post itself (per EnsembleData docs tip).
-        if oldest_timestamp is not None:
-            items = [
-                item
-                for item in items
-                if isinstance(item.get("timestamp"), int | float)
-                and item["timestamp"] >= oldest_timestamp
-            ]
-
-        logger.info("social_instagram.posts.success", post_count=len(items), user_id=user_id)
-        return items
-    except Exception:
-        logger.exception("social_instagram.posts.unexpected_error", user_id=user_id)
-        return []
-
-
 async def instagram_user_reels(
     project_id: str,
     user_id: int,
@@ -271,7 +146,7 @@ async def instagram_user_reels(
     cache_key = _cache_key(
         project_id, "user_reels", user_id=user_id, depth=depth, oldest=oldest_timestamp
     )
-    stale_key = f"{cache_key}:stale"
+    stale_key = build_stale_cache_key(cache_key)
     if redis:
         try:
             cached = await redis.get(cache_key)
@@ -327,6 +202,7 @@ async def _instagram_user_reels_impl(
         return []
     if not _sdk_available():
         return []
+    _ensure_ssl_ca_bundle()
 
     logger.info("social_instagram.reels.start", user_id=user_id, depth=depth)
     try:
@@ -364,12 +240,12 @@ async def _instagram_user_reels_impl(
             video_versions = media.get("video_versions") or []
             video_url = video_versions[0].get("url", "") if video_versions else ""
 
-            like_count = _as_int(
+            like_count = coerce_int(
                 media.get("like_count")
                 or (media.get("edge_media_preview_like") or {}).get("count")
                 or (media.get("edge_liked_by") or {}).get("count")
             )
-            view_count = _as_int(
+            view_count = coerce_int(
                 media.get("play_count") or media.get("view_count") or media.get("video_view_count")
             )
 
@@ -476,7 +352,7 @@ async def instagram_hashtag_posts(
     cache_key = _cache_key(
         project_id, "hashtag_posts", hashtag=hashtag, cursor=cursor, author=get_author_info
     )
-    stale_key = f"{cache_key}:stale"
+    stale_key = build_stale_cache_key(cache_key)
     if redis:
         try:
             cached = await redis.get(cache_key)
@@ -534,6 +410,7 @@ async def _instagram_hashtag_posts_impl(
     if not settings.ENSEMBLE_API_TOKEN:
         logger.warning("social_instagram.no_token")
         return [], None
+    _ensure_ssl_ca_bundle()
 
     tag = hashtag.strip().lstrip("#")
     if not tag:
@@ -565,7 +442,7 @@ async def _instagram_hashtag_posts_impl(
 
     for endpoint in endpoints:
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=settings.SOCIAL_INSTAGRAM_TIMEOUT_SECONDS) as client:
                 response = await client.get(endpoint, params=params)
                 response.raise_for_status()
                 payload = response.json()
@@ -620,12 +497,12 @@ async def _instagram_hashtag_posts_impl(
                 if not video_url:
                     video_url = str(node.get("video_url") or "")
 
-                like_count = _as_int(
+                like_count = coerce_int(
                     node.get("like_count")
                     or (node.get("edge_media_preview_like") or {}).get("count")
                     or (node.get("edge_liked_by") or {}).get("count")
                 )
-                view_count = _as_int(
+                view_count = coerce_int(
                     node.get("play_count") or node.get("view_count") or node.get("video_view_count")
                 )
 

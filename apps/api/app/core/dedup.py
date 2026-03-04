@@ -15,6 +15,8 @@ from typing import TypeVar
 
 import structlog
 
+from app.core.config import settings
+
 logger = structlog.get_logger(__name__)
 
 T = TypeVar("T")
@@ -36,17 +38,25 @@ async def deduplicate_request(key: str, fn: Callable[[], Awaitable[T]]) -> T:
     result_key = f"sys:dedup:res:{key}"
 
     # Try to become the primary worker
-    acquired = await redis.set(lock_key, "1", nx=True, ex=120)
+    acquired = await redis.set(lock_key, "1", nx=True, ex=settings.DEDUP_LOCK_TTL_SECONDS)
     if acquired:
         logger.debug("dedup.first_request", key=key[:50])
         try:
             result = await fn()
             # Serialize and broadcast result globally
-            await redis.setex(result_key, 60, json.dumps({"status": "ok", "data": result}))
+            await redis.setex(
+                result_key,
+                settings.DEDUP_RESULT_TTL_SECONDS,
+                json.dumps({"status": "ok", "data": result}),
+            )
             logger.debug("dedup.completed", key=key[:50])
             return result
         except Exception as exc:
-            await redis.setex(result_key, 60, json.dumps({"status": "error", "message": str(exc)}))
+            await redis.setex(
+                result_key,
+                settings.DEDUP_RESULT_TTL_SECONDS,
+                json.dumps({"status": "error", "message": str(exc)}),
+            )
             logger.warning("dedup.error", key=key[:50], error=str(exc))
             raise
         finally:
@@ -56,7 +66,7 @@ async def deduplicate_request(key: str, fn: Callable[[], Awaitable[T]]) -> T:
         import asyncio
 
         logger.debug("dedup.waiting_globally", key=key[:50])
-        for _ in range(600):  # Wait up to 60 seconds
+        for _ in range(settings.DEDUP_WAIT_MAX_ATTEMPTS):
             raw = await redis.get(result_key)
             if raw:
                 try:
@@ -67,7 +77,7 @@ async def deduplicate_request(key: str, fn: Callable[[], Awaitable[T]]) -> T:
                     return payload.get("data")  # type: ignore
                 except json.JSONDecodeError:
                     pass
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(settings.DEDUP_WAIT_POLL_SECONDS)
 
         # Fallback if primary process died before writing result
         logger.warning("dedup.timeout_fallback", key=key[:50])

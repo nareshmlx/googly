@@ -9,7 +9,6 @@ dedicated pool. Set OPENALEX_EMAIL to any valid address to opt in.
 Integrated with production infrastructure: rate limiting, circuit breaker, caching, retry.
 """
 
-import hashlib
 import json
 import re
 from datetime import UTC, datetime
@@ -18,6 +17,7 @@ import httpx
 import structlog
 
 from app.core.cache import TwoTierCache
+from app.core.cache_keys import build_search_cache_key, build_stale_cache_key
 from app.core.circuit_breaker import call_with_circuit_breaker, openalex_breaker
 from app.core.config import settings
 from app.core.dedup import deduplicate_request
@@ -28,11 +28,6 @@ from app.core.retry import retry_with_backoff
 logger = structlog.get_logger(__name__)
 
 _OPENALEX_BASE_URL = "https://api.openalex.org/works"
-_TIMEOUT = 10.0  # seconds
-_TARGET_PAPER_COUNT = 20
-_OPENALEX_VARIANT_LIMIT = 3
-_OPENALEX_PER_PAGE = 50
-_STRICT_PAGES: tuple[int, ...] = (1, 2)
 
 _LATEST_QUERY_TERMS: set[str] = {
     "latest",
@@ -167,7 +162,7 @@ def _build_query_variants(query: str) -> list[str]:
             continue
         seen.add(key)
         out.append(cleaned)
-    return out[:_OPENALEX_VARIANT_LIMIT]
+    return out[: settings.OPENALEX_QUERY_VARIANT_LIMIT]
 
 
 def _paper_relevance_score(
@@ -223,8 +218,12 @@ def _reconstruct_abstract(inverted_index: dict | None) -> str:
 
 def _cache_key(project_id: str, query: str) -> str:
     """Generate deterministic project-scoped cache key for a query."""
-    query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()[:16]
-    return f"search:cache:{project_id}:openalex:papers:{query_hash}"
+    return build_search_cache_key(
+        project_id=project_id,
+        provider="openalex",
+        query_type="papers",
+        parts=[query],
+    )
 
 
 async def _get_works_with_retry(params: dict) -> dict | None:
@@ -236,7 +235,7 @@ async def _get_works_with_retry(params: dict) -> dict | None:
     """
 
     async def _fetch() -> dict:
-        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=settings.PAPERS_OPENALEX_TIMEOUT_SECONDS) as client:
             response = await client.get(_OPENALEX_BASE_URL, params=params)
             response.raise_for_status()
             return response.json()
@@ -278,14 +277,14 @@ async def _fetch_papers_openalex_impl(project_id: str, query: str, cache_key: st
     if result:
         await cache.set(cache_key, {"papers": result}, ttl=settings.CACHE_TTL_PAPERS)
         # Store a "stale" copy that lasts longer
-        stale_key = f"{cache_key}:stale"
+        stale_key = build_stale_cache_key(cache_key)
         await redis_client.setex(
             stale_key, settings.CACHE_TTL_STALE, json.dumps({"papers": result})
         )
         return result
 
     # 4. Failure -> Serve Stale Fallback
-    stale_key = f"{cache_key}:stale"
+    stale_key = build_stale_cache_key(cache_key)
     stale_raw = await redis_client.get(stale_key)
     if stale_raw and isinstance(stale_raw, str | bytes):
         logger.warning(
@@ -359,10 +358,13 @@ async def _fetch_papers_impl(query: str) -> list[dict]:
     all_works: list[dict] = []
     variant_counts: list[dict[str, int | str]] = []
     latest_like = _looks_like_latest_query(query)
-    from_year = max(2018, datetime.now(UTC).year - 7)
+    from_year = max(
+        settings.OPENALEX_LATEST_MIN_YEAR,
+        datetime.now(UTC).year - settings.OPENALEX_LATEST_LOOKBACK_YEARS,
+    )
     for variant in query_variants:
         variant_total = 0
-        for page in _STRICT_PAGES:
+        for page in settings.OPENALEX_STRICT_PAGES:
             filter_parts = [
                 f"title_and_abstract.search:{variant}",
                 "has_abstract:true",
@@ -373,7 +375,7 @@ async def _fetch_papers_impl(query: str) -> list[dict]:
                 filter_parts.append(f"from_publication_date:{from_year}-01-01")
             params: dict = {
                 "filter": ",".join(filter_parts),
-                "per-page": _OPENALEX_PER_PAGE,
+                "per-page": settings.OPENALEX_PER_PAGE,
                 "page": page,
                 "mailto": settings.OPENALEX_EMAIL,
                 "sort": "publication_date:desc",
@@ -407,7 +409,7 @@ async def _fetch_papers_impl(query: str) -> list[dict]:
         variant_counts.append({"query": variant[:80], "count": variant_total})
 
     # Broaden only when strict title+abstract search under-fetches.
-    if len(all_works) < (_TARGET_PAPER_COUNT * 3):
+    if len(all_works) < (settings.OPENALEX_TARGET_PAPER_COUNT * 3):
         for variant in query_variants:
             filter_parts = [
                 "type:article|review|preprint|proceedings-article",
@@ -418,7 +420,7 @@ async def _fetch_papers_impl(query: str) -> list[dict]:
             params = {
                 "search": variant,
                 "filter": ",".join(filter_parts),
-                "per-page": _OPENALEX_PER_PAGE,
+                "per-page": settings.OPENALEX_PER_PAGE,
                 "page": 1,
                 "mailto": settings.OPENALEX_EMAIL,
                 "sort": "publication_date:desc",
@@ -545,9 +547,9 @@ async def _fetch_papers_impl(query: str) -> list[dict]:
     pre_positive_count = len([item for item in ranked if item[0] > 0])
     strict_ranked = [item for item in ranked if item[0] > 0 and (not specific_terms or item[2] > 0)]
     positive_ranked = [item for item in ranked if item[0] > 0]
-    if len(strict_ranked) >= _TARGET_PAPER_COUNT:
+    if len(strict_ranked) >= settings.OPENALEX_TARGET_PAPER_COUNT:
         ranked_pool = strict_ranked
-    elif len(positive_ranked) >= _TARGET_PAPER_COUNT:
+    elif len(positive_ranked) >= settings.OPENALEX_TARGET_PAPER_COUNT:
         ranked_pool = positive_ranked
     else:
         ranked_pool = ranked
@@ -564,9 +566,9 @@ async def _fetch_papers_impl(query: str) -> list[dict]:
     )
 
     selected = (
-        [paper for _, _, _, _, paper in ranked_pool[:_TARGET_PAPER_COUNT]]
+        [paper for _, _, _, _, paper in ranked_pool[: settings.OPENALEX_TARGET_PAPER_COUNT]]
         if ranked_pool
-        else papers[:_TARGET_PAPER_COUNT]
+        else papers[: settings.OPENALEX_TARGET_PAPER_COUNT]
     )
 
     filtered_out = [item for item in ranked if item not in ranked_pool][:10]

@@ -9,7 +9,6 @@ Free tier: 1 req/sec, no API key required (optional for higher limits).
 Integrated with production infrastructure: rate limiting, circuit breaker, caching, retry.
 """
 
-import hashlib
 import json
 import time
 
@@ -17,10 +16,12 @@ import httpx
 import structlog
 
 from app.core.cache import TwoTierCache
+from app.core.cache_keys import build_search_cache_key, build_stale_cache_key
 from app.core.circuit_breaker import call_with_circuit_breaker, semantic_scholar_breaker
 from app.core.config import settings
 from app.core.dedup import deduplicate_request
 from app.core.metrics import api_call_duration_seconds, api_calls_total
+from app.core.query_sanitize import sanitize_query
 from app.core.rate_limiter import rate_limited_call, semantic_scholar_limiter
 from app.core.redis import get_redis
 from app.core.retry import retry_with_backoff
@@ -28,8 +29,6 @@ from app.core.retry import retry_with_backoff
 logger = structlog.get_logger(__name__)
 
 _BASE_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
-_TIMEOUT = 15.0  # seconds
-_MAX_RESULTS = 20
 
 # Module-level HTTP client pool (reused across requests to prevent memory leak)
 _http_client: httpx.AsyncClient | None = None
@@ -39,7 +38,7 @@ async def _get_http_client() -> httpx.AsyncClient:
     """Get or create shared HTTP client pool for module."""
     global _http_client
     if _http_client is None:
-        _http_client = httpx.AsyncClient(timeout=_TIMEOUT)
+        _http_client = httpx.AsyncClient(timeout=settings.PAPERS_SEMANTIC_SCHOLAR_TIMEOUT_SECONDS)
     return _http_client
 
 
@@ -61,8 +60,12 @@ def _build_semantic_query(
 
 def _cache_key(project_id: str, query: str) -> str:
     """Generate deterministic project-scoped cache key for a query."""
-    query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()[:16]
-    return f"search:cache:{project_id}:semantic_scholar:papers:{query_hash}"
+    return build_search_cache_key(
+        project_id=project_id,
+        provider="semantic_scholar",
+        query_type="papers",
+        parts=[query],
+    )
 
 
 async def _search_with_retry(query: str) -> dict | None:
@@ -87,8 +90,8 @@ async def _search_with_retry(query: str) -> dict | None:
             _BASE_URL,
             params={
                 "query": query,
-                "limit": _MAX_RESULTS,
-                "fields": "paperId,title,authors,year,abstract,url,citationCount",
+                "limit": settings.PAPERS_MAX_RESULTS,
+                "fields": "paperId,title,authors,year,abstract,url,citationCount,externalIds",
             },
             headers=headers,
         )
@@ -171,6 +174,7 @@ async def _search_impl(query: str) -> list[dict]:
                     "citation_count": paper.get("citationCount", 0),
                     "source": "semantic_scholar",
                     "paper_id": paper.get("paperId", ""),
+                    "doi": (paper.get("externalIds") or {}).get("DOI", ""),
                 }
             )
         except Exception:
@@ -204,14 +208,14 @@ async def _search_semantic_scholar_impl(project_id: str, query: str, cache_key: 
     if result:
         await cache.set(cache_key, {"results": result}, ttl=settings.CACHE_TTL_PAPERS)
         # Store a "stale" copy that lasts longer
-        stale_key = f"{cache_key}:stale"
+        stale_key = build_stale_cache_key(cache_key)
         await redis_client.setex(
             stale_key, settings.CACHE_TTL_STALE, json.dumps({"results": result})
         )
         return result
 
     # 4. Failure -> Serve Stale Fallback
-    stale_key = f"{cache_key}:stale"
+    stale_key = build_stale_cache_key(cache_key)
     stale_raw = await redis_client.get(stale_key)
     if stale_raw:
         logger.warning(
@@ -266,13 +270,15 @@ async def search_semantic_scholar(
         logger.debug("search_semantic_scholar.no_api_key", message="Using free tier limits")
 
     # Sanitize and normalize query BEFORE cache key generation (prevents cache key collision)
-    query = query.strip()
-    if not query:
-        logger.warning("search_semantic_scholar.empty_query")
+    sanitized_query = sanitize_query(
+        query,
+        logger=logger,
+        empty_event="search_semantic_scholar.empty_query",
+        too_long_event="search_semantic_scholar.query_too_long",
+    )
+    if sanitized_query is None:
         return []
-    if len(query) > 1000:
-        logger.warning("search_semantic_scholar.query_too_long", original_length=len(query))
-        query = query[:1000]
+    query = sanitized_query
 
     effective_query = _build_semantic_query(query, must_match_terms, domain_terms)
     if str(query_specificity or "").lower() == "specific" and must_match_terms:

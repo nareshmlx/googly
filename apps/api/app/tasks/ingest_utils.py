@@ -3,6 +3,7 @@
 extracted from ingest_project.py to support modular ingestion sources.
 """
 
+import hashlib
 import re
 from datetime import UTC, datetime
 from urllib.parse import urlparse
@@ -10,24 +11,60 @@ from urllib.parse import urlparse
 import structlog
 
 from app.core.config import settings
+from app.core.constants import SourceType
+from app.core.normalize import coerce_int
+from app.core.utils import metadata_pick
 from app.kb.ingester import RawDocument
 from app.tools.search_exa import search_exa
 from app.tools.search_tavily import search_tavily
 
 logger = structlog.get_logger(__name__)
 
-SOCIAL_SOURCES: frozenset[str] = frozenset(
-    {
-        "social_tiktok",
-        "social_instagram",
-        "social_youtube",
-        "social_reddit",
-        "social_x",
-    }
-)
+
+def generate_stable_source_id(paper: dict) -> str:
+    """Generate a stable source_id for a paper across different sources.
+
+    Prioritizes DOI if available (prefixed with 'doi:').
+    Then prefers provider-native IDs/URLs to avoid cross-paper title collisions.
+    Falls back to a SHA256 hash of normalized title.
+    """
+    doi = str(paper.get("doi") or "").strip().lower()
+    if doi:
+        # DOI might be a full URL from some sources, extract only the identifier part
+        if "doi.org/" in doi:
+            doi = doi.split("doi.org/")[-1]
+        return f"doi:{doi}"
+
+    provider_id = str(
+        paper.get("paper_id")
+        or paper.get("id")
+        or paper.get("pmid")
+        or paper.get("arxiv_id")
+        or paper.get("article_id")
+        or paper.get("url")
+        or ""
+    ).strip()
+    if provider_id:
+        return provider_id
+
+    title = str(paper.get("title") or "").strip().lower()
+    # Normalize title: remove all non-alphanumeric characters
+    normalized_title = re.sub(r"[^a-z0-9]", "", title)
+    if normalized_title:
+        title_hash = hashlib.sha256(normalized_title.encode()).hexdigest()[:16]
+        return f"title:{title_hash}"
+
+    return ""
+
+SOCIAL_SOURCES = SourceType.SOCIAL_SOURCES
+
+
+def _as_int(value: object) -> int:
+    """Backward-compatible numeric coercion helper for ingest task modules."""
+    return coerce_int(value)
 
 # Constants for ranking and scoring
-REEL_RECENCY_DAYS = 30.0
+REEL_RECENCY_DAYS = float(settings.INGEST_SOCIAL_RECENCY_DECAY_DAYS_INSTAGRAM)
 
 _GENERIC_RELEVANCE_TERMS: set[str] = {
     "trend",
@@ -100,21 +137,6 @@ _PROJECT_TEXT_STOPWORDS: set[str] = {
 }
 
 
-def _as_int(value: object) -> int:
-    """Safely coerce any numeric-like object to an integer."""
-    if value is None or isinstance(value, bool):
-        return 0
-    try:
-        if isinstance(value, str):
-            value = value.replace(",", "").strip()
-            if not value:
-                return 0
-            return int(float(value))
-        return int(float(value))  # type: ignore
-    except (TypeError, ValueError):
-        return 0
-
-
 def _tokenize(text: str) -> set[str]:
     """Lowercase tokenization for lexical counting."""
     if not text:
@@ -153,14 +175,17 @@ def _is_document_new_enough(doc: RawDocument, oldest_timestamp: int | None) -> b
         return True
 
     metadata = doc.metadata or {}
-    published_raw = (
-        metadata.get("published_at")
-        or metadata.get("published")
-        or metadata.get("published_date")
-        or metadata.get("date")
-        or metadata.get("year")
-        or metadata.get("publication_year")
-        or metadata.get("timestamp")
+    published_raw = metadata_pick(
+        metadata,
+        (
+            "published_at",
+            "published",
+            "published_date",
+            "date",
+            "year",
+            "publication_year",
+            "timestamp",
+        ),
     )
     if published_raw in (None, ""):
         return True
@@ -503,7 +528,13 @@ def _query_for_news_or_web(intent: dict, *, source: str = "perigon") -> str:
         or (entities[0] if entities else "")
         or " ".join(str(k) for k in keywords[:4])
     )
-    return str(seed_query or "").strip()
+    normalized = str(seed_query or "").strip()
+    if normalized:
+        return normalized
+
+    project_title = str(intent.get("project_title") or "").strip()
+    project_description = str(intent.get("project_description") or "").strip()
+    return _project_context_query(project_title, project_description)
 
 
 def _clean_term_values(values: list[str] | None) -> list[str]:
@@ -725,7 +756,7 @@ async def _run_source_with_timeout(
     coro,
     *,
     timeout_seconds: float | None = None,
-) -> list[RawDocument]:
+) -> list[RawDocument] | Exception:
     """Run one source ingest with timeout and fail-open behavior."""
     import asyncio
 
@@ -738,10 +769,10 @@ async def _run_source_with_timeout(
             source=source,
             timeout_seconds=timeout,
         )
-        return []
+        return TimeoutError(f"{source} timed out after {timeout}s")
     except Exception as exc:
         logger.warning("ingest_tool.failed", source=source, error=str(exc))
-        return []
+        return exc
 
 
 def _social_web_url_allowed(source: str, url: str) -> bool:

@@ -228,6 +228,35 @@ def reload_projects():
     st.session_state.projects_loaded = True
 
 
+def _sync_project_chunk_count_from_ingest(
+    project_id: str, status_payload: dict | None
+) -> None:
+    """Sync local project list chunk counters from latest ingest status payload."""
+    if not project_id or not isinstance(status_payload, dict):
+        return
+
+    total_chunks_raw = status_payload.get("total_chunks")
+    try:
+        total_chunks = int(total_chunks_raw)
+    except (TypeError, ValueError):
+        return
+
+    if total_chunks < 0:
+        return
+
+    refreshed_at = status_payload.get("finished_at") or status_payload.get("updated_at")
+    for project in st.session_state.projects:
+        if project.get("id") != project_id:
+            continue
+        current_chunks = int(project.get("kb_chunk_count") or 0)
+        if current_chunks == total_chunks:
+            return
+        project["kb_chunk_count"] = total_chunks
+        if refreshed_at:
+            project["last_refreshed_at"] = refreshed_at
+        return
+
+
 def _project_chat_session_id(project_id: str) -> str:
     """Stable session ID scoped to user + project for the SSE chat endpoint."""
     return f"streamlit_{st.session_state.user_id}_{project_id}"
@@ -445,6 +474,8 @@ else:
         )
         if page != st.session_state.current_page:
             st.session_state.current_page = page
+            if page == "Home":
+                reload_projects()
             st.rerun()
 
         st.divider()
@@ -1107,6 +1138,7 @@ if st.session_state.current_page == "Discover":
         _maybe_auto_refresh_discover(project_id, len(items))
 
         ingest_status = _api.get_ingest_status(project_id)
+        _sync_project_chunk_count_from_ingest(project_id, ingest_status)
         _render_ingest_status(ingest_status)
 
         if items:

@@ -4,6 +4,8 @@ from datetime import UTC, datetime, timedelta
 
 import asyncpg
 
+from app.core.db import get_db_pool
+
 
 async def verify_session_ownership(
     pool: asyncpg.Pool,
@@ -181,3 +183,83 @@ async def replace_chat_history(
             """,
             insert_rows,
         )
+
+
+async def delete_old_messages(pool: asyncpg.Pool, cutoff_dt: datetime) -> int:
+    """Delete chat rows older than cutoff timestamp and return deleted row count."""
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            DELETE FROM chat_messages
+            WHERE created_at < $1
+            """,
+            cutoff_dt,
+        )
+    return int((result or "DELETE 0").split()[-1])
+
+
+async def delete_old_messages_for_service(cutoff_dt: datetime) -> int:
+    """Delete old messages with internally managed pool."""
+    pool = await get_db_pool()
+    return await delete_old_messages(pool, cutoff_dt)
+
+
+async def verify_session_ownership_for_chat(
+    project_id: str,
+    user_id: str,
+    session_id: str,
+) -> bool:
+    """Verify session ownership with internally managed pool for chat service usage."""
+    pool = await get_db_pool()
+    return await verify_session_ownership(pool, project_id, user_id, session_id)
+
+
+async def insert_chat_turn_for_chat(
+    project_id: str,
+    user_id: str,
+    session_id: str,
+    user_message: str,
+    assistant_message: str,
+) -> None:
+    """Insert one chat turn with internally managed pool for chat service usage."""
+    pool = await get_db_pool()
+    await insert_chat_turn(
+        pool=pool,
+        project_id=project_id,
+        user_id=user_id,
+        session_id=session_id,
+        user_message=user_message,
+        assistant_message=assistant_message,
+    )
+
+
+async def fetch_chat_history_for_chat(
+    project_id: str,
+    user_id: str,
+    session_id: str,
+) -> list[dict]:
+    """Fetch one session chat history with internally managed pool for chat service usage."""
+    pool = await get_db_pool()
+    return await fetch_chat_history(
+        pool=pool,
+        project_id=project_id,
+        user_id=user_id,
+        session_id=session_id,
+    )
+
+
+async def replace_chat_history_for_chat(
+    project_id: str,
+    user_id: str,
+    session_id: str,
+    messages: list[dict],
+) -> None:
+    """Replace one session chat history with internally managed pool for chat service usage."""
+    pool = await get_db_pool()
+    await replace_chat_history(
+        pool=pool,
+        project_id=project_id,
+        user_id=user_id,
+        session_id=session_id,
+        messages=messages,
+    )

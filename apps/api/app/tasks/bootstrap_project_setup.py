@@ -2,12 +2,11 @@
 
 import json
 from datetime import UTC, datetime
-from hashlib import sha256
 
 import structlog
 
 from app.core.arq import get_arq_pool
-from app.core.db import get_db_pool
+from app.core.utils import build_stable_signature, parse_metadata
 from app.kb.embedder import embed_texts
 from app.kb.intent_extractor import extract_document_intent, merge_intents
 from app.repositories import project as project_repo
@@ -18,9 +17,7 @@ logger = structlog.get_logger(__name__)
 
 def _upload_signature(upload_ids: list[str]) -> str:
     """Compute stable upload signature for status/idempotency traces."""
-    if not upload_ids:
-        return ""
-    return sha256("|".join(upload_ids).encode("utf-8")).hexdigest()
+    return build_stable_signature(upload_ids)
 
 
 async def _set_status(
@@ -54,20 +51,6 @@ async def _ingest_is_active(project_id: str) -> bool:
     status = await project_service.get_project_ingest_status(project_id)
     return str(status.get("status") or "").lower() in {"queued", "running"}
 
-
-def _coerce_intent(value: object) -> dict:
-    """Normalize persisted structured_intent payload into a mapping."""
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, str):
-        try:
-            parsed = json.loads(value)
-        except json.JSONDecodeError:
-            return {}
-        return parsed if isinstance(parsed, dict) else {}
-    return {}
-
-
 async def bootstrap_project_setup(
     ctx: dict,
     project_id: str,
@@ -88,8 +71,7 @@ async def bootstrap_project_setup(
         upload_signature=upload_signature,
     )
 
-    pool = await get_db_pool()
-    project = await project_repo.fetch_project(pool, project_id, user_id)
+    project = await project_repo.fetch_project_for_service(project_id, user_id)
     if not project:
         await _set_status(
             project_id,
@@ -104,11 +86,9 @@ async def bootstrap_project_setup(
         return
 
     try:
-        summaries = await project_repo.fetch_upload_chunk_summaries(
-            pool,
+        summaries = await project_repo.fetch_upload_chunk_summaries_for_service(
             project_id,
             canonical_upload_ids,
-            limit=40,
         )
 
         await _set_status(
@@ -121,7 +101,7 @@ async def bootstrap_project_setup(
             upload_signature=upload_signature,
         )
 
-        base_intent = _coerce_intent(project.get("structured_intent"))
+        base_intent = parse_metadata(project.get("structured_intent"))
         doc_intent = await extract_document_intent(summaries) if summaries else {}
 
         await _set_status(
@@ -143,12 +123,12 @@ async def bootstrap_project_setup(
         if summaries:
             merged_intent["last_doc_refined_at"] = datetime.now(UTC).isoformat()
 
-        await project_repo.update_project_intent(pool, project_id, merged_intent)
+        await project_repo.update_project_intent_for_service(project_id, merged_intent)
 
         embedding_input = f"{project.get('description', '')}\n{json.dumps(merged_intent, sort_keys=True)}"
         vectors = await embed_texts([embedding_input])
         if vectors:
-            await project_repo.update_project_intent_embedding(pool, project_id, vectors[0])
+            await project_repo.update_project_intent_embedding_for_service(project_id, vectors[0])
 
         await _set_status(
             project_id,

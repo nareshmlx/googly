@@ -162,7 +162,7 @@ async def _ingest_tiktok(
             math.log1p(max(0, _as_int(video.get("likes")) + _as_int(video.get("views")))) / 20.0,
         )
 
-        recency_score = 0.4
+        recency_score = settings.INGEST_SOCIAL_RECENCY_FALLBACK_SCORE
         ts = video.get("create_time") or video.get("created_at")
         if ts:
             try:
@@ -174,9 +174,9 @@ async def _ingest_tiktok(
                     if video_dt.tzinfo is None:
                         video_dt = video_dt.replace(tzinfo=UTC)
                 days_old = max(0.0, (now_utc - video_dt).total_seconds() / 86400.0)
-                recency_score = math.exp(-days_old / 21.0)
+                recency_score = math.exp(-days_old / settings.INGEST_SOCIAL_RECENCY_DECAY_DAYS_TIKTOK)
             except Exception:
-                recency_score = 0.4
+                recency_score = settings.INGEST_SOCIAL_RECENCY_FALLBACK_SCORE
         scored.append((relevance_match, quality_score, engagement_score, recency_score, video))
 
     scored.sort(key=lambda item: (item[0], item[1], item[2], item[3]), reverse=True)

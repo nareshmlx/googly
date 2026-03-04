@@ -17,7 +17,6 @@ Called from ChatService. Yields SSE-formatted strings.
 """
 
 import asyncio
-import hashlib
 import json
 import math
 import re
@@ -33,6 +32,7 @@ from app.agents.patent import build_patent_agent
 from app.agents.project_relevance import build_project_relevance_agent
 from app.agents.query_enhancer import build_query_enhancer_agent
 from app.agents.synthesis import build_synthesis_agent
+from app.core.cache_keys import stable_hash
 from app.core.config import settings
 from app.core.dedup_papers import deduplicate_papers
 from app.core.metrics import (
@@ -41,6 +41,7 @@ from app.core.metrics import (
     research_deduplication_rate,
     research_tool_calls_total,
 )
+from app.core.normalize import coerce_int
 from app.core.paper_schema import normalize_paper_schema
 from app.core.query_policy import lexical_entity_coverage
 from app.core.redis import get_redis
@@ -100,21 +101,7 @@ def _get_patent_agent():
 
 def _safe_int(value: object) -> int:
     """Convert mixed numeric values (int/float/str) to int safely."""
-    if isinstance(value, bool) or value is None:
-        return 0
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value)
-    if isinstance(value, str):
-        cleaned = value.strip().replace(",", "")
-        if not cleaned:
-            return 0
-        try:
-            return int(float(cleaned))
-        except ValueError:
-            return 0
-    return 0
+    return coerce_int(value)
 
 
 def _extract_social_insights(kb_results: list[dict]) -> dict:
@@ -241,7 +228,9 @@ def _format_openalex_context(papers: list[dict]) -> str:
             source_header = f"[{title}]({citation_url}) (paper, {year})"
         elif paper_id:
             # OpenAlex ID format: https://openalex.org/W123456789
-            citation_url = f"https://openalex.org/{paper_id}" if not paper_id.startswith("http") else paper_id
+            citation_url = (
+                f"https://openalex.org/{paper_id}" if not paper_id.startswith("http") else paper_id
+            )
             source_header = f"[{title}]({citation_url}) (paper, {year})"
         else:
             source_header = f"[Source: {title} (paper, {year})]"
@@ -376,6 +365,134 @@ def _format_search_fallback_context(results: list[dict]) -> str:
     return "\n\n---\n\n".join(parts)
 
 
+def _format_kb_context(kb_results: list[dict]) -> str:
+    """
+    Format KB chunks into synthesis context blocks with clickable citation links.
+
+    Handles social media metadata and academic identifiers (DOI, PMID, arXiv).
+    Surfaces URLs to ensure the synthesis agent can cite specific sources.
+    """
+    if not kb_results:
+        return ""
+
+    context_parts = []
+    urls_found = 0
+    urls_missing = 0
+
+    for chunk in kb_results:
+        title = chunk.get("title") or "Untitled"
+        source = chunk.get("source", "unknown")
+        score = float(chunk.get("score", 0.0) or 0.0)
+        relevance = f"{score:.2f}"
+        metadata = chunk.get("metadata") or {}
+        content = str(chunk.get("content") or "")
+
+        if source in {
+            "social_instagram",
+            "social_tiktok",
+            "social_youtube",
+            "social_reddit",
+            "social_x",
+        }:
+            likes = _safe_int(metadata.get("like_count") or metadata.get("likes"))
+            views = _safe_int(metadata.get("view_count") or metadata.get("views"))
+            author = (
+                metadata.get("username")
+                or metadata.get("author_username")
+                or metadata.get("author")
+                or str(title).lstrip("@")
+            )
+            # Extract URL for social media sources — enables citations
+            social_url = (
+                metadata.get("url") or metadata.get("source_url") or metadata.get("link") or ""
+            ).strip()
+
+            if social_url:
+                urls_found += 1
+                # Format with clickable link for proper citation
+                source_header = f"[{title}]({social_url}) ({source}, relevance: {relevance})"
+                context_parts.append(
+                    f"{source_header}\nauthor={author} likes={likes} views={views}\n{content}"
+                )
+            else:
+                urls_missing += 1
+                # Fallback if no URL available
+                context_parts.append(
+                    f"[Source: {title} ({source}, relevance: {relevance})]\n"
+                    f"author={author} likes={likes} views={views}\n"
+                    f"{content}"
+                )
+        else:
+            # Surface any URL stored at ingest time so the synthesis agent can
+            # cite specific pages rather than falling back to homepage guesses.
+            doi = str(metadata.get("doi") or "").strip()
+            pmid = str(metadata.get("pmid") or "").strip()
+            arxiv_id = str(metadata.get("arxiv_id") or "").strip()
+            chunk_url = (
+                metadata.get("url") or metadata.get("source_url") or metadata.get("link") or ""
+            ).strip()
+
+            # Fallback: use open_access_url / pdf_url stored by OpenAlex ingest when
+            # the primary url field is empty (common for paywalled papers with no DOI URL).
+            if not chunk_url:
+                chunk_url = str(
+                    metadata.get("open_access_url") or metadata.get("pdf_url") or ""
+                ).strip()
+
+            # Fallback: use paper_id to construct a citation link.
+            # OpenAlex stores a full URL (https://openalex.org/W...) — use directly.
+            # Semantic Scholar stores a bare hash (paperId) — construct the SS paper URL.
+            if not doi and not chunk_url:
+                paper_id = str(metadata.get("paper_id") or "").strip()
+                if paper_id:
+                    if paper_id.startswith("http"):
+                        chunk_url = paper_id
+                    else:
+                        # Bare Semantic Scholar paperId — build the canonical paper URL
+                        chunk_url = f"https://www.semanticscholar.org/paper/{paper_id}"
+
+            # Prioritize clickable links for synthesis agent
+            if chunk_url:
+                final_url = chunk_url
+                urls_found += 1
+            elif doi:
+                if doi.startswith("http"):
+                    final_url = doi  # Already a full URL
+                else:
+                    final_url = f"https://doi.org/{doi.replace('https://doi.org/', '')}"
+                urls_found += 1
+            elif pmid:
+                final_url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+                urls_found += 1
+            elif arxiv_id:
+                final_url = f"https://arxiv.org/abs/{arxiv_id}"
+                urls_found += 1
+            else:
+                final_url = ""
+                urls_missing += 1
+
+            if final_url and title != "Untitled":
+                source_header = f"[{title}]({final_url}) ({source}, relevance: {relevance})"
+            elif final_url:
+                source_header = f"[{source}]({final_url}) (relevance: {relevance})"
+            elif title != "Untitled":
+                # No URL available - use plain text citation but still label clearly
+                source_header = f"[Source: {title} ({source}, relevance: {relevance})]"
+            else:
+                source_header = f"[Source: {source} (relevance: {relevance})]"
+            context_parts.append(f"{source_header}\n{content}")
+
+    # Log URL availability for debugging citation issues
+    logger.info(
+        "orchestrator.kb_context_formatted",
+        total_chunks=len(kb_results),
+        urls_found=urls_found,
+        urls_missing=urls_missing,
+    )
+
+    return "\n\n---\n\n".join(context_parts)
+
+
 def _asks_for_paper_list(query: str) -> bool:
     """Return True when user explicitly asks for papers/studies/literature results."""
     q = query.lower()
@@ -410,6 +527,21 @@ _PAPER_SUMMARY_STOPWORDS: set[str] = {
     "using",
     "with",
 }
+
+# Compiled once at module load — matches unambiguous "search the web" intent phrases.
+# Word boundaries (\b) prevent false positives on research phrases like
+# "recent studies" or "current treatment" that should still use KB.
+_FORCE_WEB_PATTERNS = re.compile(
+    r"\b("
+    r"search\s+(?:the\s+)?web"
+    r"|search\s+online"
+    r"|look\s+up\s+online"
+    r"|find\s+online"
+    r"|check\s+online"
+    r"|google\s+(?:for\s+)?\w+"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 def _paper_context_snippet(paper: dict, max_chars: int = 420) -> str:
@@ -492,11 +624,21 @@ def _format_openalex_paper_list_answer(query: str, papers: list[dict]) -> str:
         # `url` is a last-resort fallback — normalization should have already
         # promoted it into paper_id, but this guards against any missed edge case.
         url_fallback = str(paper.get("url") or "").strip()
-        link = doi or paper_id or url_fallback or "Link unavailable"
+
+        # Build a clean clickable link in markdown format
+        raw_link = doi or paper_id or url_fallback
+        if raw_link:
+            # Ensure DOI is a full URL
+            if raw_link and not raw_link.startswith("http"):
+                raw_link = f"https://doi.org/{raw_link}"
+            link_md = f"[{raw_link}]({raw_link})"
+        else:
+            link_md = "Link unavailable"
+
         citations = _safe_int(paper.get("cited_by_count"))
         context = _paper_context_snippet(paper)
-        lines.append(f"{idx}. {title} ({year})")
-        lines.append(f"   - {link}")
+        lines.append(f"{idx}. **{title}** ({year})")
+        lines.append(f"   - {link_md}")
         if citations > 0:
             lines.append(f"   - Context: {context} (Citations: {citations})")
         else:
@@ -619,7 +761,7 @@ async def _extract_intent(query: str) -> dict:
 
     # Normalise query for cache key (lowercase + strip whitespace)
     query_normalised = query.lower().strip()
-    cache_key = f"intent:{hashlib.sha256(query_normalised.encode()).hexdigest()}"
+    cache_key = f"intent:{stable_hash([query_normalised])}"
 
     # --- Cache read ---
     redis = None
@@ -810,6 +952,9 @@ async def run_query(
     # Include papers for all queries if OpenAlex is enabled — let relevance score
     # determine if they're shown. This allows papers/patents to be cited even for
     # non-research queries (e.g. "acne treatments" might have relevant dermatology papers).
+    # NOTE: KB_SCORE_THRESHOLD was intentionally lowered (0.70 → 0.40) alongside this
+    # change. Together they make KB + papers more inclusive. Monitor for context noise
+    # on non-research queries if answer quality degrades.
     exclude_papers = not openalex_enabled
 
     # Extract optional domain filter from intent (set when user names a specific
@@ -819,24 +964,9 @@ async def run_query(
     target_domain: str | None = intent.get("target_domain")
     include_domains: list[str] | None = [target_domain] if target_domain else None
 
-    # Detect explicit web search request (user wants fresh/live web results, not KB)
-    query_lower = cleaned_query.lower()
-    force_web_search = any(
-        phrase in query_lower
-        for phrase in [
-            "search web",
-            "search the web",
-            "google",
-            "search online",
-            "look up online",
-            "find online",
-            "check online",
-            "latest",
-            "recent",
-            "news about",
-            "current",
-        ]
-    )
+    # Detect explicit web search request (user wants fresh/live web results, not KB).
+    # _FORCE_WEB_PATTERNS is compiled at module level — see constant definition above.
+    force_web_search = bool(_FORCE_WEB_PATTERNS.search(cleaned_query))
 
     logger.info(
         "orchestrator.intent_and_relevance",
@@ -863,28 +993,10 @@ async def run_query(
     # If KB is empty, the fallback (Tavily, Exa, Perigon) will handle it.
     # This saves significant EnsembleData credits at runtime.
 
-    if query_type == "patent" and not target_domain:
-        # Route to PatentAgent for patent search
-        logger.info("orchestrator.routing_to_patent_agent", query=cleaned_query[:80])
-        try:
-            patent_agent = _get_patent_agent()
-            patent_result = await patent_agent.arun(cleaned_query)
-            patent_content = (
-                patent_result.content if patent_result and patent_result.content else ""
-            )
-
-            if patent_content:
-                # Stream the patent search result directly
-                yield f"data: {json.dumps({'token': patent_content})}\n\n"
-                yield "data: [DONE]\n\n"
-                logger.info("orchestrator.patent_agent_success", result_length=len(patent_content))
-                return
-            else:
-                logger.warning("orchestrator.patent_agent_empty_result")
-                # Fall through to normal KB flow
-        except Exception:
-            logger.exception("orchestrator.patent_agent_error")
-            # Fall through to normal KB flow on error
+    # NOTE: PatentAgent is NOT called here — patent queries flow through KB first,
+    # then web search fallback (Tavily/Exa/Perigon), exactly like all other queries.
+    # PatentAgent is only used as a last-resort fallback at Step 4 when both KB and
+    # web search return no context at all. See last-resort block below.
 
     # Step 3: KB retrieval + academic tools (research queries) started concurrently.
     #
@@ -943,7 +1055,10 @@ async def run_query(
     else:
         try:
             kb_results = await retrieve(
-                query=cleaned_query, project_ids=relevant_project_ids, exclude_papers=exclude_papers
+                query=cleaned_query,
+                project_ids=relevant_project_ids,
+                top_k=settings.KB_RETRIEVAL_TOP_K,
+                exclude_papers=exclude_papers,
             )
         except Exception:
             # Cancel academic_task before propagating — otherwise the pending Task is
@@ -1215,68 +1330,62 @@ async def run_query(
     social_insights = _extract_social_insights(kb_results or [])
     is_social_like_query = intent.get("query_type") in {"social", "trend"}
 
+    # Calculate context quality metrics once for logging and prompt
+    chunk_count = len(kb_results) if kb_results else 0
+    avg_score = 0.0
     if kb_results:
-        context_parts = []
-        for chunk in kb_results:
-            title = chunk.get("title") or "Untitled"
-            source = chunk.get("source", "unknown")
-            score = chunk.get("score", 0)
-            metadata = chunk.get("metadata") or {}
-            if source in {
-                "social_instagram",
-                "social_tiktok",
-                "social_youtube",
-                "social_reddit",
-                "social_x",
-            }:
-                likes = _safe_int(metadata.get("like_count") or metadata.get("likes"))
-                views = _safe_int(metadata.get("view_count") or metadata.get("views"))
-                author = (
-                    metadata.get("username")
-                    or metadata.get("author_username")
-                    or metadata.get("author")
-                    or str(title).lstrip("@")
-                )
-                # Extract URL for social media sources — enables citations
-                social_url = (
-                    metadata.get("url") or metadata.get("source_url") or metadata.get("link") or ""
-                ).strip()
+        scores = [float(c.get("score", 0.0) or 0.0) for c in kb_results]
+        avg_score = sum(scores) / len(scores) if scores else 0.0
+        min_score = min(scores) if scores else 0.0
+        max_score = max(scores) if scores else 0.0
 
-                if social_url:
-                    # Format with clickable link for proper citation
-                    source_header = f"[{title}]({social_url}) ({source}, relevance: {score:.2f})"
-                    context_parts.append(
-                        f"{source_header}\n"
-                        f"author={author} likes={likes} views={views}\n"
-                        f"{chunk['content']}"
-                    )
+        # Count source types for logging
+        source_counts: dict[str, int] = {}
+        # Check for URL availability in paper metadata
+        papers_with_doi = 0
+        papers_with_url = 0
+        papers_without_any_url = 0
+
+        for chunk in kb_results:
+            source = chunk.get("source", "unknown")
+            source_counts[source] = source_counts.get(source, 0) + 1
+
+            # Track URL availability for papers
+            if source == "paper":
+                metadata = chunk.get("metadata") or {}
+                doi = str(metadata.get("doi") or "").strip()
+                url = str(metadata.get("url") or "").strip()
+                paper_id = str(metadata.get("paper_id") or "").strip()
+                if doi:
+                    papers_with_doi += 1
+                elif url:
+                    papers_with_url += 1
+                elif paper_id:
+                    papers_with_url += 1  # paper_id can be used as fallback URL
                 else:
-                    # Fallback if no URL available
-                    context_parts.append(
-                        f"[Source: {title} ({source}, relevance: {score:.2f})]\n"
-                        f"author={author} likes={likes} views={views}\n"
-                        f"{chunk['content']}"
-                    )
-            else:
-                # Surface any URL stored at ingest time so the synthesis agent can
-                # cite specific pages rather than falling back to homepage guesses.
-                chunk_url = (
-                    metadata.get("url") or metadata.get("source_url") or metadata.get("link") or ""
-                ).strip()
-                if chunk_url and title != "Untitled":
-                    source_header = f"[{title}]({chunk_url}) ({source}, relevance: {score:.2f})"
-                elif chunk_url:
-                    source_header = f"[{source}]({chunk_url}) (relevance: {score:.2f})"
-                else:
-                    source_header = f"[Source: {title} ({source}, relevance: {score:.2f})]"
-                context_parts.append(f"{source_header}\n{chunk['content']}")
+                    papers_without_any_url += 1
+
+        logger.info(
+            "orchestrator.kb_hit",
+            chunk_count=chunk_count,
+            avg_score=round(avg_score, 3),
+            min_score=round(min_score, 3),
+            max_score=round(max_score, 3),
+            source_counts=source_counts,
+            papers_with_doi=papers_with_doi,
+            papers_with_url=papers_with_url,
+            papers_without_any_url=papers_without_any_url,
+        )
+
+    if kb_results:
+        context = _format_kb_context(kb_results)
         if openalex_papers:
-            context_parts.append(_format_openalex_context(openalex_papers))
-        context = "\n\n---\n\n".join(context_parts)
-        logger.info("orchestrator.kb_hit", chunk_count=len(kb_results))
+            context = f"{context}\n\n---\n\n{_format_openalex_context(openalex_papers)}"
     elif search_fallback_results:
-        # KB returned None (score < threshold) — use search fallback results
-        context = f"[Source: External Search Fallback]\n{search_fallback_results}"
+        # KB returned None (score < threshold) — use search fallback results.
+        # Each result already has its own [Title](url) header from _format_search_fallback_context;
+        # no outer wrapper label needed.
+        context = search_fallback_results
         logger.info(
             "orchestrator.search_fallback_context_used", result_length=len(search_fallback_results)
         )
@@ -1287,6 +1396,36 @@ async def run_query(
         context = ""
         logger.info("orchestrator.kb_miss_or_below_threshold")
 
+    # Step 4b: Last-resort PatentAgent — only for patent queries when KB and web search
+    # both returned no context. This keeps the happy path (KB → web search) unchanged
+    # and only pays the PatentsView API cost when we genuinely have no other evidence.
+    #
+    # PatentAgent output is fed into SynthesisAgent as context (not yielded directly)
+    # so citation formatting, inline links, and answer structure are consistent with
+    # all other query types. The patent tool already produces google_patents_url per result.
+    patent_context = ""
+    if not context and query_type == "patent" and not target_domain:
+        logger.info("orchestrator.patent_agent_last_resort", query=cleaned_query[:80])
+        try:
+            patent_agent = _get_patent_agent()
+            patent_result = await patent_agent.arun(cleaned_query)
+            patent_content = (
+                patent_result.content if patent_result and patent_result.content else ""
+            )
+            if patent_content:
+                # Wrap patent output as context so SynthesisAgent can cite it inline
+                patent_context = f"[Source: Patent Search Results]\n{patent_content}"
+                context = patent_context
+                logger.info(
+                    "orchestrator.patent_agent_last_resort_success",
+                    result_length=len(patent_content),
+                )
+            else:
+                logger.warning("orchestrator.patent_agent_last_resort_empty")
+        except Exception:
+            logger.exception("orchestrator.patent_agent_last_resort_error")
+            # Fall through to synthesis with empty context
+
     # Step 5: Build synthesis prompt
     if context:
         social_block = ""
@@ -1295,38 +1434,65 @@ async def run_query(
                 "Structured Social Insights (precomputed from retrieved social evidence):\n"
                 f"{json.dumps(social_insights, ensure_ascii=True)}\n\n"
             )
+
         # Build requirements dynamically — only instruct the LLM to include a section
         # when the underlying data actually exists, preventing hallucinated empty sections.
-        req_parts = ["1) Start with a concise answer tailored to the query."]
+        req_parts = [
+            "1) Write a comprehensive, multi-paragraph report that directly addresses the query. "
+            "Extract ALL specific data from the context: numbers, percentages, names, dates, "
+            "ratings, quotes, clinical findings, patent numbers, market figures. "
+            "Do NOT reduce any source to a one-sentence summary — include all substantive detail it contains.",
+        ]
         req_num = 2
+        req_parts.append(
+            f"{req_num}) CRITICAL — CITATIONS: Every factual claim MUST be cited inline using "
+            "[title](url) markdown format. Use only URLs that appear verbatim in the context — "
+            "never invent or guess a URL. If no URL is available, use [Source: title]."
+        )
+        req_num += 1
         if openalex_papers:
             req_parts.append(
-                f"{req_num}) Include a 'Latest Papers' section with 6-8 distinct papers. "
-                "For each paper include: title, publication year, and DOI or OpenAlex link."
+                f"{req_num}) Include a '## Latest Papers' section with 6–8 distinct papers. "
+                "For each paper include: title as a markdown link using its DOI or OpenAlex URL, "
+                "publication year, and a 1–2 sentence summary of its key finding."
             )
             req_num += 1
         if is_social_like_query or social_insights:
             req_parts.append(
-                f"{req_num}) Include a 'Social Insights' section grounded in the provided metrics."
+                f"{req_num}) Include a '## Social Insights' section grounded strictly in the "
+                "provided metrics — do not add general social media commentary."
             )
             req_num += 1
         req_parts.append(
-            "Cite sources inline using [title](url) markdown link format — "
-            "do not add a separate 'Evidence' section or a 'Confidence / Gaps' section."
+            f"{req_num}) Cite at least 3–4 distinct sources spread throughout the response, not "
+            "clustered only at the end."
+        )
+        req_num += 1
+        req_parts.append(
+            f"{req_num}) NO AI BLOAT: Do not write generic introductory paragraphs, "
+            "obvious background filler, or fluffy transitional sentences. "
+            "Every sentence must contain a specific sourced fact. Cut anything that does not."
         )
         if is_specific_query and must_match_terms:
+            req_num += 1
             req_parts.append(
-                "For specific-entity queries, prioritize evidence that explicitly mentions: "
+                f"{req_num}) Prioritize evidence that explicitly mentions: "
                 + ", ".join(must_match_terms)
                 + "."
             )
-        req_parts.append("Do not include irrelevant general information.")
 
         synthesis_prompt = (
             f"Research Query: {cleaned_query}\n\n"
             f"Domain: {intent.get('domain', 'general')}\n\n"
-            f"{social_block}"
-            f"Relevant Knowledge Base Context:\n{context}\n\n"
+            + (
+                f"Context Quality: You have {chunk_count} retrieved knowledge chunks with average "
+                f"relevance score {avg_score:.2f} (pre-filtered above threshold "
+                f">{settings.KB_SCORE_THRESHOLD}).\n\n"
+                if chunk_count > 0
+                else ""
+            )
+            + f"{social_block}"
+            f"Relevant Context:\n{context}\n\n"
             f"Response requirements:\n" + "\n".join(req_parts)
         )
     else:

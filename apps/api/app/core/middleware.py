@@ -32,12 +32,3 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
 
         response.headers["X-Request-ID"] = request_id
         return response
-
-
-async def log_error(request: Request, exc: Exception) -> None:
-    logger.exception(
-        "request.error",
-        method=request.method,
-        path=request.url.path,
-        error=str(exc),
-    )

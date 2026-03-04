@@ -6,36 +6,19 @@ refine_intent to detect domain shifts and update structured_intent.
 
 import base64
 import io
-import json
 from datetime import UTC, datetime
 
 import structlog
 
 from app.core.cache_invalidation import invalidate_project_caches
-from app.core.db import get_db_pool
 from app.core.redis import get_redis
+from app.core.utils import parse_metadata
 from app.kb.ingester import RawDocument, ingest_documents
 from app.kb.intent_extractor import refine_intent
+from app.repositories import knowledge as knowledge_repo
 from app.repositories import project as project_repo
 
 logger = structlog.get_logger(__name__)
-
-
-def _coerce_intent_mapping(value: object) -> dict:
-    """Normalize structured intent payload into a dictionary."""
-    if isinstance(value, dict):
-        return dict(value)
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return {}
-        try:
-            loaded = json.loads(text)
-        except json.JSONDecodeError:
-            return {}
-        return dict(loaded) if isinstance(loaded, dict) else {}
-    return {}
-
 
 def _extract_text_from_bytes(content_bytes: bytes, filename: str) -> str:
     """
@@ -148,41 +131,18 @@ async def ingest_document(
         await invalidate_project_caches(project_id)
 
         # Step 3: Refine intent — collect short summaries from the new chunks
-        pool = await get_db_pool()
-        async with pool.acquire() as conn:
-            await conn.execute("SELECT set_config('app.accessible_projects', $1, true)", project_id)
-            result = await conn.fetch(
-                """
-                WITH recent_chunks AS (
-                    SELECT content FROM knowledge_chunks
-                    WHERE project_id = $1::uuid AND source_id LIKE $2
-                    ORDER BY created_at DESC
-                    LIMIT 20
-                ),
-                chunk_count AS (
-                    SELECT COUNT(*) as total FROM knowledge_chunks
-                    WHERE project_id = $1::uuid
-                )
-                SELECT
-                    recent_chunks.content,
-                    chunk_count.total
-                FROM recent_chunks
-                CROSS JOIN chunk_count
-                """,
-                project_id,
-                f"{upload_id}%",
-            )
+        result = await knowledge_repo.get_chunks_for_document_for_service(project_id, upload_id)
         chunk_summaries = [row["content"][:200] for row in result]
         total = result[0]["total"] if result else 0
 
         if chunk_summaries:
-            project = await project_repo.fetch_project(pool, project_id, user_id)
+            project = await project_repo.fetch_project_for_service(project_id, user_id)
             if project:
-                existing_intent = _coerce_intent_mapping(project.get("structured_intent"))
+                existing_intent = parse_metadata(project.get("structured_intent"))
                 try:
                     refined = await refine_intent(existing_intent, chunk_summaries)
                     if refined != existing_intent:
-                        await project_repo.update_project_intent(pool, project_id, refined)
+                        await project_repo.update_project_intent_for_service(project_id, refined)
                         logger.info(
                             "ingest_document.intent_refined",
                             project_id=project_id,
@@ -196,8 +156,10 @@ async def ingest_document(
                     )
 
         # Step 4: Update kb_chunk_count
-        await project_repo.update_project_kb_stats(
-            pool, project_id, int(total or 0), datetime.now(UTC)
+        await project_repo.update_project_kb_stats_for_service(
+            project_id,
+            int(total or 0),
+            datetime.now(UTC),
         )
 
         logger.info(

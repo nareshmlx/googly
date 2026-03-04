@@ -82,9 +82,13 @@ async def _ingest_youtube(
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         for batch in results:
+            if isinstance(batch, asyncio.CancelledError):
+                raise
             if isinstance(batch, Exception):
                 logger.exception("ingest_youtube.batch_failed", project_id=project_id)
                 continue
+            if isinstance(batch, BaseException):
+                raise batch
             for row in batch:
                 source_id = str(
                     row.get("source_id") or row.get("video_id") or row.get("url") or ""
@@ -148,7 +152,7 @@ async def _ingest_youtube(
         quality_score = _content_quality_score(title, content)
         engagement_score = min(1.0, math.log1p(max(0, likes + views + comments)) / 20.0)
 
-        recency_score = 0.4
+        recency_score = settings.INGEST_SOCIAL_RECENCY_FALLBACK_SCORE
         published_raw = video.get("published_at")
         if published_raw:
             try:
@@ -157,9 +161,11 @@ async def _ingest_youtube(
                 if published_dt.tzinfo is None:
                     published_dt = published_dt.replace(tzinfo=UTC)
                 days_old = max(0.0, (now_utc - published_dt).total_seconds() / 86400.0)
-                recency_score = math.exp(-days_old / 21.0)
+                recency_score = math.exp(
+                    -days_old / settings.INGEST_SOCIAL_RECENCY_DECAY_DAYS_YOUTUBE
+                )
             except Exception:
-                recency_score = 0.4
+                recency_score = settings.INGEST_SOCIAL_RECENCY_FALLBACK_SCORE
 
         scored.append((relevance_match, quality_score, engagement_score, recency_score, video))
 
@@ -185,7 +191,15 @@ async def _ingest_youtube(
             comments = _as_int(video.get("comments"))
             quality_score = _content_quality_score(title, content)
             engagement_score = min(1.0, math.log1p(max(0, likes + views + comments)) / 20.0)
-            scored.append((0, quality_score, engagement_score, 0.4, video))
+            scored.append(
+                (
+                    0,
+                    quality_score,
+                    engagement_score,
+                    settings.INGEST_SOCIAL_RECENCY_FALLBACK_SCORE,
+                    video,
+                )
+            )
 
     scored.sort(key=lambda item: (item[0], item[1], item[2], item[3]), reverse=True)
 

@@ -1,5 +1,7 @@
 from enum import Enum
 
+EMBEDDING_DIM = 1536
+
 
 class DatabasePool:
     MIN_SIZE = 5
@@ -80,3 +82,35 @@ class KBUpload:
 
 class ProjectRefresh:
     VALID_STRATEGIES: frozenset[str] = frozenset({"once", "daily", "weekly", "on_demand"})
+
+
+class SourceType:
+    SOCIAL_TIKTOK = "social_tiktok"
+    SOCIAL_INSTAGRAM = "social_instagram"
+    SOCIAL_YOUTUBE = "social_youtube"
+    SOCIAL_REDDIT = "social_reddit"
+    SOCIAL_X = "social_x"
+    PAPER = "paper"
+    PATENT = "patent"
+    NEWS = "news"
+    SEARCH = "search"
+    UPLOAD = "upload"
+
+    SOCIAL_SOURCES: frozenset[str] = frozenset(
+        {
+            SOCIAL_TIKTOK,
+            SOCIAL_INSTAGRAM,
+            SOCIAL_YOUTUBE,
+            SOCIAL_REDDIT,
+            SOCIAL_X,
+        }
+    )
+    FULLTEXT_ELIGIBLE_SOURCES: frozenset[str] = frozenset({PAPER, PATENT})
+    DISCOVER_DIRECT_SOURCES: frozenset[str] = frozenset({PAPER, PATENT, NEWS, SEARCH})
+    DISCOVER_SOURCE_MAP: dict[str, str] = {
+        SOCIAL_TIKTOK: "tiktok",
+        SOCIAL_INSTAGRAM: "instagram",
+        SOCIAL_YOUTUBE: "youtube",
+        SOCIAL_REDDIT: "reddit",
+        SOCIAL_X: "x",
+    }

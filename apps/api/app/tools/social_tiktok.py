@@ -14,10 +14,11 @@ try/except so any SDK-level exception is caught and logged gracefully.
 """
 
 import asyncio
-import hashlib
 import json
+import os
 from typing import Literal
 
+import certifi
 import httpx
 import structlog
 
@@ -26,10 +27,19 @@ try:
 except ImportError:  # pragma: no cover - environment-dependent optional dependency
     EDClient = None  # type: ignore[assignment]
 
+from app.core.cache_keys import build_search_cache_key, build_stale_cache_key
 from app.core.config import settings
 
 logger = structlog.get_logger(__name__)
 _SDK_WARNED = False
+
+
+def _ensure_ssl_ca_bundle() -> None:
+    """Ensure a valid CA bundle path exists for SDK/httpx TLS verification."""
+    certifi_path = certifi.where()
+    if certifi_path and os.path.exists(certifi_path):
+        os.environ.setdefault("SSL_CERT_FILE", certifi_path)
+        os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi_path)
 
 
 def _sdk_available() -> bool:
@@ -122,6 +132,7 @@ def _fetch_hashtag_sync(tag: str) -> list[dict]:
     try:
         if not _sdk_available():
             return []
+        _ensure_ssl_ca_bundle()
         client = EDClient(token=settings.ENSEMBLE_API_TOKEN or "")
         result = client.tiktok.hashtag_search(hashtag=tag)
 
@@ -149,6 +160,7 @@ def _fetch_keyword_sync(
     try:
         if not _sdk_available():
             return []
+        _ensure_ssl_ca_bundle()
         client = EDClient(token=settings.ENSEMBLE_API_TOKEN or "")
         result = client.tiktok.keyword_search(
             keyword=query,
@@ -193,9 +205,12 @@ def _cache_key(
     project_id: str, hashtags: str, keyword_queries: list[str] | None, max_results: int
 ) -> str:
     """Generate a deterministic, project-scoped cache key for TikTok searches."""
-    kw_str = ",".join(sorted(keyword_queries)) if keyword_queries else ""
-    query_hash = hashlib.sha256(f"{hashtags}:{kw_str}:{max_results}".encode()).hexdigest()[:16]
-    return f"search:cache:{project_id}:social_tiktok:posts:{query_hash}"
+    return build_search_cache_key(
+        project_id=project_id,
+        provider="social_tiktok",
+        query_type="posts",
+        parts=[hashtags, sorted(keyword_queries or []), max_results],
+    )
 
 
 async def fetch_tiktok_posts(
@@ -211,7 +226,7 @@ async def fetch_tiktok_posts(
     """Fetch TikTok videos with project-scoped caching."""
     # Check cache first
     cache_key = _cache_key(project_id, hashtags, keyword_queries, max_results)
-    stale_key = f"{cache_key}:stale"
+    stale_key = build_stale_cache_key(cache_key)
     if redis:
         try:
             cached = await redis.get(cache_key)
@@ -368,6 +383,7 @@ async def _fetch_keyword_full_http(
     """
     if not settings.ENSEMBLE_API_TOKEN:
         return []
+    _ensure_ssl_ca_bundle()
 
     keyword = str(query or "").strip()
     if not keyword:

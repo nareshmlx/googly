@@ -11,7 +11,6 @@ use the same deterministic policy:
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
@@ -84,25 +83,6 @@ _DOMAIN_CONTEXT_TERMS: dict[str, list[str]] = {
     "fragrance": ["fragrance", "cosmetic", "consumer"],
     "haircare": ["haircare", "scalp", "cosmetic"],
 }
-
-
-@dataclass(frozen=True)
-class QueryPolicy:
-    """Normalized query policy used by tools, reranking, and fallback logic."""
-
-    original_query: str
-    normalized_query: str
-    must_match_terms: list[str]
-    optional_terms: list[str]
-    domain_terms: list[str]
-    query_type: str
-    query_specificity: str
-
-    @property
-    def is_specific(self) -> bool:
-        """Return True when the query should preserve exact user entities."""
-        return self.query_specificity == "specific" and bool(self.must_match_terms)
-
 
 def _tokenize(text: str) -> list[str]:
     """Tokenize into lowercase alphanumeric tokens."""

@@ -9,29 +9,26 @@ Plus plan: 4 req/sec, $0.011 per request (50k req/mo = $550).
 Integrated with production infrastructure: rate limiting, circuit breaker, caching, retry.
 """
 
-import hashlib
-import json
 import time
 from datetime import UTC, datetime, timedelta
 
 import httpx
 import structlog
 
-from app.core.cache import TwoTierCache
+from app.core.cache_keys import build_search_cache_key
 from app.core.circuit_breaker import call_with_circuit_breaker, perigon_breaker
 from app.core.config import settings
 from app.core.dedup import deduplicate_request
+from app.core.external_cache import cached_external_results
 from app.core.metrics import api_call_duration_seconds, api_calls_total
+from app.core.query_sanitize import sanitize_query
 from app.core.rate_limiter import perigon_limiter, rate_limited_call
-from app.core.redis import get_redis
 from app.core.retry import retry_with_backoff
 
 logger = structlog.get_logger(__name__)
 
 _PERIGON_BASE_URL = "https://api.goperigon.com/v1/all"
-_TIMEOUT = 15.0  # seconds
 _CATEGORIES = "Business,Tech,Lifestyle"
-_DAYS_LOOKBACK = 30
 
 
 def _build_perigon_query(
@@ -59,8 +56,12 @@ def _build_perigon_categories(domain_terms: list[str] | None) -> str:
 
 def _cache_key(project_id: str, query: str) -> str:
     """Generate deterministic project-scoped cache key for a query."""
-    query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()[:16]
-    return f"search:cache:{project_id}:perigon:news:{query_hash}"
+    return build_search_cache_key(
+        project_id=project_id,
+        provider="perigon",
+        query_type="news",
+        parts=[query],
+    )
 
 
 async def _search_with_retry(query: str, category: str) -> dict | None:
@@ -71,10 +72,10 @@ async def _search_with_retry(query: str, category: str) -> dict | None:
     Returns parsed JSON dict on success, None on any failure (per AGENTS.md Rule 4).
     """
     # Calculate date range (last 30 days)
-    from_date = (datetime.now(UTC) - timedelta(days=_DAYS_LOOKBACK)).isoformat()
+    from_date = (datetime.now(UTC) - timedelta(days=settings.PERIGON_DAYS_LOOKBACK)).isoformat()
 
     async def _fetch() -> dict:
-        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=settings.PERIGON_TIMEOUT_SECONDS) as client:
             response = await client.get(
                 _PERIGON_BASE_URL,
                 params={
@@ -126,7 +127,7 @@ async def _search_impl(query: str, category: str) -> list[dict]:
         api_calls_total.labels(api_name="perigon", status="timeout").inc()
         logger.warning(
             "news_perigon.timeout",
-            timeout=_TIMEOUT,
+            timeout=settings.PERIGON_TIMEOUT_SECONDS,
             query_preview=query[:80],
         )
         return []
@@ -184,43 +185,16 @@ async def _search_perigon_impl(
     Internal implementation (called by dedup layer).
     Handles cache check, API call, and cache write with stale fallback.
     """
-    redis_client = await get_redis()
-    cache = TwoTierCache(redis_client)
-
-    # 1. Primary Cache Check (Fresh result)
-    cached = await cache.get(cache_key)
-    if cached is not None:
-        return cached.get("results", [])
-
-    # 2. Fetch from API
     async def _fetch_impl() -> list[dict]:
         return await _search_impl(query, category)
 
-    result = await call_with_circuit_breaker(perigon_breaker, _fetch_impl)
-
-    # 3. Success -> Cache and Return
-    if result:
-        await cache.set(cache_key, {"results": result}, ttl=settings.CACHE_TTL_NEWS)
-        # Store a "stale" copy that lasts longer (Win #4 in analysis report)
-        stale_key = f"{cache_key}:stale"
-        await redis_client.setex(
-            stale_key, settings.CACHE_TTL_STALE, json.dumps({"results": result})
-        )
-        return result
-
-    # 4. Failure/Empty -> Serve Stale Fallback
-    stale_key = f"{cache_key}:stale"
-    stale_raw = await redis_client.get(stale_key)
-    if stale_raw:
-        logger.warning(
-            "news_perigon.api_failed.serving_stale", project_id=project_id, query=query[:50]
-        )
-        try:
-            return json.loads(stale_raw).get("results", [])
-        except json.JSONDecodeError:
-            pass
-
-    return []
+    return await cached_external_results(
+        cache_key=cache_key,
+        fetch_fn=lambda: call_with_circuit_breaker(perigon_breaker, _fetch_impl),
+        ttl=settings.CACHE_TTL_NEWS,
+        stale_event="news_perigon.api_failed.serving_stale",
+        stale_context={"project_id": project_id, "query": query[:50]},
+    )
 
 
 async def search_perigon(
@@ -266,13 +240,15 @@ async def search_perigon(
         return []
 
     # Sanitize query
-    query = query.strip()
-    if not query:
-        logger.warning("news_perigon.empty_query")
+    sanitized_query = sanitize_query(
+        query,
+        logger=logger,
+        empty_event="news_perigon.empty_query",
+        too_long_event="news_perigon.query_too_long",
+    )
+    if sanitized_query is None:
         return []
-    if len(query) > 1000:
-        logger.warning("news_perigon.query_too_long", original_length=len(query))
-        query = query[:1000]
+    query = sanitized_query
 
     effective_query = _build_perigon_query(query, must_match_terms, domain_terms)
     category = _build_perigon_categories(domain_terms)

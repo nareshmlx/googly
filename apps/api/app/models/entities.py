@@ -23,6 +23,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import relationship
 
+from app.core.constants import EMBEDDING_DIM
 from app.core.db import Base
 
 
@@ -66,9 +67,9 @@ class Project(Base):
     perigon_enabled = Column(Boolean, nullable=False, server_default="true")
     tavily_enabled = Column(Boolean, nullable=False, server_default="true")
     exa_enabled = Column(Boolean, nullable=False, server_default="true")
-    metadata = Column(JSONB, nullable=False, server_default="{}")
+    metadata_ = Column("metadata", JSONB, nullable=False, server_default="{}")
     patents_enabled = Column(Boolean, nullable=False, server_default="true")
-    intent_embedding = Column(Vector(dim=1536), nullable=True)  # type: ignore[var-annotated]
+    intent_embedding = Column(Vector(dim=EMBEDDING_DIM), nullable=True)  # type: ignore[var-annotated]
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False)
     updated_at = Column(
         DateTime(timezone=True),
@@ -78,6 +79,9 @@ class Project(Base):
     )
 
     user = relationship("User", back_populates="projects", foreign_keys=[user_id], viewonly=True)
+    knowledge_documents = relationship(
+        "KnowledgeDocument", back_populates="project", cascade="all, delete-orphan"
+    )
     knowledge_chunks = relationship(
         "KnowledgeChunk", back_populates="project", cascade="all, delete-orphan"
     )
@@ -97,15 +101,45 @@ class Project(Base):
     )
 
 
+class KnowledgeDocument(Base):
+    """
+    Metadata-only row representing a single logical paper/article/post.
+    One document can have many knowledge_chunks (abstract + fulltext splits).
+    """
+
+    __tablename__ = "knowledge_documents"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+    project_id = Column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id = Column(Text, nullable=False)
+    source = Column(String(50), nullable=False)  # upload|news|paper|patent|social|search
+    source_id = Column(Text, nullable=False)
+    title = Column(Text, nullable=False, server_default="")
+    summary = Column(Text, nullable=True)
+    metadata_ = Column("metadata", JSONB, nullable=False, server_default="{}")
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        nullable=False,
+    )
+
+    project = relationship("Project", back_populates="knowledge_documents")
+    chunks = relationship("KnowledgeChunk", back_populates="document", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        UniqueConstraint("project_id", "source", "source_id", name="uq_kd_project_source_id"),
+        Index("ix_kd_project_id", "project_id"),
+        Index("ix_kd_source_id", "source_id"),
+    )
+
+
 class KnowledgeChunk(Base):
     """
-    Stores one text chunk + its vector embedding per project.
-
-    `user_id` is denormalized here (also on projects) for fast cross-project queries
-    without an extra join. `source` tracks where the chunk came from so we can
-    deduplicate by (project_id, source, source_id) and expire news/social chunks.
-    `embedding` is declared as Text here so SQLAlchemy can manage the model —
-    the actual vector(1536) DDL is handled in the migration via raw ALTER TABLE.
+    Stores one text chunk + its vector embedding per document.
     """
 
     __tablename__ = "knowledge_chunks"
@@ -114,22 +148,26 @@ class KnowledgeChunk(Base):
     project_id = Column(
         UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
     )
-    # user_id denormalized as TEXT — Clerk IDs are not UUIDs (migration 002)
+    document_id = Column(
+        UUID(as_uuid=True), ForeignKey("knowledge_documents.id", ondelete="CASCADE"), nullable=True
+    )
+    # user_id denormalized as TEXT
     user_id = Column(Text, nullable=False)
-    source = Column(String(50), nullable=False)  # upload|news|paper|patent|social|search
-    source_id = Column(Text, nullable=True)
+    source = Column(String(50), nullable=False)
+    source_id = Column(Text, nullable=True)  # Legacy (kept for migration)
     title = Column(Text, nullable=True)
     content = Column(Text, nullable=False)
-    # embedding stored as vector(1536) in DB; ORM uses Text to avoid pgvector type registration
     metadata_ = Column("metadata", JSONB, nullable=False, server_default="{}")
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False)
     expires_at = Column(DateTime(timezone=True), nullable=True)
 
     project = relationship("Project", back_populates="knowledge_chunks")
+    document = relationship("KnowledgeDocument", back_populates="chunks")
 
     __table_args__ = (
         UniqueConstraint("project_id", "source", "source_id", name="uq_kc_project_source"),
         Index("ix_kc_project_id", "project_id"),
+        Index("ix_kc_document_id", "document_id"),
         Index("ix_kc_user_id", "user_id"),
     )
 
@@ -191,7 +229,7 @@ class KnowledgeSourceAsset(Base):
     last_attempt_at = Column(DateTime(timezone=True), nullable=True)
     extracted_chars = Column(Integer, nullable=False, server_default="0")
     extracted_pages = Column(Integer, nullable=False, server_default="0")
-    metadata = Column(JSONB, nullable=False, server_default="{}")
+    metadata_ = Column("metadata", JSONB, nullable=False, server_default="{}")
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False)
     updated_at = Column(
         DateTime(timezone=True),

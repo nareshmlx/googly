@@ -5,9 +5,7 @@ user_id comes from X-User-ID header (set by APIM in production, passed directly 
 arq_pool is injected via FastAPI dependency so it can be mocked in tests.
 """
 
-import json
 from datetime import datetime
-from typing import Literal, cast
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException
@@ -16,6 +14,7 @@ from app.api.ownership import require_owned_project
 from app.core.arq import get_arq_pool
 from app.core.auth import get_current_user, verify_internal_token
 from app.core.constants import ProjectRefresh
+from app.core.utils import parse_metadata
 from app.models.schemas import (
     DiscoverItem,
     IngestStatusResponse,
@@ -25,6 +24,7 @@ from app.models.schemas import (
     ProjectSetupStatusResponse,
 )
 from app.services import project as project_service
+from app.services import project_discover
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(dependencies=[Depends(verify_internal_token)])
@@ -43,17 +43,7 @@ async def _run_service_call(action: str, detail: str, coro):
 
 def _serialize_project(p: dict) -> ProjectResponse:
     """Convert asyncpg row dict to ProjectResponse — handles datetime serialisation."""
-    structured_intent_raw = p.get("structured_intent")
-    if isinstance(structured_intent_raw, dict):
-        structured_intent = structured_intent_raw
-    elif isinstance(structured_intent_raw, str):
-        try:
-            parsed_intent = json.loads(structured_intent_raw)
-            structured_intent = parsed_intent if isinstance(parsed_intent, dict) else {}
-        except json.JSONDecodeError:
-            structured_intent = {}
-    else:
-        structured_intent = {}
+    structured_intent = parse_metadata(p.get("structured_intent"))
 
     created_at_raw = p.get("created_at")
     if isinstance(created_at_raw, datetime):
@@ -84,123 +74,6 @@ def _serialize_project(p: dict) -> ProjectResponse:
         if p.get("last_refreshed_at")
         else None,
         created_at=created_at,
-    )
-
-
-def _row_to_discover_item(row: dict) -> DiscoverItem | None:
-    """Map a DB row into the unified DiscoverItem response schema.
-
-    Returns None for unsupported source types.
-    """
-    raw_source = str(row.get("source") or "search")
-    source: Literal[
-        "tiktok",
-        "instagram",
-        "youtube",
-        "reddit",
-        "x",
-        "paper",
-        "patent",
-        "news",
-        "search",
-    ] | None = (
-        "tiktok"
-        if raw_source == "social_tiktok"
-        else "instagram"
-        if raw_source == "social_instagram"
-        else "youtube"
-        if raw_source == "social_youtube"
-        else "reddit"
-        if raw_source == "social_reddit"
-        else "x"
-        if raw_source == "social_x"
-        else None
-    )
-    if raw_source in {"paper", "patent", "news", "search"}:
-        source = cast(
-            Literal[
-                "tiktok",
-                "instagram",
-                "youtube",
-                "reddit",
-                "x",
-                "paper",
-                "patent",
-                "news",
-                "search",
-            ],
-            raw_source,
-        )
-    if source is None:
-        logger.warning("projects.discover.unsupported_source", source=raw_source)
-        return None
-
-    metadata_raw = row.get("metadata")
-    metadata: dict
-    if isinstance(metadata_raw, dict):
-        metadata = metadata_raw
-    elif isinstance(metadata_raw, str):
-        try:
-            parsed_meta = json.loads(metadata_raw)
-            metadata = parsed_meta if isinstance(parsed_meta, dict) else {}
-        except json.JSONDecodeError:
-            metadata = {}
-    else:
-        metadata = {}
-
-    title = str(
-        row.get("title")
-        or metadata.get("title")
-        or metadata.get("author")
-        or metadata.get("byline")
-        or "Untitled"
-    )
-
-    url_raw = metadata.get("url") or metadata.get("doi") or row.get("url")
-    url = str(url_raw) if url_raw else None
-
-    row_created_at = row.get("created_at")
-    if isinstance(row_created_at, datetime):
-        created_at_str = row_created_at.isoformat()
-    elif row_created_at is not None:
-        created_at_str = str(row_created_at)
-    else:
-        created_at_str = None
-
-    published_raw = (
-        metadata.get("published_at")
-        or metadata.get("pubDate")
-        or metadata.get("year")
-        or row.get("published_at")
-        or created_at_str
-    )
-    published_at = str(published_raw) if published_raw else None
-
-    summary_raw = row.get("summary") or row.get("content") or metadata.get("summary") or ""
-
-    score_raw = row.get("score")
-    try:
-        score = float(score_raw) if score_raw is not None else 0.0
-    except (TypeError, ValueError):
-        score = 0.0
-
-    cover_raw = metadata.get("cover_url") or metadata.get("thumbnail_url")
-    cover_url = str(cover_raw) if cover_raw else None
-
-    author_raw = metadata.get("author") or metadata.get("byline")
-    author = str(author_raw) if author_raw else None
-
-    return DiscoverItem(
-        source=source,
-        item_id=str(row.get("item_id") or row.get("id") or row.get("source_id") or ""),
-        title=title,
-        summary=str(summary_raw)[:500],
-        url=url,
-        cover_url=cover_url,
-        author=author,
-        published_at=published_at,
-        score=score,
-        metadata=metadata,
     )
 
 
@@ -309,7 +182,7 @@ async def get_discover_feed(
 
     items: list[DiscoverItem] = []
     for row in rows:
-        item = _row_to_discover_item(row)
+        item = project_discover.row_to_discover_item(row)
         if item is not None:
             items.append(item)
     return items

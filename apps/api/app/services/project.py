@@ -9,7 +9,6 @@ import asyncio
 import json
 import re
 from datetime import UTC, datetime
-from hashlib import sha256
 
 import structlog
 from arq import ArqRedis
@@ -17,13 +16,13 @@ from arq.jobs import deserialize_result
 
 from app.core.config import settings
 from app.core.constants import RedisKeys, RedisTTL
-from app.core.db import get_db_pool
-from app.core.openai_client import get_openai_client
 from app.core.redis import get_redis
+from app.core.utils import build_stable_signature, parse_metadata
 from app.kb.embedder import embed_texts
 from app.kb.intent_extractor import extract_intent
 from app.repositories import project as project_repo
 from app.repositories import source_asset as source_asset_repo
+from app.tools.llm import expand_project_description
 
 logger = structlog.get_logger(__name__)
 
@@ -84,14 +83,11 @@ async def get_project_ingest_status(project_id: str) -> dict:
         redis_client = await get_redis()
         raw = await redis_client.get(status_key)
         if raw:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                redis_payload = parsed
+            redis_payload = parse_metadata(raw)
     except Exception:
         logger.warning("project_service.ingest_status_get_failed", project_id=project_id)
 
-    pool = await get_db_pool()
-    row = await project_repo.fetch_project_by_id(pool, project_id)
+    row = await project_repo.fetch_project_by_id_for_service(project_id)
     if not row:
         return {
             "project_id": project_id,
@@ -103,15 +99,10 @@ async def get_project_ingest_status(project_id: str) -> dict:
     kb_chunk_count = int(row.get("kb_chunk_count") or 0)
     refreshed = row.get("last_refreshed_at")
     refreshed_at = refreshed.isoformat() if refreshed else None
-    enrichment = await source_asset_repo.fetch_project_enrichment_counts(pool, project_id)
+    enrichment = await source_asset_repo.fetch_project_enrichment_counts_for_service(project_id)
 
     if redis_payload:
-        if kb_chunk_count > 0 and redis_payload.get("status") in {"queued", "running", "empty"}:
-            redis_payload["status"] = "ready"
-            redis_payload["total_chunks"] = kb_chunk_count
-            redis_payload["finished_at"] = refreshed_at or redis_payload.get("finished_at")
-            redis_payload["message"] = "Ingestion complete."
-        elif (
+        if (
             redis_payload.get("status") in {"queued", "running"}
             and redis_client is not None
             and str(redis_payload.get("job_id") or "").strip()
@@ -156,6 +147,22 @@ async def get_project_ingest_status(project_id: str) -> dict:
                     "project_service.ingest_status_arq_result_check_failed",
                     project_id=project_id,
                 )
+
+        pending_enrichment = int(enrichment.get("pending") or 0)
+        if pending_enrichment > 0 and redis_payload.get("status") in {"ready", "empty"}:
+            redis_payload["status"] = "running"
+            redis_payload["message"] = (
+                f"Main ingestion complete. Fulltext enrichment in progress ({pending_enrichment} pending)."
+            )
+
+        if (
+            redis_payload.get("status") in {"ready", "empty"}
+            and not redis_payload.get("total_chunks")
+            and kb_chunk_count > 0
+        ):
+            redis_payload["total_chunks"] = kb_chunk_count
+            redis_payload["finished_at"] = refreshed_at or redis_payload.get("finished_at")
+
         redis_payload.setdefault("project_id", project_id)
         redis_payload.setdefault("source_counts", {})
         redis_payload.setdefault("source_diagnostics", {})
@@ -188,10 +195,7 @@ def _canonicalize_upload_ids(upload_ids: list[str] | None) -> list[str]:
 
 def _upload_signature(upload_ids: list[str]) -> str:
     """Compute stable signature for idempotent bootstrap runs."""
-    if not upload_ids:
-        return ""
-    payload = "|".join(upload_ids)
-    return sha256(payload.encode("utf-8")).hexdigest()
+    return build_stable_signature(upload_ids)
 
 
 async def set_project_setup_status(
@@ -228,8 +232,7 @@ async def set_project_setup_status(
         logger.warning("project_service.setup_status_set_redis_failed", project_id=project_id)
 
     try:
-        pool = await get_db_pool()
-        await project_repo.update_project_setup_status_metadata(pool, project_id, payload)
+        await project_repo.update_project_setup_status_metadata_for_service(project_id, payload)
     except Exception:
         logger.warning("project_service.setup_status_set_metadata_failed", project_id=project_id)
     return payload
@@ -241,15 +244,12 @@ async def get_project_setup_status(project_id: str) -> dict:
         redis = await get_redis()
         raw = await redis.get(RedisKeys.PROJECT_SETUP_STATUS.format(project_id=project_id))
         if raw:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                return parsed
+            return parse_metadata(raw)
     except Exception:
         logger.warning("project_service.setup_status_get_redis_failed", project_id=project_id)
 
     try:
-        pool = await get_db_pool()
-        row = await project_repo.fetch_project_by_id(pool, project_id)
+        row = await project_repo.fetch_project_by_id_for_service(project_id)
         if not row:
             return {
                 "project_id": project_id,
@@ -261,13 +261,8 @@ async def get_project_setup_status(project_id: str) -> dict:
                 "upload_signature": "",
                 "job_id": None,
             }
-        metadata = row.get("metadata") or {}
-        if isinstance(metadata, str):
-            try:
-                metadata = json.loads(metadata)
-            except json.JSONDecodeError:
-                metadata = {}
-        setup = metadata.get("setup_status") if isinstance(metadata, dict) else None
+        metadata = parse_metadata(row.get("metadata"))
+        setup = metadata.get("setup_status")
         if isinstance(setup, dict):
             return setup
     except Exception:
@@ -328,48 +323,15 @@ async def _expand_description(description: str) -> str:
     Returns the original description when expansion fails, so project creation
     remains resilient.
     """
-    client = get_openai_client()
-
-    try:
-        response = await client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Expand short project descriptions into 2-3 rich sentences "
-                        "for research intent extraction. Include domain context, "
-                        "core topics, and likely information needs. Output only the "
-                        "expanded description."
-                    ),
-                },
-                {"role": "user", "content": description},
-            ],
-            max_tokens=200,
-            temperature=0.3,
-        )
-        expanded = (response.choices[0].message.content or "").strip()
-
-        if not expanded:
-            logger.warning(
-                "project_service.expand_description.empty_response",
-                description_len=len(description),
-            )
-            return description
-
-        logger.info(
-            "project_service.expand_description.success",
-            description_len=len(description),
-            expanded_len=len(expanded),
-        )
-        return expanded
-    except Exception as exc:
-        logger.warning(
-            "project_service.expand_description.failed",
-            description_preview=description[:80],
-            error=str(exc),
-        )
+    expanded = await expand_project_description(description)
+    if not expanded:
         return description
+    logger.info(
+        "project_service.expand_description.success",
+        description_len=len(description),
+        expanded_len=len(expanded),
+    )
+    return expanded
 
 
 async def create_project(
@@ -400,16 +362,13 @@ async def create_project(
     Enqueueing ingest_project is fire-and-forget: the worker runs after this
     returns. Project creation does not wait for KB population.
     """
-    pool = await get_db_pool()
-
     logger.info("project_service.create.start", user_id=user_id, title=title)
 
     if openalex_enabled is not None:
         papers_enabled = openalex_enabled
 
     # 1. Insert with empty intent first — get a real project_id
-    project = await project_repo.insert_project(
-        pool,
+    project = await project_repo.insert_project_for_service(
         user_id,
         title,
         description,
@@ -481,14 +440,14 @@ async def create_project(
     )
 
     # 3. Store intent
-    await project_repo.update_project_intent(pool, project_id, intent)
+    await project_repo.update_project_intent_for_service(project_id, intent)
     project["structured_intent"] = intent
 
     embedding_input = f"{expanded}\n{json.dumps(intent, sort_keys=True)}"
     try:
         vectors = await embed_texts([embedding_input])
         if vectors:
-            await project_repo.update_project_intent_embedding(pool, project_id, vectors[0])
+            await project_repo.update_project_intent_embedding_for_service(project_id, vectors[0])
             logger.info(
                 "project_service.create.intent_embedding_stored",
                 project_id=project_id,
@@ -525,8 +484,7 @@ async def create_project(
 
 async def list_projects(user_id: str) -> list[dict]:
     """Return all projects for a user, newest first."""
-    pool = await get_db_pool()
-    return await project_repo.list_projects(pool, user_id)
+    return await project_repo.list_projects_for_service(user_id)
 
 
 async def get_project(project_id: str, user_id: str) -> dict | None:
@@ -536,8 +494,7 @@ async def get_project(project_id: str, user_id: str) -> dict | None:
     Returns None if the project does not exist or the user does not own it.
     Caller is responsible for returning 404.
     """
-    pool = await get_db_pool()
-    return await project_repo.fetch_project(pool, project_id, user_id)
+    return await project_repo.fetch_project_for_service(project_id, user_id)
 
 
 async def get_discover_feed(project_id: str) -> list[dict]:
@@ -545,8 +502,7 @@ async def get_discover_feed(project_id: str) -> list[dict]:
 
     Returns an empty list when no content has been ingested yet.
     """
-    pool = await get_db_pool()
-    rows = await project_repo.fetch_discover_feed(pool, project_id)
+    rows = await project_repo.fetch_discover_feed_for_service(project_id)
     logger.info(
         "project_service.discover_feed.fetched",
         project_id=project_id,
@@ -570,8 +526,7 @@ async def delete_project(project_id: str, user_id: str) -> bool:
 
     Returns True if deleted, False if not found / not owned.
     """
-    pool = await get_db_pool()
-    deleted = await project_repo.delete_project(pool, project_id, user_id)
+    deleted = await project_repo.delete_project_for_service(project_id, user_id)
     if deleted:
         logger.info("project_service.deleted", project_id=project_id, user_id=user_id)
         await _invalidate_projects_summary_cache(user_id)

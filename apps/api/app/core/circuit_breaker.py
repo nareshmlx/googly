@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from contextlib import suppress
 from datetime import UTC, datetime
 from typing import Any
 
@@ -288,6 +289,11 @@ lens_breaker = create_circuit_breaker("lens")
 # === Safe Call Wrapper (Returns [] on circuit open or failure) ===
 
 
+def _raise_error(exc: Exception) -> None:
+    """Raise an exception from a sync context for breaker failure accounting."""
+    raise exc
+
+
 async def call_with_circuit_breaker(
     breaker: CircuitBreaker,
     func: Callable,
@@ -324,10 +330,8 @@ async def call_with_circuit_breaker(
             # We pass a sync wrapper to breaker.call() in a thread
             result = await func(*args, **kwargs)
             # Notify pybreaker of success by calling a no-op through the breaker
-            try:
+            with suppress(Exception):
                 await asyncio.to_thread(breaker.call, lambda: None)
-            except Exception:
-                pass  # Don't fail on breaker bookkeeping errors
             return result
         else:
             # If function is sync, call it through the breaker directly
@@ -339,6 +343,10 @@ async def call_with_circuit_breaker(
         logger.warning("circuit_breaker.open_rejected", api_name=breaker.name)
         return []
     except Exception as exc:
+        # For async functions, manually record failure since execution bypasses breaker.call().
+        if asyncio.iscoroutinefunction(func):
+            with suppress(Exception):
+                await asyncio.to_thread(breaker.call, _raise_error, exc)
         logger.error(
             "circuit_breaker.function_error",
             api_name=breaker.name,

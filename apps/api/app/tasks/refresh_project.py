@@ -6,7 +6,7 @@ run is fetched. Avoids re-ingesting already-stored content.
 
 import structlog
 
-from app.core.db import get_db_pool
+from app.repositories import project as project_repo
 from app.tasks.ingest_project import _run_ingestion
 
 logger = structlog.get_logger(__name__)
@@ -24,18 +24,11 @@ async def refresh_project(
     Delegates to ingest_project._run_ingestion with oldest_timestamp set.
     """
     if oldest_timestamp is None:
-        pool = await get_db_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT last_refreshed_at FROM projects WHERE id = $1::uuid",
-                project_id,
-            )
-
-        if not row:
+        last_refreshed = await project_repo.get_project_last_refreshed_for_service(project_id)
+        if last_refreshed is None and not await project_repo.project_exists_for_service(project_id):
             logger.warning("refresh_project.not_found", project_id=project_id)
             return
 
-        last_refreshed = row["last_refreshed_at"]
         oldest_timestamp = int(last_refreshed.timestamp()) if last_refreshed else None
 
     logger.info(
@@ -54,19 +47,7 @@ async def refresh_due_projects(ctx: dict) -> None:
     Runs every 6 hours. Projects with refresh_strategy='once' or 'on_demand'
     are never touched by this cron.
     """
-    pool = await get_db_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT id::text, last_refreshed_at FROM projects
-            WHERE
-                (refresh_strategy = 'daily'
-                 AND (last_refreshed_at IS NULL OR last_refreshed_at < NOW() - INTERVAL '1 day'))
-            OR
-                (refresh_strategy = 'weekly'
-                 AND (last_refreshed_at IS NULL OR last_refreshed_at < NOW() - INTERVAL '7 days'))
-            """
-        )
+    rows = await project_repo.get_projects_due_for_refresh_for_service()
 
     projects = [
         {

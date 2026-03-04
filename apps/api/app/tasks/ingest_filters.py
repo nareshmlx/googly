@@ -7,12 +7,12 @@ import structlog
 
 from app.core.config import settings
 from app.kb.embedder import embed_texts
-from app.services.llm import chat_completion
 from app.tasks.ingest_utils import (
     _relevance_item_text,
     _required_must_match_count,
     _tokenize,
 )
+from app.tools.llm import chat_completion
 
 logger = structlog.get_logger(__name__)
 
@@ -56,6 +56,26 @@ async def _filter_relevance(
         "social_x",
         "social_reddit",
     ):
+        strict_terms = set(must_match_terms or social_match_terms or [])
+        if strict_terms:
+            required_count = _required_must_match_count(strict_terms)
+            strict_kept = []
+            for item in candidates:
+                tokens = _tokenize(_relevance_item_text(item))
+                matches = sum(1 for term in strict_terms if term in tokens)
+                if matches >= required_count:
+                    strict_kept.append(item)
+            logger.info(
+                "filter_social.strict_term_gate",
+                source=source,
+                candidates=len(candidates),
+                kept=len(strict_kept),
+                filtered_out=len(candidates) - len(strict_kept),
+                required_count=required_count,
+                terms_count=len(strict_terms),
+            )
+            return strict_kept
+
         return await _filter_stage2_llm_social(
             candidates,
             intent_text=intent_text,
@@ -102,9 +122,9 @@ async def _filter_stage1_embedding(
         if not scores:
             return items
 
-        # Drop bottom 20% (keep top 80%) - reduced from 40% for better recall
+        # Drop bottom 40% (keep top 60%) to enforce stricter stage-1 pruning.
         scores.sort(key=lambda x: x[0], reverse=True)
-        keep_count = max(1, int(len(scores) * 0.8))
+        keep_count = max(1, int(len(scores) * settings.INGEST_FILTER_STAGE1_KEEP_RATIO))
         kept = [it for _, it in scores[:keep_count]]
 
         logger.info(

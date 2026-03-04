@@ -4,8 +4,19 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from typing import TypeVar
 
 import asyncpg
+
+from app.core.db import get_db_pool
+
+T = TypeVar("T")
+
+
+async def _with_service_pool(fn, *args, **kwargs) -> T:
+    """Execute a pool-injected repository function using the shared DB pool."""
+    pool = await get_db_pool()
+    return await fn(pool, *args, **kwargs)
 
 
 async def upsert_source_asset(
@@ -40,9 +51,18 @@ async def upsert_source_asset(
             ON CONFLICT (project_id, source, source_id, canonical_url)
             DO UPDATE SET
                 resolved_url = EXCLUDED.resolved_url,
-                source_url = EXCLUDED.source_url,
-                title = EXCLUDED.title,
-                updated_at = EXCLUDED.updated_at
+                source_url   = EXCLUDED.source_url,
+                title        = EXCLUDED.title,
+                -- Reset fetch lifecycle so re-ingested assets get a fresh attempt.
+                -- Without this, an exhausted row (attempt_count >= max) would be
+                -- immediately marked attempts_exhausted again on the next ingest run.
+                fetch_status    = 'pending',
+                extract_status  = 'pending',
+                attempt_count   = 0,
+                error_code      = NULL,
+                error_message   = NULL,
+                next_attempt_at = NULL,
+                updated_at      = EXCLUDED.updated_at
             RETURNING id::text
             """,
             project_id,
@@ -57,6 +77,33 @@ async def upsert_source_asset(
             now,
         )
     return str(row["id"]) if row else None
+
+
+async def upsert_source_asset_for_service(
+    *,
+    project_id: str,
+    user_id: str,
+    source: str,
+    source_id: str,
+    title: str,
+    source_url: str,
+    resolved_url: str,
+    canonical_url: str,
+    source_fetcher: str,
+) -> str | None:
+    """Upsert source asset with internally managed pool."""
+    return await _with_service_pool(
+        upsert_source_asset,
+        project_id=project_id,
+        user_id=user_id,
+        source=source,
+        source_id=source_id,
+        title=title,
+        source_url=source_url,
+        resolved_url=resolved_url,
+        canonical_url=canonical_url,
+        source_fetcher=source_fetcher,
+    )
 
 
 async def fetch_source_asset(pool: asyncpg.Pool, asset_id: str) -> dict | None:
@@ -76,6 +123,11 @@ async def fetch_source_asset(pool: asyncpg.Pool, asset_id: str) -> dict | None:
             asset_id,
         )
     return dict(row) if row else None
+
+
+async def fetch_source_asset_for_service(asset_id: str) -> dict | None:
+    """Fetch source asset with internally managed pool."""
+    return await _with_service_pool(fetch_source_asset, asset_id)
 
 
 async def mark_fetch_result(
@@ -118,6 +170,31 @@ async def mark_fetch_result(
         )
 
 
+async def mark_fetch_result_for_service(
+    *,
+    asset_id: str,
+    fetch_status: str,
+    mime_type: str,
+    byte_size: int,
+    checksum_sha256: str,
+    blob_path: str,
+    error_code: str = "",
+    error_message: str = "",
+) -> None:
+    """Persist fetch status with internally managed pool."""
+    await _with_service_pool(
+        mark_fetch_result,
+        asset_id=asset_id,
+        fetch_status=fetch_status,
+        mime_type=mime_type,
+        byte_size=byte_size,
+        checksum_sha256=checksum_sha256,
+        blob_path=blob_path,
+        error_code=error_code,
+        error_message=error_message,
+    )
+
+
 async def mark_extract_result(
     pool: asyncpg.Pool,
     *,
@@ -152,6 +229,27 @@ async def mark_extract_result(
         )
 
 
+async def mark_extract_result_for_service(
+    *,
+    asset_id: str,
+    extract_status: str,
+    extracted_chars: int,
+    extracted_pages: int,
+    error_code: str = "",
+    error_message: str = "",
+) -> None:
+    """Persist extract status with internally managed pool."""
+    await _with_service_pool(
+        mark_extract_result,
+        asset_id=asset_id,
+        extract_status=extract_status,
+        extracted_chars=extracted_chars,
+        extracted_pages=extracted_pages,
+        error_code=error_code,
+        error_message=error_message,
+    )
+
+
 async def increment_attempt(
     pool: asyncpg.Pool,
     *,
@@ -176,6 +274,17 @@ async def increment_attempt(
             next_attempt_at,
         )
     return int((row or {}).get("attempt_count") or 0)
+
+
+async def increment_attempt_for_service(
+    *,
+    asset_id: str,
+    next_attempt_at: datetime | None = None,
+) -> int:
+    """Increment attempt count with internally managed pool."""
+    return await _with_service_pool(
+        increment_attempt, asset_id=asset_id, next_attempt_at=next_attempt_at
+    )
 
 
 async def fetch_project_enrichment_counts(pool: asyncpg.Pool, project_id: str) -> dict:
@@ -209,3 +318,8 @@ async def fetch_project_enrichment_counts(pool: asyncpg.Pool, project_id: str) -
     payload = dict(row) if row else {"pending": 0, "fetched": 0, "extracted": 0, "failed": 0}
     payload["embedded"] = int(embedded or 0)
     return payload
+
+
+async def fetch_project_enrichment_counts_for_service(project_id: str) -> dict:
+    """Return enrichment counts with internally managed pool for service-layer calls."""
+    return await _with_service_pool(fetch_project_enrichment_counts, project_id)

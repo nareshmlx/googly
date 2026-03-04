@@ -1,5 +1,6 @@
 """Document handling logic (fulltext enrichment, lifecycle status)."""
 
+import asyncio
 import json
 from datetime import UTC, datetime
 
@@ -8,6 +9,7 @@ import structlog
 from app.core.config import settings
 from app.core.constants import RedisKeys, RedisTTL
 from app.core.metrics import fulltext_resolve_total
+from app.core.utils import metadata_pick, parse_metadata
 from app.kb.ingester import RawDocument
 from app.repositories import source_asset as source_asset_repo
 from app.services.fulltext_resolver import resolve_fulltext_url
@@ -33,7 +35,9 @@ async def _prepare_kept_documents_for_source(
     if not source_enabled:
         return [], {"fetched": 0, "kept": 0, "filtered_out": 0, "reason": "source_disabled"}, False
 
-    if isinstance(result, BaseException):
+    if isinstance(result, asyncio.CancelledError):
+        raise
+    if isinstance(result, Exception):
         diagnostics: dict[str, int | str | bool] = {
             "fetched": 0,
             "kept": 0,
@@ -173,7 +177,11 @@ async def _set_ingest_status(
         logger.exception("set_ingest_status.failed", project_id=project_id)
 
 
-async def _schedule_fulltext_enrichment(ctx: dict, pool, documents: list[RawDocument]) -> int:
+async def _schedule_fulltext_enrichment(
+    ctx: dict,
+    pool,
+    documents: list[RawDocument],
+) -> int:
     """Resolve/upsert fulltext assets and enqueue enrichment tasks for eligible docs."""
     if not settings.ENABLE_FULLTEXT_ENRICHMENT:
         return 0
@@ -187,14 +195,7 @@ async def _schedule_fulltext_enrichment(ctx: dict, pool, documents: list[RawDocu
         if doc.source not in {"paper", "patent"}:
             continue
         # Parse metadata - may be JSON string from database
-        metadata_raw = doc.metadata
-        if isinstance(metadata_raw, str):
-            import json
-            metadata = json.loads(metadata_raw) if metadata_raw else {}
-        elif isinstance(metadata_raw, dict):
-            metadata = metadata_raw
-        else:
-            metadata = {}
+        metadata = parse_metadata(doc.metadata)
         if str(metadata.get("content_level") or "abstract") == "fulltext":
             continue
 
@@ -204,23 +205,38 @@ async def _schedule_fulltext_enrichment(ctx: dict, pool, documents: list[RawDocu
             continue
 
         source_url = str(
-            metadata.get("open_access_url")
-            or metadata.get("pdf_url")
-            or metadata.get("url")
-            or resolved.resolved_url
+            metadata_pick(
+                metadata,
+                ("open_access_url", "pdf_url", "url"),
+                resolved.resolved_url,
+            )
+            or ""
         )
-        asset_id = await source_asset_repo.upsert_source_asset(
-            pool,
-            project_id=doc.project_id,
-            user_id=doc.user_id,
-            source=doc.source,
-            source_id=str(doc.source_id or ""),
-            title=str(doc.title or ""),
-            source_url=source_url,
-            resolved_url=resolved.resolved_url,
-            canonical_url=resolved.canonical_url,
-            source_fetcher=resolved.source_fetcher,
-        )
+        if pool is None:
+            asset_id = await source_asset_repo.upsert_source_asset_for_service(
+                project_id=doc.project_id,
+                user_id=doc.user_id,
+                source=doc.source,
+                source_id=str(doc.source_id or ""),
+                title=str(doc.title or ""),
+                source_url=source_url,
+                resolved_url=resolved.resolved_url,
+                canonical_url=resolved.canonical_url,
+                source_fetcher=resolved.source_fetcher,
+            )
+        else:
+            asset_id = await source_asset_repo.upsert_source_asset(
+                pool,
+                project_id=doc.project_id,
+                user_id=doc.user_id,
+                source=doc.source,
+                source_id=str(doc.source_id or ""),
+                title=str(doc.title or ""),
+                source_url=source_url,
+                resolved_url=resolved.resolved_url,
+                canonical_url=resolved.canonical_url,
+                source_fetcher=resolved.source_fetcher,
+            )
         if not asset_id:
             continue
         # Using redis.enqueue_job assuming redis is an Arq container or similar wrapper as used in codebase

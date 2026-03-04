@@ -47,7 +47,7 @@ class WorkerSettings:
     cron_jobs = [
         # refresh_due_projects runs every 6 hours — checks which projects are
         # overdue for daily/weekly refresh and enqueues refresh_project for each
-        cron(refresh_due_projects, hour={0, 6, 12, 18}, minute=0),
+        cron(refresh_due_projects, hour=set(settings.ARQ_REFRESH_CRON_HOURS), minute=0),
         cron(backfill_fulltext_assets, minute={10, 40}),
         # cleanup_old_chat_messages runs daily at 3am UTC — deletes messages
         # older than 90 days from both Postgres and Redis
@@ -56,7 +56,7 @@ class WorkerSettings:
 
     redis_settings = RedisSettings.from_dsn(settings.REDIS_URL)
 
-    max_jobs = 20
+    max_jobs = settings.ARQ_WORKER_MAX_JOBS
     job_timeout = settings.ARQ_WORKER_JOB_TIMEOUT
-    health_check_interval = 30
+    health_check_interval = settings.ARQ_WORKER_HEALTH_CHECK_INTERVAL
     # queue_name is intentionally omitted — ARQ default "arq:queue" matches create_pool default.

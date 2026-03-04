@@ -1,5 +1,4 @@
 import asyncio
-import hashlib
 import json
 import re
 import time
@@ -8,9 +7,9 @@ from collections.abc import AsyncGenerator, Callable
 import structlog
 
 from app.agents.orchestrator import run_query
+from app.core.cache_keys import stable_hash
 from app.core.cache_version import get_project_cache_version
 from app.core.constants import RedisKeys, RedisTTL
-from app.core.db import get_db_pool
 from app.core.metrics import (
     cache_hits_total,
     cache_misses_total,
@@ -21,7 +20,10 @@ from app.core.metrics import (
 )
 from app.core.redis import get_redis
 from app.repositories import chat_history as chat_history_repo
-from app.repositories.project import fetch_project_papers_enabled, list_projects_summary
+from app.repositories.project import (
+    fetch_project_papers_enabled_for_chat,
+    list_projects_summary_for_chat,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -185,7 +187,7 @@ async def get_cached_response(
     """
     try:
         redis = await get_redis()
-        query_hash = hashlib.sha256(query.encode()).hexdigest()[:16]
+        query_hash = stable_hash([query])
         version = await get_project_cache_version(redis, project_id)
         cache_key = RedisKeys.SEMANTIC_CACHE.format(
             project_id=project_id, hash=f"{version}:{query_hash}"
@@ -216,7 +218,7 @@ async def cache_response(
     """
     try:
         redis = await get_redis()
-        query_hash = hashlib.sha256(query.encode()).hexdigest()[:16]
+        query_hash = stable_hash([query])
         version = await get_project_cache_version(redis, project_id)
         cache_key = RedisKeys.SEMANTIC_CACHE.format(
             project_id=project_id, hash=f"{version}:{query_hash}"
@@ -232,7 +234,7 @@ async def cache_response(
         logger.warning("chat.cache_write_error", project_id=project_id)
 
 
-async def _list_projects_summary_cached(pool, user_id: str) -> list[dict]:
+async def _list_projects_summary_cached(user_id: str) -> list[dict]:
     """Read project summaries from Redis cache, falling back to DB."""
     cache_key = RedisKeys.PROJECTS_SUMMARY.format(user_id=user_id)
     try:
@@ -245,7 +247,7 @@ async def _list_projects_summary_cached(pool, user_id: str) -> list[dict]:
     except Exception:
         logger.warning("chat.projects_summary_cache_read_error", user_id=user_id)
 
-    projects = await list_projects_summary(pool, user_id)
+    projects = await list_projects_summary_for_chat(user_id)
     try:
         redis = await get_redis()
         await redis.setex(cache_key, RedisTTL.PROJECTS_SUMMARY.value, json.dumps(projects))
@@ -268,10 +270,8 @@ async def persist_chat_turn(
     Source of truth is Postgres (no TTL). Redis is best-effort mirror cache for
     short-term reads and backward compatibility.
     """
-    pool = await get_db_pool()
     try:
-        await chat_history_repo.insert_chat_turn(
-            pool=pool,
+        await chat_history_repo.insert_chat_turn_for_chat(
             project_id=project_id,
             user_id=user_id,
             session_id=session_id,
@@ -326,10 +326,8 @@ async def get_chat_history_messages(
     Postgres returns no rows, so pre-migration sessions still render.
     """
     db_messages: list[dict] = []
-    pool = await get_db_pool()
     try:
-        db_messages = await chat_history_repo.fetch_chat_history(
-            pool=pool,
+        db_messages = await chat_history_repo.fetch_chat_history_for_chat(
             project_id=project_id,
             user_id=user_id,
             session_id=session_id,
@@ -373,8 +371,7 @@ async def get_chat_history_messages(
     # replace DB history with Redis copy so future reads remain durable.
     if redis_messages and len(redis_messages) > len(db_messages):
         try:
-            await chat_history_repo.replace_chat_history(
-                pool=pool,
+            await chat_history_repo.replace_chat_history_for_chat(
                 project_id=project_id,
                 user_id=user_id,
                 session_id=session_id,
@@ -399,6 +396,20 @@ async def get_chat_history_messages(
     if db_messages:
         return db_messages
     return redis_messages
+
+
+async def verify_chat_session_ownership(
+    *,
+    project_id: str,
+    user_id: str,
+    session_id: str,
+) -> bool:
+    """Check whether a chat session belongs to the requesting user."""
+    return await chat_history_repo.verify_session_ownership_for_chat(
+        project_id=project_id,
+        user_id=user_id,
+        session_id=session_id,
+    )
 
 
 async def stream_response(
@@ -458,16 +469,15 @@ async def stream_response(
                 success = True
                 return
 
-        pool = await get_db_pool()
-        papers_enabled = (await fetch_project_papers_enabled(pool, project_id)) or False
-        all_projects = await _list_projects_summary_cached(pool, user_id)
+        papers_enabled = (await fetch_project_papers_enabled_for_chat(project_id)) or False
+        all_projects = await _list_projects_summary_cached(user_id)
         if not all_projects:
             all_projects = [{"id": project_id, "title": "", "description": ""}]
 
         # Generate deduplication key for concurrent identical queries
         # Format: chat_stream:project_id:query_hash
         # TTL is implicit (only during active streaming, ~8-15 seconds)
-        query_hash = hashlib.sha256(query.encode()).hexdigest()[:16]
+        query_hash = stable_hash([query])
         dedup_key = f"chat_stream:{project_id}:{query_hash}"
 
         tokens: list[str] = []

@@ -17,13 +17,12 @@ import structlog
 from openai import AsyncOpenAI
 
 from app.core.config import settings
-from app.core.constants import EmbeddingBatchSize, RedisKeys, RedisTTL
+from app.core.constants import EMBEDDING_DIM, EmbeddingBatchSize, RedisKeys, RedisTTL
 from app.core.redis import get_redis
 
 logger = structlog.get_logger(__name__)
 
 EMBEDDING_MODEL = "text-embedding-3-small"
-EMBEDDING_DIM = 1536
 
 # Module-level singleton — one connection pool per worker process, reused across
 # all embed_texts() calls. Creating a new AsyncOpenAI() per call creates a new
@@ -110,7 +109,12 @@ async def embed_texts(texts: list[str]) -> list[list[float]]:
                     response = await client.embeddings.create(
                         model=EMBEDDING_MODEL, input=batch_texts
                     )
-                    return [item.embedding for item in response.data]
+                    vectors = [item.embedding for item in response.data]
+                    if vectors and len(vectors[0]) != EMBEDDING_DIM:
+                        raise ValueError(
+                            f"unexpected_embedding_dim:{len(vectors[0])} expected:{EMBEDDING_DIM}"
+                        )
+                    return vectors
 
                 # Rate-limited: release the Redis connection BEFORE sleeping.
                 # The original code slept while still holding a connection

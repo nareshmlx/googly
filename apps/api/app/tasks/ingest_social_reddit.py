@@ -74,9 +74,13 @@ async def _ingest_reddit(
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         for batch in results:
+            if isinstance(batch, asyncio.CancelledError):
+                raise
             if isinstance(batch, Exception):
                 logger.exception("ingest_reddit.batch_failed", project_id=project_id)
                 continue
+            if isinstance(batch, BaseException):
+                raise batch
             for row in batch:
                 sid = str(row.get("source_id") or row.get("id") or "").strip()
                 if not sid or sid in seen_ids:
@@ -138,7 +142,7 @@ async def _ingest_reddit(
         quality_score = _content_quality_score(title, content)
         engagement_score = min(1.0, math.log1p(max(0, score + (comments / 2.0))) / 12.0)
 
-        recency_score = 0.4
+        recency_score = settings.INGEST_SOCIAL_RECENCY_FALLBACK_SCORE
         ts = post.get("published_at")
         if ts:
             try:
@@ -147,9 +151,9 @@ async def _ingest_reddit(
                 if post_dt.tzinfo is None:
                     post_dt = post_dt.replace(tzinfo=UTC)
                 days_old = max(0.0, (now_utc - post_dt).total_seconds() / 86400.0)
-                recency_score = math.exp(-days_old / 28.0)
+                recency_score = math.exp(-days_old / settings.INGEST_SOCIAL_RECENCY_DECAY_DAYS_REDDIT)
             except Exception:
-                recency_score = 0.4
+                recency_score = settings.INGEST_SOCIAL_RECENCY_FALLBACK_SCORE
         scored.append((relevance_match, quality_score, engagement_score, recency_score, post))
 
     scored.sort(key=lambda item: (item[0], item[1], item[2], item[3]), reverse=True)

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -12,7 +11,6 @@ import structlog
 from app.core.cache_version import bump_project_cache_version
 from app.core.config import settings
 from app.core.constants import RedisKeys, RedisTTL
-from app.core.db import get_db_pool
 from app.core.metrics import (
     fulltext_embed_total,
     fulltext_extract_total,
@@ -21,6 +19,7 @@ from app.core.metrics import (
     fulltext_upsert_total,
 )
 from app.core.url_safety import is_safe_public_url
+from app.core.utils import parse_metadata
 from app.kb.ingester import ingest_documents
 from app.repositories import project as project_repo
 from app.repositories import source_asset as source_asset_repo
@@ -41,7 +40,10 @@ def _allowed_domains() -> set[str]:
 async def _download_asset(url: str) -> tuple[bytes, str]:
     """Download source bytes with bounded redirects/timeouts/size limits."""
     timeout = httpx.Timeout(settings.FULLTEXT_FETCH_TIMEOUT_SECONDS)
-    limits = httpx.Limits(max_keepalive_connections=20, max_connections=50)
+    limits = httpx.Limits(
+        max_keepalive_connections=settings.FULLTEXT_HTTP_MAX_KEEPALIVE,
+        max_connections=settings.FULLTEXT_HTTP_MAX_CONNECTIONS,
+    )
     allowed_domains = _allowed_domains()
     current_url = str(url)
     async with httpx.AsyncClient(timeout=timeout, limits=limits, follow_redirects=False) as client:
@@ -91,19 +93,17 @@ async def ingest_source_asset(ctx: dict, asset_id: str) -> None:
     if not acquired:
         return
 
-    pool = await get_db_pool()
     started = datetime.now(UTC)
 
     try:
-        asset = await source_asset_repo.fetch_source_asset(pool, asset_id)
+        asset = await source_asset_repo.fetch_source_asset_for_service(asset_id)
         if not asset:
             logger.warning("fulltext_asset.not_found", asset_id=asset_id)
             return
 
-        attempts = await source_asset_repo.increment_attempt(pool, asset_id=asset_id)
+        attempts = await source_asset_repo.increment_attempt_for_service(asset_id=asset_id)
         if attempts > settings.FULLTEXT_MAX_ENRICHMENT_ATTEMPTS:
-            await source_asset_repo.mark_fetch_result(
-                pool,
+            await source_asset_repo.mark_fetch_result_for_service(
                 asset_id=asset_id,
                 fetch_status="failed",
                 mime_type=str(asset.get("mime_type") or ""),
@@ -118,8 +118,7 @@ async def ingest_source_asset(ctx: dict, asset_id: str) -> None:
         source = str(asset.get("source") or "paper")
         source_url = str(asset.get("resolved_url") or asset.get("source_url") or "")
         if not source_url:
-            await source_asset_repo.mark_fetch_result(
-                pool,
+            await source_asset_repo.mark_fetch_result_for_service(
                 asset_id=asset_id,
                 fetch_status="failed",
                 mime_type="",
@@ -135,8 +134,7 @@ async def ingest_source_asset(ctx: dict, asset_id: str) -> None:
         try:
             body, mime_type = await _download_asset(source_url)
             sha = hashlib.sha256(body).hexdigest()
-            await source_asset_repo.mark_fetch_result(
-                pool,
+            await source_asset_repo.mark_fetch_result_for_service(
                 asset_id=asset_id,
                 fetch_status="fetched",
                 mime_type=mime_type,
@@ -150,8 +148,7 @@ async def ingest_source_asset(ctx: dict, asset_id: str) -> None:
             )
         except httpx.TimeoutException:
             should_retry = attempts < settings.FULLTEXT_MAX_ENRICHMENT_ATTEMPTS
-            await source_asset_repo.mark_fetch_result(
-                pool,
+            await source_asset_repo.mark_fetch_result_for_service(
                 asset_id=asset_id,
                 fetch_status="retry" if should_retry else "failed",
                 mime_type="",
@@ -163,7 +160,10 @@ async def ingest_source_asset(ctx: dict, asset_id: str) -> None:
             )
             fulltext_fetch_total.labels(source=source, status="timeout").inc()
             if should_retry:
-                retry_delay = min(300, 30 * attempts)
+                retry_delay = min(
+                    settings.FULLTEXT_RETRY_MAX_DELAY_SECONDS,
+                    settings.FULLTEXT_RETRY_BASE_DELAY_SECONDS * attempts,
+                )
                 await redis.enqueue_job(
                     "ingest_source_asset",
                     asset_id,
@@ -172,8 +172,7 @@ async def ingest_source_asset(ctx: dict, asset_id: str) -> None:
                 )
             return
         except Exception as exc:
-            await source_asset_repo.mark_fetch_result(
-                pool,
+            await source_asset_repo.mark_fetch_result_for_service(
                 asset_id=asset_id,
                 fetch_status="failed",
                 mime_type="",
@@ -189,8 +188,7 @@ async def ingest_source_asset(ctx: dict, asset_id: str) -> None:
         extract = extract_text_from_asset(body, mime_type)
         fulltext_extract_total.labels(source=source, status=extract.status).inc()
         if extract.status != "success":
-            await source_asset_repo.mark_extract_result(
-                pool,
+            await source_asset_repo.mark_extract_result_for_service(
                 asset_id=asset_id,
                 extract_status=extract.status,
                 extracted_chars=extract.extracted_chars,
@@ -201,13 +199,7 @@ async def ingest_source_asset(ctx: dict, asset_id: str) -> None:
             return
 
         # Parse metadata - database stores it as JSON string
-        metadata_raw = asset.get("metadata")
-        if isinstance(metadata_raw, str):
-            metadata = json.loads(metadata_raw) if metadata_raw else {}
-        elif isinstance(metadata_raw, dict):
-            metadata = metadata_raw
-        else:
-            metadata = {}
+        metadata = parse_metadata(asset.get("metadata"))
 
         raw_doc = map_fulltext_raw_document(
             project_id=str(asset["project_id"]),
@@ -231,16 +223,14 @@ async def ingest_source_asset(ctx: dict, asset_id: str) -> None:
             fulltext_upsert_total.labels(source=source, status="failed").inc()
             raise
 
-        await source_asset_repo.mark_extract_result(
-            pool,
+        await source_asset_repo.mark_extract_result_for_service(
             asset_id=asset_id,
             extract_status="success",
             extracted_chars=extract.extracted_chars,
             extracted_pages=extract.page_count,
         )
 
-        await project_repo.increment_project_kb_stats(
-            pool,
+        await project_repo.increment_project_kb_stats_for_service(
             str(asset["project_id"]),
             int(inserted),
             datetime.now(UTC),

@@ -35,19 +35,21 @@ services:
   worker:
     image: ghcr.io/astral-sh/uv:python3.11-bookworm
     container_name: googly-worker
+    user: "1000:1000"
     working_dir: /app
     volumes:
       - ../apps/api:/app
-      # Shadow .venv with a named Docker volume so the Linux venv is never
-      # written into the Windows source tree (prevents corrupted lib64 symlink).
-      - worker_venv:/app/.venv
-      - uv_cache:/root/.cache/uv
+      - uv_cache:/home/user/.cache/uv
     command: uv run arq app.tasks.worker.WorkerSettings
     env_file:
       - ../.env
     environment:
       DATABASE_URL: postgresql+asyncpg://googly:googly@db:5432/googly
       REDIS_URL: redis://redis:6379/0
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+      REQUESTS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
+      UV_CACHE_DIR: /tmp/uv-cache
+      UV_PROJECT_ENVIRONMENT: /tmp/.venv
     depends_on:
       db:
         condition: service_healthy
@@ -65,7 +67,6 @@ volumes:
     external: true
     name: googly_googly_redisdata
   uv_cache:
-  worker_venv:
 
 networks:
   default:

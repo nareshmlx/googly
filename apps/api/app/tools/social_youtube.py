@@ -1,18 +1,16 @@
 """YouTube retrieval tool using EnsembleData keyword search endpoint."""
 
-import hashlib
 import json
 import re
 
 import httpx
 import structlog
 
+from app.core.cache_keys import build_search_cache_key, build_stale_cache_key
 from app.core.config import settings
 
 logger = structlog.get_logger(__name__)
 
-YOUTUBE_MAX_RESULTS = 100
-YOUTUBE_TIMEOUT_SECONDS = 45.0
 ENSEMBLE_BASE_FALLBACK = "https://ensembledata.com/apis"
 
 
@@ -138,8 +136,12 @@ def _normalize_row(row: dict) -> dict:
 
 def _cache_key(project_id: str, query: str, max_results: int) -> str:
     """Generate a deterministic, project-scoped cache key for YouTube searches."""
-    query_hash = hashlib.sha256(f"{query}:{max_results}".encode()).hexdigest()[:16]
-    return f"search:cache:{project_id}:social_youtube:videos:{query_hash}"
+    return build_search_cache_key(
+        project_id=project_id,
+        provider="social_youtube",
+        query_type="videos",
+        parts=[query, max_results],
+    )
 
 
 async def search_youtube_videos(
@@ -155,7 +157,7 @@ async def search_youtube_videos(
 
     # Check cache first
     cache_key = _cache_key(project_id, cleaned_query, max_results)
-    stale_key = f"{cache_key}:stale"
+    stale_key = build_stale_cache_key(cache_key)
     if redis:
         try:
             cached = await redis.get(cache_key)
@@ -200,7 +202,7 @@ async def _search_youtube_videos_impl(
         logger.warning("social_youtube.no_token")
         return []
 
-    bounded_max = max(1, min(max_results, YOUTUBE_MAX_RESULTS))
+    bounded_max = max(1, min(max_results, settings.SOCIAL_YOUTUBE_MAX_RESULTS))
     logger.info(
         "social_youtube.search.start",
         query_preview=cleaned_query[:80],
@@ -217,7 +219,7 @@ async def _search_youtube_videos_impl(
     }
 
     payload: object | None = None
-    async with httpx.AsyncClient(timeout=YOUTUBE_TIMEOUT_SECONDS) as client:
+    async with httpx.AsyncClient(timeout=settings.SOCIAL_YOUTUBE_TIMEOUT_SECONDS) as client:
         for endpoint in _endpoint_candidates():
             try:
                 response = await client.get(

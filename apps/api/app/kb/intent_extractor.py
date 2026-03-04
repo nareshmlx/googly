@@ -261,7 +261,7 @@ async def extract_intent(
                 {"role": "user", "content": prompt},
             ],
             response_format={"type": "json_object"},
-            timeout=30.0,
+            timeout=settings.INTENT_EXTRACT_TIMEOUT_SECONDS,
         )
         text = response.choices[0].message.content or ""
         intent = json.loads(text.strip())
@@ -338,7 +338,7 @@ async def refine_intent(
                 {"role": "user", "content": prompt},
             ],
             response_format={"type": "json_object"},
-            timeout=30.0,
+            timeout=settings.INTENT_EXTRACT_TIMEOUT_SECONDS,
         )
         text = response.choices[0].message.content or ""
         refined = json.loads(text.strip())

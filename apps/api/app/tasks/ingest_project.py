@@ -9,6 +9,7 @@ Supports independently toggleable ingestion sources:
 
 import asyncio
 import json
+import re
 from datetime import UTC, datetime
 
 import structlog
@@ -16,10 +17,10 @@ import structlog
 from app.core.cache_invalidation import invalidate_project_caches
 from app.core.config import settings
 from app.core.constants import RedisKeys
-from app.core.db import get_db_pool
 from app.core.redis import get_redis
+from app.core.utils import parse_metadata
 from app.kb.embedder import embed_texts
-from app.kb.ingester import ingest_documents
+from app.kb.ingester import RawDocument, ingest_documents
 from app.repositories import project as project_repo
 from app.tasks.ingest_discovery import (
     _ingest_news,
@@ -68,10 +69,9 @@ async def ingest_project(ctx: dict, project_id: str) -> None:
         key = RedisKeys.PROJECT_INGEST_STATUS.format(project_id=project_id)
         raw = await redis.get(key)
         if raw:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                queued_at = parsed.get("queued_at")
-                job_id = str(parsed.get("job_id") or "").strip() or None
+            parsed = parse_metadata(raw)
+            queued_at = parsed.get("queued_at")
+            job_id = str(parsed.get("job_id") or "").strip() or None
     except Exception:
         logger.warning("ingest_project.status_read_failed", project_id=project_id)
 
@@ -191,32 +191,15 @@ async def _run_ingestion(
     oldest_timestamp: int | None,
 ) -> dict:
     """Core ingestion logic shared by ingest_project and refresh_project."""
-    pool = await get_db_pool()
     redis = await get_redis()
 
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT id::text, user_id::text, title, description, structured_intent,
-                   tiktok_enabled, instagram_enabled, youtube_enabled, reddit_enabled, x_enabled,
-                   papers_enabled, patents_enabled, perigon_enabled, tavily_enabled, exa_enabled
-            FROM projects
-            WHERE id = $1::uuid
-            """,
-            project_id,
-        )
+    row = await project_repo.get_project_for_ingestion_for_service(project_id)
 
     if not row:
         return {"status": "failed", "message": "Project not found."}
 
     project = dict(row)
-    raw_intent = project.get("structured_intent") or {}
-    if isinstance(raw_intent, str):
-        try:
-            raw_intent = json.loads(raw_intent)
-        except (json.JSONDecodeError, ValueError):
-            raw_intent = {}
-    intent = dict(raw_intent)
+    intent = parse_metadata(project.get("structured_intent"))
     user_id = project["user_id"]
     project_title = str(project.get("title") or "")
     project_description = str(project.get("description") or "")
@@ -455,20 +438,41 @@ async def _run_ingestion(
         else _noop(),
         _run_source_with_timeout(
             "news_perigon",
-            _ingest_news(project_id=project_id, user_id=user_id, intent=intent, redis=redis),
+            _ingest_news(
+                project_id=project_id,
+                user_id=user_id,
+                intent=intent,
+                project_title=project_title,
+                project_description=project_description,
+                redis=redis,
+            ),
             timeout_seconds=settings.INGEST_NEWS_TIMEOUT,
         )
         if perigon_enabled
         else _noop(),
         _run_source_with_timeout(
             "search_tavily",
-            _ingest_web_tavily(project_id=project_id, user_id=user_id, intent=intent, redis=redis),
+            _ingest_web_tavily(
+                project_id=project_id,
+                user_id=user_id,
+                intent=intent,
+                project_title=project_title,
+                project_description=project_description,
+                redis=redis,
+            ),
         )
         if tavily_enabled
         else _noop(),
         _run_source_with_timeout(
             "search_exa",
-            _ingest_web_exa(project_id=project_id, user_id=user_id, intent=intent, redis=redis),
+            _ingest_web_exa(
+                project_id=project_id,
+                user_id=user_id,
+                intent=intent,
+                project_title=project_title,
+                project_description=project_description,
+                redis=redis,
+            ),
         )
         if exa_enabled
         else _noop(),
@@ -486,6 +490,14 @@ async def _run_ingestion(
     source_counts: dict[str, int] = {}
     source_diagnostics: dict[str, dict] = {}
     seen_social_ids: set[tuple[str, str]] = set()
+    all_paper_docs: list[RawDocument] = []
+    paper_source_priorities = {
+        "paper_openalex": 1,
+        "paper_semantic_scholar": 2,
+        "paper_arxiv": 3,
+        "paper_pubmed": 4,
+        "search_exa": 5,
+    }
     expansion_seeds: dict[str, set[str]] = {
         "social_instagram": set(),
         "social_tiktok": set(),
@@ -539,13 +551,10 @@ async def _run_ingestion(
             source = source_key
 
         if completed_sources % 3 == 0:
-            async with pool.acquire() as conn:
-                exists = await conn.fetchval(
-                    "SELECT 1 FROM projects WHERE id = $1::uuid", project_id
-                )
-                if not exists:
-                    logger.info("ingestion.project_deleted", project_id=project_id)
-                    break
+            exists = await project_repo.project_exists_for_service(project_id)
+            if not exists:
+                logger.info("ingestion.project_deleted", project_id=project_id)
+                break
 
         # Process all sources (including social) immediately as they complete
         # Social sources no longer delayed - processed in first loop
@@ -564,9 +573,18 @@ async def _run_ingestion(
         any_source_completed = any_source_completed or source_completed
 
         if kept_docs:
-            inserted += await ingest_documents(kept_docs)
-            fulltext_enqueued += await _schedule_fulltext_enrichment(ctx, pool, kept_docs)
             source_counts[source] = source_counts.get(source, 0) + len(kept_docs)
+
+            if source == "paper":
+                # Buffer papers to dedup by priority AFTER all sources complete
+                # We tag the document with its specific source_key for priority sorting
+                for d in kept_docs:
+                    # Store source_key in metadata temporarily for sorting
+                    d.metadata["_source_key"] = source_key
+                all_paper_docs.extend(kept_docs)
+            else:
+                inserted += await ingest_documents(kept_docs)
+                fulltext_enqueued += await _schedule_fulltext_enrichment(ctx, None, kept_docs)
 
             # When expansion is enabled, track social doc IDs inserted in this
             # first pass so Section 2 doesn't double-insert the same documents.
@@ -583,6 +601,48 @@ async def _run_ingestion(
             source_diagnostics=source_diagnostics,
             fulltext_enqueued=fulltext_enqueued,
         )
+
+    # 1b. Process Buffered Papers (Deduplicate by Priority)
+    if all_paper_docs:
+        # Sort by priority: lower number = higher priority
+        all_paper_docs.sort(
+            key=lambda d: paper_source_priorities.get(str(d.metadata.get("_source_key")), 999)
+        )
+
+        unique_papers = []
+        seen_dois = set()
+        seen_titles = set()
+
+        for d in all_paper_docs:
+            # Clean up the temporary sorting key
+            d.metadata.pop("_source_key", None)
+
+            # 1. Extract DOI if present (standardized format: doi:...)
+            doi = None
+            sid = str(d.source_id)
+            if sid.startswith("doi:"):
+                doi = sid[4:]
+
+            # 2. Normalize Title for cross-source matching
+            title = str(d.title or "").strip().lower()
+            # Strict normalization: alphanumeric only, no spaces
+            norm_title = re.sub(r"[^a-z0-9]", "", title)
+
+            # 3. Comprehensive Duplicate Check
+            # Priority sorting ensures higher quality sources are processed first
+            if (doi and doi in seen_dois) or (norm_title and norm_title in seen_titles):
+                continue
+
+            if doi:
+                seen_dois.add(doi)
+            if norm_title:
+                seen_titles.add(norm_title)
+
+            unique_papers.append(d)
+
+        if unique_papers:
+            inserted += await ingest_documents(unique_papers)
+            fulltext_enqueued += await _schedule_fulltext_enrichment(ctx, None, unique_papers)
 
     # 2. Social Processing & seed extraction (only if expansion is enabled)
     # Since expansion is disabled, this loop is skipped for better performance
@@ -646,7 +706,6 @@ async def _run_ingestion(
                             user_id=user_id,
                             intent=intent,
                             social_filter=q,
-                            expansion_mode=True,
                             redis=redis,
                         ),
                     )
@@ -661,7 +720,6 @@ async def _run_ingestion(
                             user_id=user_id,
                             intent=intent,
                             social_filter=q,
-                            expansion_mode=True,
                             oldest_timestamp=oldest_timestamp,
                             redis=redis,
                         ),
@@ -750,14 +808,7 @@ async def _run_ingestion(
     # run's new chunks. On refresh, overwriting with `inserted` would undercount.
     real_total_chunks = inserted  # fallback if DB query fails
     try:
-        async with pool.acquire() as conn:
-            real_total_chunks = (
-                await conn.fetchval(
-                    "SELECT COUNT(*)::int FROM knowledge_chunks WHERE project_id = $1::uuid",
-                    project_id,
-                )
-                or 0
-            )
+        real_total_chunks = await project_repo.get_chunk_count_for_service(project_id)
     except Exception:
         logger.warning("ingestion.total_chunk_count_query_failed", project_id=project_id)
 
@@ -774,11 +825,16 @@ async def _run_ingestion(
         "fulltext_enqueued": fulltext_enqueued,
         "total_chunks": real_total_chunks,
     }
+    status_value = str(outcome["status"])
+    message_value = str(outcome["message"])
+    source_counts_value = dict(source_counts)
 
     # Update DB stats with the accurate cumulative total
     try:
-        await project_repo.update_project_kb_stats(
-            pool, project_id, real_total_chunks, datetime.now(UTC)
+        await project_repo.update_project_kb_stats_for_service(
+            project_id,
+            real_total_chunks,
+            datetime.now(UTC),
         )
     except Exception:
         logger.warning("ingestion.db_stats_update_failed", project_id=project_id)
@@ -786,10 +842,10 @@ async def _run_ingestion(
     await _set_ingest_status(
         redis,
         project_id,
-        status=outcome["status"],
-        message=outcome["message"],
+        status=status_value,
+        message=message_value,
         finished_at=finished_at,
-        source_counts=outcome["source_counts"],
+        source_counts=source_counts_value,
         source_diagnostics=source_diagnostics,
         fulltext_enqueued=fulltext_enqueued,
         total_chunks=real_total_chunks,

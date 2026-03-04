@@ -4,8 +4,9 @@ from datetime import UTC, datetime, timedelta
 
 import structlog
 
-from app.core.db import get_db_pool
+from app.core.config import settings
 from app.core.redis import get_redis
+from app.repositories import chat_history as chat_history_repo
 
 logger = structlog.get_logger(__name__)
 
@@ -23,7 +24,7 @@ async def cleanup_old_chat_messages(ctx: dict) -> dict:
     Why both stores: Postgres is the source of truth, but Redis holds working
     sessions. Must clean both to prevent memory leaks.
     """
-    cutoff_date = datetime.now(UTC) - timedelta(days=90)
+    cutoff_date = datetime.now(UTC) - timedelta(days=settings.CHAT_HISTORY_RETENTION_DAYS)
     postgres_deleted = 0
     redis_deleted = 0
 
@@ -34,21 +35,11 @@ async def cleanup_old_chat_messages(ctx: dict) -> dict:
 
     # Delete from Postgres
     try:
-        pool = await get_db_pool()
-        async with pool.acquire() as conn:
-            result = await conn.execute(
-                """
-                DELETE FROM chat_messages
-                WHERE created_at < $1
-                """,
-                cutoff_date,
-            )
-            # Extract count from result string "DELETE N"
-            postgres_deleted = int(result.split()[-1]) if result else 0
-            logger.info(
-                "cleanup.chat_messages.postgres_complete",
-                deleted=postgres_deleted,
-            )
+        postgres_deleted = await chat_history_repo.delete_old_messages_for_service(cutoff_date)
+        logger.info(
+            "cleanup.chat_messages.postgres_complete",
+            deleted=postgres_deleted,
+        )
     except Exception:
         logger.exception("cleanup.chat_messages.postgres_error")
         # Continue to Redis cleanup even if Postgres fails

@@ -9,7 +9,6 @@ Free tier: 0.33 req/sec (1 request per 3 seconds), no API key required.
 Integrated with production infrastructure: rate limiting, circuit breaker, caching, retry.
 """
 
-import hashlib
 import json
 import time
 
@@ -18,10 +17,12 @@ import structlog
 from defusedxml import ElementTree
 
 from app.core.cache import TwoTierCache
+from app.core.cache_keys import build_search_cache_key, build_stale_cache_key
 from app.core.circuit_breaker import arxiv_breaker, call_with_circuit_breaker
 from app.core.config import settings
 from app.core.dedup import deduplicate_request
 from app.core.metrics import api_call_duration_seconds, api_calls_total
+from app.core.query_sanitize import sanitize_query
 from app.core.rate_limiter import arxiv_limiter, rate_limited_call
 from app.core.redis import get_redis
 from app.core.retry import retry_with_backoff
@@ -29,8 +30,6 @@ from app.core.retry import retry_with_backoff
 logger = structlog.get_logger(__name__)
 
 _BASE_URL = "https://export.arxiv.org/api/query"
-_TIMEOUT = 15.0  # seconds
-_MAX_RESULTS = 20
 
 # Module-level HTTP client pool (reused across requests to prevent memory leak)
 _http_client: httpx.AsyncClient | None = None
@@ -40,7 +39,7 @@ async def _get_http_client() -> httpx.AsyncClient:
     """Get or create shared HTTP client pool for module."""
     global _http_client
     if _http_client is None:
-        _http_client = httpx.AsyncClient(timeout=_TIMEOUT)
+        _http_client = httpx.AsyncClient(timeout=settings.PAPERS_ARXIV_TIMEOUT_SECONDS)
     return _http_client
 
 
@@ -63,8 +62,12 @@ def _build_arxiv_query(
 
 def _cache_key(project_id: str, query: str) -> str:
     """Generate deterministic project-scoped cache key for a query."""
-    query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()[:16]
-    return f"search:cache:{project_id}:arxiv:papers:{query_hash}"
+    return build_search_cache_key(
+        project_id=project_id,
+        provider="arxiv",
+        query_type="papers",
+        parts=[query],
+    )
 
 
 async def _search_with_retry(query: str) -> str | None:
@@ -81,7 +84,7 @@ async def _search_with_retry(query: str) -> str | None:
             _BASE_URL,
             params={
                 "search_query": query,
-                "max_results": _MAX_RESULTS,
+                "max_results": settings.PAPERS_MAX_RESULTS,
                 "sortBy": "relevance",
                 "sortOrder": "descending",
             },
@@ -176,6 +179,10 @@ def _parse_atom_feed(xml_text: str) -> list[dict]:
                 if term:
                     categories.append(term)
 
+            # Extract DOI
+            doi_elem = entry.find("arxiv:doi", ns)
+            doi = doi_elem.text.strip() if doi_elem is not None and doi_elem.text else ""
+
             # Extract arXiv ID
             arxiv_id = _extract_arxiv_id(entry_id)
 
@@ -187,6 +194,7 @@ def _parse_atom_feed(xml_text: str) -> list[dict]:
                     "authors": authors,
                     "published": published,
                     "arxiv_id": arxiv_id,
+                    "doi": doi,
                     "source": "arxiv",
                     "categories": categories,
                 }
@@ -224,7 +232,7 @@ async def _search_impl(query: str) -> list[dict]:
         api_calls_total.labels(api_name="arxiv", status="timeout").inc()
         logger.warning(
             "search_arxiv.timeout",
-            timeout=_TIMEOUT,
+            timeout=settings.PAPERS_ARXIV_TIMEOUT_SECONDS,
             query_preview=query[:80],
         )
         return []
@@ -274,14 +282,14 @@ async def _search_arxiv_impl(project_id: str, query: str, cache_key: str) -> lis
     if result:
         await cache.set(cache_key, {"results": result}, ttl=settings.CACHE_TTL_PAPERS)
         # Store a "stale" copy that lasts longer
-        stale_key = f"{cache_key}:stale"
+        stale_key = build_stale_cache_key(cache_key)
         await redis_client.setex(
             stale_key, settings.CACHE_TTL_STALE, json.dumps({"results": result})
         )
         return result
 
     # 4. Failure -> Serve Stale Fallback
-    stale_key = f"{cache_key}:stale"
+    stale_key = build_stale_cache_key(cache_key)
     stale_raw = await redis_client.get(stale_key)
     if stale_raw:
         logger.warning(
@@ -330,13 +338,16 @@ async def search_arxiv(
     Never raises.
     """
     # Sanitize and normalize query BEFORE cache key generation (prevents cache key collision)
-    query = query.strip().lower()
-    if not query:
-        logger.warning("search_arxiv.empty_query")
+    sanitized_query = sanitize_query(
+        query,
+        logger=logger,
+        empty_event="search_arxiv.empty_query",
+        too_long_event="search_arxiv.query_too_long",
+        lower=True,
+    )
+    if sanitized_query is None:
         return []
-    if len(query) > 1000:
-        logger.warning("search_arxiv.query_too_long", original_length=len(query))
-        query = query[:1000]
+    query = sanitized_query
 
     effective_query = _build_arxiv_query(query, must_match_terms, domain_terms)
     if str(query_specificity or "").lower() == "specific" and must_match_terms:

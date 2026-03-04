@@ -15,14 +15,17 @@ from difflib import SequenceMatcher
 
 import structlog
 
+from app.core.config import settings
+
 logger = structlog.get_logger(__name__)
 
 # Priority order for source selection (when same paper found in multiple sources)
 _SOURCE_PRIORITY = {
-    "semantic_scholar": 1,
-    "arxiv": 2,
-    "pubmed": 3,
-    "exa": 4,
+    "openalex": 1,
+    "semantic_scholar": 2,
+    "arxiv": 3,
+    "pubmed": 4,
+    "exa": 5,
 }
 
 
@@ -49,7 +52,11 @@ def normalize_title(title: str) -> str:
     return normalized.strip()
 
 
-def titles_match(title1: str, title2: str, threshold: float = 0.85) -> bool:
+def titles_match(
+    title1: str,
+    title2: str,
+    threshold: float = settings.PAPER_TITLE_DEDUP_THRESHOLD,
+) -> bool:
     """
     Check if two titles are similar using fuzzy matching.
 

@@ -1,19 +1,18 @@
 """X (Twitter) retrieval tool backed by EnsembleData endpoints."""
 
 import base64
-import hashlib
 import json
 import re
 
 import httpx
 import structlog
 
+from app.core.cache_keys import build_search_cache_key, build_stale_cache_key
 from app.core.config import settings
+from app.core.normalize import coerce_int
 
 logger = structlog.get_logger(__name__)
 
-X_MAX_RESULTS = 100
-X_TIMEOUT_SECONDS = 20.0
 ENSEMBLE_BASE_FALLBACK = "https://ensembledata.com/apis"
 X_HANDLE_STOPWORDS = frozenset(
     {
@@ -56,25 +55,6 @@ def _keyword_auth_params() -> dict[str, str]:
     if settings.ENSEMBLE_X_GUEST_ID:
         params["guest_id"] = settings.ENSEMBLE_X_GUEST_ID
     return params
-
-
-def _as_int(value: object) -> int:
-    """Convert mixed metric values (int/float/str) into int safely."""
-    if isinstance(value, bool) or value is None:
-        return 0
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value)
-    if isinstance(value, str):
-        cleaned = value.strip().replace(",", "")
-        if not cleaned:
-            return 0
-        try:
-            return int(float(cleaned))
-        except ValueError:
-            return 0
-    return 0
 
 
 def _extract_items(payload: object) -> list[dict]:
@@ -206,8 +186,12 @@ def _candidate_handles(query: str) -> list[str]:
 
 def _cache_key(project_id: str, query: str, max_results: int) -> str:
     """Generate a deterministic, project-scoped cache key for X searches."""
-    query_hash = hashlib.sha256(f"{query}:{max_results}".encode()).hexdigest()[:16]
-    return f"search:cache:{project_id}:social_x:posts:{query_hash}"
+    return build_search_cache_key(
+        project_id=project_id,
+        provider="social_x",
+        query_type="posts",
+        parts=[query, max_results],
+    )
 
 
 def _endpoint_candidates(path: str) -> list[str]:
@@ -323,7 +307,7 @@ async def search_x_posts(
 
     # Check cache first
     cache_key = _cache_key(project_id, cleaned_query, max_results)
-    stale_key = f"{cache_key}:stale"
+    stale_key = build_stale_cache_key(cache_key)
     if redis:
         try:
             cached = await redis.get(cache_key)
@@ -363,7 +347,7 @@ async def _search_x_posts_impl(query: str, max_results: int = 20) -> list[dict]:
         logger.warning("social_x.no_token")
         return []
 
-    bounded_max = max(1, min(max_results, X_MAX_RESULTS))
+    bounded_max = max(1, min(max_results, settings.SOCIAL_X_MAX_RESULTS))
     logger.info(
         "social_x.search.start",
         query_preview=cleaned_query[:80],
@@ -371,7 +355,7 @@ async def _search_x_posts_impl(query: str, max_results: int = 20) -> list[dict]:
     )
 
     posts: list[dict] = []
-    async with httpx.AsyncClient(timeout=X_TIMEOUT_SECONDS) as client:
+    async with httpx.AsyncClient(timeout=settings.SOCIAL_X_TIMEOUT_SECONDS) as client:
         # Try keyword-style endpoints first (if available for tenant plan).
         keyword_candidates = (
             (
@@ -451,10 +435,10 @@ async def _search_x_posts_impl(query: str, max_results: int = 20) -> list[dict]:
                 "content": content,
                 "author": username
                 or str(normalized.get("name") or normalized.get("author") or "").strip(),
-                "likes": _as_int(normalized.get("favorite_count") or normalized.get("likes")),
-                "retweets": _as_int(normalized.get("retweet_count") or normalized.get("retweets")),
-                "replies": _as_int(normalized.get("reply_count") or normalized.get("replies")),
-                "quotes": _as_int(normalized.get("quote_count") or normalized.get("quotes")),
+                "likes": coerce_int(normalized.get("favorite_count") or normalized.get("likes")),
+                "retweets": coerce_int(normalized.get("retweet_count") or normalized.get("retweets")),
+                "replies": coerce_int(normalized.get("reply_count") or normalized.get("replies")),
+                "quotes": coerce_int(normalized.get("quote_count") or normalized.get("quotes")),
                 "published_at": str(
                     normalized.get("create_time") or normalized.get("created_at") or ""
                 ).strip(),

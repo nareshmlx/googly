@@ -2,12 +2,15 @@
 *.md
 !README.md
 *.ps1
+*.toml
+*.log
 
 # Docs, plans, logs and test directories
 docs/
 plans/
 tests/
 logs/
+openspec/
 
 # Python-generated files
 __pycache__/
@@ -19,6 +22,7 @@ wheels/
 
 # Virtual environments (each app has its own)
 apps/api/.venv/
+apps/api/.venv-local/
 apps/streamlit/.venv/
 .*env
 ensemble_data/

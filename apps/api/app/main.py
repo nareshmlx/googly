@@ -6,12 +6,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 
 from app.core.arq import close_arq_pool
-from app.core.auth import verify_internal_token
 from app.core.config import settings
-from app.core.db import close_db_pools, get_db_pool
+from app.core.db import close_db_pools
 from app.core.logging_setup import configure_logging
 from app.core.middleware import RequestIDMiddleware
 from app.core.redis import close_redis, get_redis
+from app.repositories.health import check_db_ready
 
 configure_logging(settings.LOG_LEVEL)
 
@@ -29,8 +29,11 @@ async def lifespan(app: FastAPI):
         )
 
     try:
-        pool = await get_db_pool()
-        logger.info("db.connected", pool_size=pool.get_size())
+        db_ready = await check_db_ready()
+        if db_ready:
+            logger.info("db.connected")
+        else:
+            logger.warning("db.connection_failed", error="db_not_ready")
     except Exception as e:
         logger.warning("db.connection_failed", error=str(e))
 
@@ -69,11 +72,11 @@ def create_app() -> FastAPI:
             "X-Internal-Token",
             "X-User-ID",
         ],
-        max_age=3600,
+        max_age=settings.CORS_MAX_AGE_SECONDS,
     )
 
     app.add_middleware(RequestIDMiddleware)
-    app.add_middleware(GZipMiddleware, minimum_size=1000)
+    app.add_middleware(GZipMiddleware, minimum_size=settings.GZIP_MINIMUM_SIZE_BYTES)
 
     from app.api.v1 import chat, kb, projects, users
 
@@ -97,10 +100,7 @@ def create_app() -> FastAPI:
         redis_ok = False
 
         try:
-            pool = await get_db_pool()
-            async with pool.acquire() as conn:
-                await conn.fetchval("SELECT 1")
-            db_ok = True
+            db_ok = await check_db_ready()
         except Exception as exc:
             logger.warning("health.db_unreachable", error=str(exc))
 

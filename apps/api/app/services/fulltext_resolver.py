@@ -7,7 +7,9 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 import structlog
 
 from app.core.config import settings
+from app.core.constants import SourceType
 from app.core.url_safety import is_safe_public_url
+from app.core.utils import parse_metadata
 from app.kb.ingester import RawDocument
 from app.services.fulltext_types import FulltextResolveResult
 
@@ -19,7 +21,9 @@ _PAPER_OA_HOST_HINTS = {
     "medrxiv.org",
     "pmc.ncbi.nlm.nih.gov",
     "pubmed.ncbi.nlm.nih.gov",
-    "doi.org",
+    # doi.org is intentionally excluded: it is a redirect resolver, not an OA
+    # host.  A doi.org URL may resolve to a paywalled publisher page.  The OA
+    # check must rely on is_open_access/open_access_url metadata instead.
     "openalex.org",
 }
 
@@ -82,7 +86,9 @@ def _paper_oa_allowed(url: str, metadata: dict) -> bool:
     if bool(metadata.get("is_open_access") or metadata.get("open_access")):
         return True
     hostname = (urlparse(url).hostname or "").lower()
-    if any(hostname == domain or hostname.endswith(f".{domain}") for domain in _PAPER_OA_HOST_HINTS):
+    if any(
+        hostname == domain or hostname.endswith(f".{domain}") for domain in _PAPER_OA_HOST_HINTS
+    ):
         return True
     return "/pdf" in url.lower() or "pmc" in url.lower()
 
@@ -90,17 +96,10 @@ def _paper_oa_allowed(url: str, metadata: dict) -> bool:
 def resolve_fulltext_url(doc: RawDocument) -> FulltextResolveResult:
     """Resolve fulltext candidate URL for one paper/patent metadata document."""
     # Parse metadata - may be JSON string from database
-    metadata_raw = doc.metadata
-    if isinstance(metadata_raw, str):
-        import json
-        metadata = json.loads(metadata_raw) if metadata_raw else {}
-    elif isinstance(metadata_raw, dict):
-        metadata = metadata_raw
-    else:
-        metadata = {}
+    metadata = parse_metadata(doc.metadata)
     source = str(doc.source or "").strip().lower()
     allowed_domains = _allowed_domains()
-    if source not in {"paper", "patent"}:
+    if source not in SourceType.FULLTEXT_ELIGIBLE_SOURCES:
         return FulltextResolveResult(status="skipped", reason="unsupported_source")
 
     candidates = _paper_candidates(metadata) if source == "paper" else _patent_candidates(metadata)

@@ -1,18 +1,17 @@
 """Reddit retrieval tool backed by EnsembleData subreddit-posts endpoint."""
 
-import hashlib
 import json
 import re
 
 import httpx
 import structlog
 
+from app.core.cache_keys import build_search_cache_key, build_stale_cache_key
 from app.core.config import settings
+from app.core.normalize import coerce_int
 
 logger = structlog.get_logger(__name__)
 
-REDDIT_MAX_POSTS_PER_SUBREDDIT = 40  # Increased from 10 to allow more posts per subreddit
-REDDIT_TIMEOUT_SECONDS = 20.0
 REDDIT_MIN_TOKEN_LEN = 3
 REDDIT_TOKEN_MAX_LEN = 40
 ENSEMBLE_BASE_FALLBACK = "https://ensembledata.com/apis"
@@ -58,25 +57,6 @@ TOPIC_SUBREDDIT_HINTS: dict[str, str] = {
     "perfume": "fragrance",
     "hair": "HaircareScience",
 }
-
-
-def _as_int(value: object) -> int:
-    """Convert mixed metric values (int/float/str) into int safely."""
-    if isinstance(value, bool) or value is None:
-        return 0
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value)
-    if isinstance(value, str):
-        cleaned = value.strip().replace(",", "")
-        if not cleaned:
-            return 0
-        try:
-            return int(float(cleaned))
-        except ValueError:
-            return 0
-    return 0
 
 
 def _curated_subreddits() -> list[str]:
@@ -196,8 +176,12 @@ def _extract_next_cursor(payload: object) -> str:
 
 def _cache_key(project_id: str, query: str, limit: int, time_filter: str) -> str:
     """Generate a deterministic, project-scoped cache key for Reddit searches."""
-    query_hash = hashlib.sha256(f"{query}:{limit}:{time_filter}".encode()).hexdigest()[:16]
-    return f"search:cache:{project_id}:social_reddit:posts:{query_hash}"
+    return build_search_cache_key(
+        project_id=project_id,
+        provider="social_reddit",
+        query_type="posts",
+        parts=[query, limit, time_filter],
+    )
 
 
 def _endpoint_candidates() -> list[str]:
@@ -217,7 +201,11 @@ def _endpoint_candidates() -> list[str]:
 
 
 async def search_reddit_posts(
-    project_id: str, query: str, limit: int = 24, time_filter: str = "week", redis=None
+    project_id: str,
+    query: str,
+    limit: int = settings.SOCIAL_REDDIT_DEFAULT_LIMIT,
+    time_filter: str = "week",
+    redis=None,
 ) -> list[dict]:
     """Aggregate top Reddit posts from intent-derived subreddits with caching."""
     cleaned_query = str(query or "").strip()
@@ -226,7 +214,7 @@ async def search_reddit_posts(
 
     # Check cache first
     cache_key = _cache_key(project_id, cleaned_query, limit, time_filter)
-    stale_key = f"{cache_key}:stale"
+    stale_key = build_stale_cache_key(cache_key)
     if redis:
         try:
             cached = await redis.get(cache_key)
@@ -259,7 +247,9 @@ async def search_reddit_posts(
 
 
 async def _search_reddit_posts_impl(
-    query: str, limit: int = 24, time_filter: str = "week"
+    query: str,
+    limit: int = settings.SOCIAL_REDDIT_DEFAULT_LIMIT,
+    time_filter: str = "week",
 ) -> list[dict]:
     """Internal implementation of Reddit post retrieval."""
     cleaned_query = query
@@ -275,7 +265,7 @@ async def _search_reddit_posts_impl(
     if not subreddits:
         return []
 
-    per_subreddit_limit = max(1, min(REDDIT_MAX_POSTS_PER_SUBREDDIT, max(20, limit)))
+    per_subreddit_limit = max(1, min(settings.INGEST_REDDIT_MAX_POSTS_PER_SUBREDDIT, max(20, limit)))
     logger.info(
         "social_reddit.search.start",
         query_preview=cleaned_query[:80],
@@ -288,7 +278,7 @@ async def _search_reddit_posts_impl(
     rows: list[dict] = []
     endpoints = _endpoint_candidates()
     max_pages = max(1, int(settings.INGEST_REDDIT_MAX_PAGES_PER_SUBREDDIT))
-    async with httpx.AsyncClient(timeout=REDDIT_TIMEOUT_SECONDS) as client:
+    async with httpx.AsyncClient(timeout=settings.SOCIAL_REDDIT_TIMEOUT_SECONDS) as client:
         for subreddit in subreddits:
             cursor = ""
             for _ in range(max_pages):
@@ -379,8 +369,8 @@ async def _search_reddit_posts_impl(
                 "content": str(row.get("selftext") or "").strip(),
                 "author": str(row.get("author_username") or row.get("author") or "").strip(),
                 "subreddit": subreddit_name,
-                "score": _as_int(row.get("score")),
-                "comments": _as_int(row.get("num_comments") or row.get("comment_count")),
+                "score": coerce_int(row.get("score")),
+                "comments": coerce_int(row.get("num_comments") or row.get("comment_count")),
                 "published_at": row.get("create_time") or row.get("created_utc") or "",
                 "url": permalink or url,
             }

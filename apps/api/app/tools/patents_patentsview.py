@@ -13,7 +13,6 @@ NOTE: The legacy API (api.patentsview.org) was shut down on May 1, 2025.
       This tool targets the new Search API endpoint.
 """
 
-import hashlib
 import json
 import time
 
@@ -21,10 +20,12 @@ import httpx
 import structlog
 
 from app.core.cache import TwoTierCache
+from app.core.cache_keys import build_search_cache_key, build_stale_cache_key
 from app.core.circuit_breaker import call_with_circuit_breaker, patentsview_breaker
 from app.core.config import settings
 from app.core.dedup import deduplicate_request
 from app.core.metrics import api_call_duration_seconds, api_calls_total
+from app.core.query_sanitize import sanitize_query
 from app.core.rate_limiter import patentsview_limiter, rate_limited_call
 from app.core.redis import get_redis
 from app.core.retry import retry_with_backoff
@@ -32,8 +33,6 @@ from app.core.retry import retry_with_backoff
 logger = structlog.get_logger(__name__)
 
 _BASE_URL = "https://search.patentsview.org/api/v1/patent/"
-_TIMEOUT = 15.0  # seconds
-_MAX_RESULTS = 20
 
 # Module-level HTTP client pool (reused across requests to prevent memory leak)
 _http_client: httpx.AsyncClient | None = None
@@ -46,14 +45,20 @@ async def _get_http_client() -> httpx.AsyncClient:
         headers = {}
         if settings.PATENTSVIEW_API_KEY:
             headers["X-Api-Key"] = settings.PATENTSVIEW_API_KEY
-        _http_client = httpx.AsyncClient(timeout=_TIMEOUT, headers=headers)
+        _http_client = httpx.AsyncClient(
+            timeout=settings.PATENTS_PATENTSVIEW_TIMEOUT_SECONDS, headers=headers
+        )
     return _http_client
 
 
 def _cache_key(project_id: str, query: str) -> str:
     """Generate deterministic project-scoped cache key for a query."""
-    query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()[:16]
-    return f"search:cache:{project_id}:patentsview:patents:{query_hash}"
+    return build_search_cache_key(
+        project_id=project_id,
+        provider="patentsview",
+        query_type="patents",
+        parts=[query],
+    )
 
 
 def _build_patentsview_query(
@@ -110,7 +115,7 @@ async def _search_with_retry(query_payload: dict) -> dict | None:
                     "inventors.inventor_name_first",
                     "inventors.inventor_name_last",
                 ],
-                "o": {"size": _MAX_RESULTS},
+                "o": {"size": settings.PAPERS_MAX_RESULTS},
             },
         )
         response.raise_for_status()
@@ -153,7 +158,7 @@ async def _search_impl(query: str, query_payload: dict) -> list[dict]:
         api_calls_total.labels(api_name="patentsview", status="timeout").inc()
         logger.warning(
             "patents_patentsview.timeout",
-            timeout=_TIMEOUT,
+            timeout=settings.PATENTS_PATENTSVIEW_TIMEOUT_SECONDS,
             query_preview=query[:80],
         )
         return []
@@ -242,14 +247,14 @@ async def _search_patentsview_impl(
     if result:
         await cache.set(cache_key, {"results": result}, ttl=settings.CACHE_TTL_PATENTS)
         # Store a "stale" copy that lasts longer
-        stale_key = f"{cache_key}:stale"
+        stale_key = build_stale_cache_key(cache_key)
         await redis_client.setex(
             stale_key, settings.CACHE_TTL_STALE, json.dumps({"results": result})
         )
         return result
 
     # 4. Failure -> Serve Stale Fallback
-    stale_key = f"{cache_key}:stale"
+    stale_key = build_stale_cache_key(cache_key)
     stale_raw = await redis_client.get(stale_key)
     if stale_raw:
         logger.warning(
@@ -302,13 +307,16 @@ async def search_patentsview(
     Never raises.
     """
     # Sanitize and normalize query BEFORE cache key generation (prevents cache key collision)
-    query = query.strip().lower()
-    if not query:
-        logger.warning("patents_patentsview.empty_query")
+    sanitized_query = sanitize_query(
+        query,
+        logger=logger,
+        empty_event="patents_patentsview.empty_query",
+        too_long_event="patents_patentsview.query_too_long",
+        lower=True,
+    )
+    if sanitized_query is None:
         return []
-    if len(query) > 1000:
-        logger.warning("patents_patentsview.query_too_long", original_length=len(query))
-        query = query[:1000]
+    query = sanitized_query
 
     query_payload = _build_patentsview_query(query, must_match_terms, domain_terms)
     if str(query_specificity or "").lower() == "specific" and must_match_terms:

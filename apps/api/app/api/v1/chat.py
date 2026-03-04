@@ -4,11 +4,13 @@ from fastapi.responses import StreamingResponse
 
 from app.api.ownership import require_owned_project
 from app.core.auth import get_current_user, verify_internal_token
-from app.core.db import get_db_pool
 from app.core.user_rate_limiter import check_chat_rate_limit
 from app.models.schemas import ChatRequest
-from app.repositories import chat_history as chat_history_repo
-from app.services.chat import get_chat_history_messages, stream_response
+from app.services.chat import (
+    get_chat_history_messages,
+    stream_response,
+    verify_chat_session_ownership,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -40,9 +42,10 @@ async def chat(
 
     # Session ownership check — if user provided a custom session_id, verify they own it
     if request.session_id:
-        pool = await get_db_pool()
-        session_owned = await chat_history_repo.verify_session_ownership(
-            pool, request.project_id, user_id, request.session_id
+        session_owned = await verify_chat_session_ownership(
+            project_id=request.project_id,
+            user_id=user_id,
+            session_id=request.session_id,
         )
         if not session_owned:
             raise HTTPException(
@@ -112,11 +115,12 @@ async def get_chat_history(
     user_id = current_user["user_id"]
 
     await require_owned_project(project_id, user_id)
-    pool = await get_db_pool()
 
     # Session ownership check — verify session belongs to current user
-    session_owned = await chat_history_repo.verify_session_ownership(
-        pool, project_id, user_id, session_id
+    session_owned = await verify_chat_session_ownership(
+        project_id=project_id,
+        user_id=user_id,
+        session_id=session_id,
     )
     if not session_owned:
         raise HTTPException(
