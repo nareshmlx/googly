@@ -246,9 +246,9 @@ async def upsert_documents(records: list[dict]) -> dict[tuple[str, str, str | No
                 NOW(),
                 NOW()
             ON CONFLICT (project_id, source, source_id) DO UPDATE SET
-                title = EXCLUDED.title,
+                title = CASE WHEN EXCLUDED.title = '' THEN knowledge_documents.title ELSE EXCLUDED.title END,
                 summary = EXCLUDED.summary,
-                metadata = EXCLUDED.metadata,
+                metadata = knowledge_documents.metadata || EXCLUDED.metadata,
                 updated_at = NOW()
             RETURNING project_id::text, source, source_id, id::text
             """,
@@ -266,8 +266,75 @@ async def upsert_documents(records: list[dict]) -> dict[tuple[str, str, str | No
     }
 
 
-async def insert_chunks(chunks: list[dict], vectors: list[list[float]]) -> int:
-    """Bulk insert knowledge chunks and return inserted row count."""
+async def set_document_enrichment_status(
+    conn: asyncpg.Connection,
+    *,
+    source_id: str,
+    project_id: str,
+    status: str,
+) -> None:
+    """Update enrichment_status in the metadata JSONB column for a knowledge_document row.
+
+    Uses a targeted jsonb_set update rather than a full re-ingest — avoids re-triggering
+    chunking and embedding for a status-only change. The caller must pass an open asyncpg
+    connection; this function never acquires its own pool connection, consistent with the
+    repository layer contract.
+    """
+    await conn.execute(
+        """
+        UPDATE knowledge_documents
+           SET metadata = jsonb_set(
+                   COALESCE(metadata, '{}'),
+                   '{enrichment_status}',
+                   to_jsonb($1::text)
+               ),
+               updated_at = NOW()
+         WHERE source_id = $2
+           AND project_id = $3::uuid
+        """,
+        status,
+        source_id,
+        project_id,
+    )
+
+
+async def update_enrichment_status(
+    *,
+    source_id: str,
+    project_id: str,
+    status: str,
+) -> None:
+    """Update enrichment_status using an internally managed pool connection.
+
+    Convenience wrapper around set_document_enrichment_status for callers that
+    do not already hold an open connection (e.g. ARQ task workers).
+    get_db_pool() is allowed here because this module is under app/repositories/.
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        await set_document_enrichment_status(
+            conn,
+            source_id=source_id,
+            project_id=project_id,
+            status=status,
+        )
+
+
+async def insert_chunks(
+    chunks: list[dict],
+    vectors: list[list[float]],
+    *,
+    overwrite: bool = False,
+) -> int:
+    """Bulk insert knowledge chunks and return inserted row count.
+
+    When overwrite=False (default) uses DO NOTHING — safe for repeated ingest of
+    the same source without duplicating or altering existing chunks.
+
+    When overwrite=True uses DO UPDATE — replaces content and embedding on conflict.
+    Used by enrich_video so the Gemini transcript overwrites the original short
+    description that was written during the initial ingest pass.
+    """
     if not chunks:
         return 0
     if len(chunks) != len(vectors):
@@ -277,10 +344,16 @@ async def insert_chunks(chunks: list[dict], vectors: list[list[float]]) -> int:
         msg = "document_id is required for every chunk insert"
         raise ValueError(msg)
 
+    conflict_clause = (
+        "DO UPDATE SET content = EXCLUDED.content, embedding = EXCLUDED.embedding"
+        if overwrite
+        else "DO NOTHING"
+    )
+
     pool = await get_db_pool()
     async with pool.acquire() as conn:
         inserted = await conn.fetchval(
-            """
+            f"""
             WITH inserted AS (
                 INSERT INTO knowledge_chunks
                     (id, document_id, project_id, user_id, source, source_id, title,
@@ -296,7 +369,7 @@ async def insert_chunks(chunks: list[dict], vectors: list[list[float]]) -> int:
                     unnest($7::text[]),
                     unnest($8::text[])::vector,
                     unnest($9::text[])::jsonb
-                ON CONFLICT (project_id, source, source_id) DO NOTHING
+                ON CONFLICT (project_id, source, source_id) {conflict_clause}
                 RETURNING 1
             )
             SELECT COUNT(*)::int FROM inserted

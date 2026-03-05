@@ -15,6 +15,7 @@ from app.core.logging_setup import configure_logging
 from app.tasks.backfill_fulltext_assets import backfill_fulltext_assets
 from app.tasks.bootstrap_project_setup import bootstrap_project_setup
 from app.tasks.cleanup import cleanup_old_chat_messages
+from app.tasks.enrich_video import enrich_video
 from app.tasks.ingest_document import ingest_document
 from app.tasks.ingest_project import ingest_project
 from app.tasks.ingest_source_asset import ingest_source_asset
@@ -42,6 +43,7 @@ class WorkerSettings:
         backfill_fulltext_assets,
         refresh_due_projects,
         cleanup_old_chat_messages,
+        func(enrich_video, timeout=settings.ARQ_WORKER_JOB_TIMEOUT),
     ]
 
     cron_jobs = [

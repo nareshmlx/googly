@@ -16,7 +16,7 @@ import structlog
 
 from app.core.cache_invalidation import invalidate_project_caches
 from app.core.config import settings
-from app.core.constants import RedisKeys
+from app.core.constants import RedisKeys, RedisTTL, SourceType
 from app.core.redis import get_redis
 from app.core.utils import parse_metadata
 from app.kb.embedder import embed_texts
@@ -57,6 +57,60 @@ from app.tasks.ingest_utils import (
 )
 
 logger = structlog.get_logger(__name__)
+
+
+async def _enqueue_video_enrichment(
+    arq_pool,
+    redis,
+    docs: list,
+    project_id: str,
+) -> None:
+    """Enqueue enrich_video ARQ jobs for YouTube docs that have not yet been enqueued.
+
+    Checks GEMINI_API_KEY first; logs a warning and returns early if unset.
+    Uses a Redis pipeline to batch all SET NX calls into a single round-trip,
+    collapsing N redis.set calls into 1. Only docs whose lock was acquired
+    (truthy result) get an ARQ job enqueued, preventing duplicate enrichment
+    jobs when concurrent ingest_project runs overlap.
+    """
+    if not settings.GEMINI_API_KEY:
+        logger.warning(
+            "enrich_video.skipped.no_api_key",
+            source_id_count=len(docs),
+            note="Set GEMINI_API_KEY to enable video enrichment",
+        )
+        return
+
+    if arq_pool is None:
+        logger.warning(
+            "enrich_video.skipped.no_arq_pool",
+            source_id_count=len(docs),
+        )
+        return
+
+    # Batch all SET NX calls into one Redis pipeline round-trip instead of N.
+    # transaction=False: plain pipeline, no MULTI/EXEC — each SET NX is already atomic.
+    async with redis.pipeline(transaction=False) as pipe:
+        for doc in docs:
+            enqueued_key = RedisKeys.VIDEO_ENRICH_ENQUEUED.format(source_id=doc.source_id)
+            await pipe.set(enqueued_key, "1", ex=RedisTTL.VIDEO_ENRICH_ENQUEUED, nx=True)
+        results = await pipe.execute()
+
+    for doc, acquired in zip(docs, results, strict=True):
+        if acquired:
+            await arq_pool.enqueue_job(
+                "enrich_video",
+                source_id=str(doc.source_id),
+                platform=SourceType.DISCOVER_SOURCE_MAP[SourceType.SOCIAL_YOUTUBE],
+                video_id=str(doc.source_id),
+                project_id=project_id,
+                original_description=doc.content or "",
+            )
+            logger.info(
+                "enrich_video.enqueued",
+                source_id=doc.source_id,
+                project_id=project_id,
+            )
 
 
 async def ingest_project(ctx: dict, project_id: str) -> None:
@@ -585,6 +639,10 @@ async def _run_ingestion(
             else:
                 inserted += await ingest_documents(kept_docs)
                 fulltext_enqueued += await _schedule_fulltext_enrichment(ctx, None, kept_docs)
+                if source_key == SourceType.SOCIAL_YOUTUBE:
+                    # ctx["redis"] is the ArqRedis pool — only it has enqueue_job.
+                    # The plain redis client (get_redis()) is used for lock ops.
+                    await _enqueue_video_enrichment(ctx.get("redis"), redis, kept_docs, project_id)
 
             # When expansion is enabled, track social doc IDs inserted in this
             # first pass so Section 2 doesn't double-insert the same documents.

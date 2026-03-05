@@ -224,9 +224,9 @@ async def cache_response(
             project_id=project_id, hash=f"{version}:{query_hash}"
         )
         ttl = (
-            RedisTTL.SEMANTIC_CACHE_TRENDING.value
+            RedisTTL.SEMANTIC_CACHE_TRENDING
             if is_trending
-            else RedisTTL.SEMANTIC_CACHE_STABLE.value
+            else RedisTTL.SEMANTIC_CACHE_STABLE
         )
         await redis.setex(cache_key, ttl, response)
         logger.info("chat.cached", project_id=project_id, query_hash=query_hash, ttl=ttl)
@@ -250,7 +250,7 @@ async def _list_projects_summary_cached(user_id: str) -> list[dict]:
     projects = await list_projects_summary_for_chat(user_id)
     try:
         redis = await get_redis()
-        await redis.setex(cache_key, RedisTTL.PROJECTS_SUMMARY.value, json.dumps(projects))
+        await redis.setex(cache_key, RedisTTL.PROJECTS_SUMMARY, json.dumps(projects))
     except Exception:
         logger.warning("chat.projects_summary_cache_write_error", user_id=user_id)
     return projects
@@ -302,7 +302,7 @@ async def persist_chat_turn(
         pipe = redis.pipeline(transaction=True)
         pipe.rpush(history_key, user_payload)
         pipe.rpush(history_key, assistant_payload)
-        pipe.expire(history_key, RedisTTL.CHAT_HISTORY.value)
+        pipe.expire(history_key, RedisTTL.CHAT_HISTORY)
         await pipe.execute()
     except Exception:
         logger.warning(

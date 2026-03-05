@@ -98,7 +98,7 @@ async def enqueue_document_upload(
     try:
         redis = await get_redis()
         encoded = base64.b64encode(content_bytes).decode("ascii")
-        await redis.setex(staging_key, RedisTTL.UPLOAD_STAGING.value, encoded)
+        await redis.setex(staging_key, RedisTTL.UPLOAD_STAGING, encoded)
         await arq_pool.enqueue_job(
             "ingest_document",
             upload_id,

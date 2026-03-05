@@ -157,19 +157,54 @@ async def _filter_stage2_llm(
     must_terms = set(must_match_terms or [])
     required_count = _required_must_match_count(must_terms)
 
+    # Extract a concise summary from the intent (which may be a JSON blob).
+    # Prefer keywords and domain fields over the full JSON string.
+    _intent_summary = intent_text
+    try:
+        import json as _json
+
+        _parsed = _json.loads(intent_text)
+        if isinstance(_parsed, dict):
+            _parts: list[str] = []
+            if _parsed.get("domain"):
+                _parts.append(str(_parsed["domain"]).replace("_", " "))
+            if _parsed.get("keywords"):
+                _parts.extend(str(k) for k in _parsed["keywords"][:10])
+            if _parsed.get("domain_terms"):
+                _parts.extend(str(k) for k in _parsed["domain_terms"][:5])
+            if _parts:
+                _intent_summary = ", ".join(_parts)
+    except Exception:
+        pass  # fall back to raw intent_text
+
+    logger.info(
+        "filter_stage2_llm.start",
+        source=source,
+        candidates=len(items),
+        intent_summary=_intent_summary[:120],
+    )
+
     async def _judge(item: dict) -> bool:
         content = _relevance_item_text(item)
+        title = str(item.get("title") or "")[:80]
         if must_terms:
             tokens = _tokenize(content)
             matches = sum(1 for t in must_terms if t in tokens)
             if matches < required_count:
+                logger.debug(
+                    "filter_stage2_llm.term_rejected",
+                    source=source,
+                    title=title,
+                    matches=matches,
+                    required=required_count,
+                )
                 return False
 
         prompt = (
             f"You are a research assistant judging the relevance of a {source}.\n"
-            f"Target Context: {intent_text}\n\n"
+            f"Research topic: {_intent_summary}\n\n"
             f"Candidate Content: {content[:1000]}\n\n"
-            "Is this extremely relevant to the target context? Reply exactly with YES or NO."
+            "Is this content relevant to the research topic? Reply exactly with YES or NO."
         )
         try:
             resp = await chat_completion(
@@ -178,12 +213,29 @@ async def _filter_stage2_llm(
                 temperature=0,
                 max_tokens=5,
             )
-            return "YES" in str(resp).upper()
+            decision = "YES" in str(resp).upper()
+            logger.info(
+                "filter_stage2_llm.decision",
+                source=source,
+                title=title,
+                decision="YES" if decision else "NO",
+                raw_response=str(resp)[:20],
+            )
+            return decision
         except Exception:
+            logger.warning("filter_stage2_llm.llm_error_fail_open", source=source, title=title)
             return True
 
     results = await asyncio.gather(*[_judge(it) for it in items])
-    return [it for it, keep in zip(items, results, strict=False) if keep]
+    kept = [it for it, keep in zip(items, results, strict=False) if keep]
+    logger.info(
+        "filter_stage2_llm.complete",
+        source=source,
+        candidates=len(items),
+        kept=len(kept),
+        filtered_out=len(items) - len(kept),
+    )
+    return kept
 
 
 async def _filter_stage2_llm_social(

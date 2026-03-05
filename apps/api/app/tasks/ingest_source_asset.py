@@ -89,7 +89,7 @@ async def ingest_source_asset(ctx: dict, asset_id: str) -> None:
         return
 
     lock_key = RedisKeys.FULLTEXT_ASSET_LOCK.format(asset_id=asset_id)
-    acquired = await redis.set(lock_key, "1", nx=True, ex=RedisTTL.FULLTEXT_ASSET_LOCK.value)
+    acquired = await redis.set(lock_key, "1", nx=True, ex=RedisTTL.FULLTEXT_ASSET_LOCK)
     if not acquired:
         return
 

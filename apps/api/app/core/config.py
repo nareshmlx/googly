@@ -12,6 +12,19 @@ class Settings(BaseSettings):
 
     OPENAI_API_KEY: str | None = None
 
+    # === Gemini video enrichment ===
+    GEMINI_API_KEY: str | None = None
+    GEMINI_VIDEO_MODEL: str = Field(
+        default="gemini-3.1-flash-lite-preview",
+        description="Gemini model used for YouTube video transcript and signal extraction.",
+    )
+    VIDEO_ENRICH_MAX_DURATION_SECONDS: int = Field(
+        default=600,
+        ge=10,
+        le=3600,
+        description="Maximum video duration (seconds) sent to Gemini for enrichment. Videos exceeding this limit are skipped.",
+    )
+
     # === Embedding Model Configuration ===
     EMBEDDING_MODEL: str = "text-embedding-3-small"
     EMBEDDING_MODEL_VERSION: str = "v3-small-2024"  # Update when OpenAI changes model
@@ -395,8 +408,43 @@ class Settings(BaseSettings):
         le=3600,
         description="ARQ worker job timeout in seconds.",
     )
-    ARQ_WORKER_MAX_JOBS: int = 20
+    ARQ_WORKER_MAX_JOBS: int = Field(
+        default=40,
+        ge=1,
+        le=200,
+        description=(
+            "Max concurrent jobs per ARQ worker pod. I/O-bound tasks (LLM, HTTP, DB) are safe "
+            "at high concurrency. Keep below the asyncpg pool size (50) to avoid connection "
+            "contention. Default 40 leaves headroom for other job types sharing the pool."
+        ),
+    )
     ARQ_WORKER_HEALTH_CHECK_INTERVAL: int = 30
+    GEMINI_MAX_CALLS_PER_MINUTE: int = Field(
+        default=15,
+        ge=1,
+        le=1000,
+        description=(
+            "Maximum Gemini API calls allowed per minute across all worker pods. "
+            "Enforced via a Redis sliding-window counter so the limit is global, "
+            "not per-pod. Tune to match your Gemini quota tier. "
+            "gemini-3.1-flash-lite-preview free tier: 15 RPM."
+        ),
+    )
+    GEMINI_MAX_CALLS_PER_DAY: int = Field(
+        default=500,
+        ge=1,
+        le=100000,
+        description=(
+            "Maximum Gemini API calls allowed per calendar day (UTC) across all worker pods. "
+            "gemini-3.1-flash-lite-preview free tier: 500 RPD."
+        ),
+    )
+    GEMINI_RATE_LIMIT_WINDOW: int = Field(
+        default=60,
+        ge=10,
+        le=300,
+        description="Sliding window size in seconds for the Gemini per-minute rate limiter.",
+    )
     ARQ_REFRESH_CRON_HOURS: tuple[int, ...] = (0, 6, 12, 18)
     CHAT_HISTORY_RETENTION_DAYS: int = 90
     INGEST_SOCIAL_RAW_TARGET_TOTAL: int = Field(

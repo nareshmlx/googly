@@ -69,7 +69,7 @@ async def set_project_ingest_status(
     try:
         redis = await get_redis()
         key = RedisKeys.PROJECT_INGEST_STATUS.format(project_id=project_id)
-        await redis.setex(key, RedisTTL.PROJECT_INGEST_STATUS.value, json.dumps(payload))
+        await redis.setex(key, RedisTTL.PROJECT_INGEST_STATUS, json.dumps(payload))
     except Exception:
         logger.warning("project_service.ingest_status_set_failed", project_id=project_id)
 
@@ -139,7 +139,7 @@ async def get_project_ingest_status(project_id: str) -> dict:
                         )
                     await redis_client.setex(
                         status_key,
-                        RedisTTL.PROJECT_INGEST_STATUS.value,
+                        RedisTTL.PROJECT_INGEST_STATUS,
                         json.dumps(redis_payload),
                     )
             except Exception:
@@ -227,7 +227,7 @@ async def set_project_setup_status(
     try:
         redis = await get_redis()
         key = RedisKeys.PROJECT_SETUP_STATUS.format(project_id=project_id)
-        await redis.setex(key, RedisTTL.PROJECT_SETUP_STATUS.value, json.dumps(payload))
+        await redis.setex(key, RedisTTL.PROJECT_SETUP_STATUS, json.dumps(payload))
     except Exception:
         logger.warning("project_service.setup_status_set_redis_failed", project_id=project_id)
 

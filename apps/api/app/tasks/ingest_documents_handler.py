@@ -172,7 +172,7 @@ async def _set_ingest_status(
 
     try:
         # Use setex to match ProjectService.get() which expects a string/blob
-        await redis.setex(key, RedisTTL.PROJECT_INGEST_STATUS.value, json.dumps(data))
+        await redis.setex(key, RedisTTL.PROJECT_INGEST_STATUS, json.dumps(data))
     except Exception:
         logger.exception("set_ingest_status.failed", project_id=project_id)
 
@@ -239,8 +239,12 @@ async def _schedule_fulltext_enrichment(
             )
         if not asset_id:
             continue
-        # Using redis.enqueue_job assuming redis is an Arq container or similar wrapper as used in codebase
         try:
+            existing = await source_asset_repo.fetch_source_asset_for_service(asset_id)
+            if existing and str(existing.get("fetch_status") or "") in {"fetched", "failed"}:
+                continue
+            # Clear any stale ARQ dedup key so re-enqueue succeeds after a worker crash
+            await redis.delete(f"arq:result:fulltext:{asset_id}")
             await redis.enqueue_job("ingest_source_asset", asset_id, _job_id=f"fulltext:{asset_id}")
             scheduled += 1
         except Exception:

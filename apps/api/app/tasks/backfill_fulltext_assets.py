@@ -106,7 +106,7 @@ async def backfill_fulltext_assets(
 
     await redis.setex(
         cursor_key,
-        RedisTTL.FULLTEXT_BACKFILL_CURSOR.value,
+        RedisTTL.FULLTEXT_BACKFILL_CURSOR,
         json.dumps({"created_at": last_created_at, "id": last_id}),
     )
 

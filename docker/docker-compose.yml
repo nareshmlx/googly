@@ -39,10 +39,9 @@ services:
     working_dir: /app
     volumes:
       - ../apps/api:/app
+      - ../.env:/app/.env:ro
       - uv_cache:/home/user/.cache/uv
     command: uv run arq app.tasks.worker.WorkerSettings
-    env_file:
-      - ../.env
     environment:
       DATABASE_URL: postgresql+asyncpg://googly:googly@db:5432/googly
       REDIS_URL: redis://redis:6379/0

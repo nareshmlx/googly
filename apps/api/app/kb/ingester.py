@@ -58,11 +58,18 @@ class RawDocument:
     metadata: dict  # arbitrary source-specific fields (url, published_at, etc.)
 
 
-async def ingest_documents(documents: list[RawDocument]) -> int:
+async def ingest_documents(documents: list[RawDocument], *, overwrite: bool = False) -> int:
     """
     Upsert documents into knowledge_documents, then chunk/embed/link to knowledge_chunks.
 
-    Returns total number of chunks inserted.
+    When overwrite=False (default) chunk inserts use DO NOTHING — safe for repeated
+    ingest of the same source without duplicating or altering existing chunks.
+
+    When overwrite=True chunk inserts use DO UPDATE — replaces content and embedding
+    on conflict so enriched content (e.g. Gemini transcript) overwrites the original
+    short description written during the first ingest pass.
+
+    Returns total number of chunks inserted (or updated when overwrite=True).
     """
     if not documents:
         return 0
@@ -149,7 +156,16 @@ async def ingest_documents(documents: list[RawDocument]) -> int:
     vectors = await embed_texts(texts)
 
     # 3. Bulk insert chunks
-    inserted = await knowledge_repo.insert_chunks(all_chunks, vectors)
+    inserted = await knowledge_repo.insert_chunks(all_chunks, vectors, overwrite=overwrite)
 
-    logger.info("ingester.done", inserted=inserted, total_chunks=len(all_chunks))
+    # Log source_ids when batch is small (single-doc enrichment re-ingest) so
+    # operators can tie "N chunks inserted" to a specific video/document source_id.
+    batch_source_ids = [sid for _, sid, _ in doc_records]
+    logger.info(
+        "ingester.done",
+        inserted=inserted,
+        total_chunks=len(all_chunks),
+        source_ids=batch_source_ids if len(batch_source_ids) <= 5 else None,
+        doc_count=len(batch_source_ids),
+    )
     return inserted

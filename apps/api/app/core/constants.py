@@ -1,5 +1,3 @@
-from enum import Enum
-
 EMBEDDING_DIM = 1536
 
 
@@ -30,6 +28,10 @@ class RedisKeys:
     FULLTEXT_ASSET_DEDUP = "fulltext:asset:dedup:{project_id}:{source}:{source_id}:{url_hash}"
     FULLTEXT_BACKFILL_CURSOR = "fulltext:backfill:cursor:{scope}"
     FULLTEXT_BACKFILL_PAUSE = "fulltext:backfill:pause"
+    VIDEO_ENRICH_LOCK = "video_enrich_lock:{source_id}"
+    VIDEO_ENRICH_ENQUEUED = "video_enrich_enqueued:{source_id}"
+    GEMINI_RATE_LIMIT = "gemini:ratelimit:{window}"
+    GEMINI_RATE_LIMIT_DAY = "gemini:ratelimit:day:{date}"  # UTC date YYYY-MM-DD
 
     # Search API cache keys (project-scoped, deterministic SHA256)
     SEARCH_CACHE = "search:cache:{project_id}:{api}:{query_type}:{hash}"
@@ -41,8 +43,15 @@ class RedisKeys:
     CIRCUIT_BREAKER_LAST_FAILURE = "circuit:{api}:last_failure"
 
 
-class RedisTTL(Enum):
-    SEMANTIC_CACHE_TRENDING = 3600
+class RedisTTL:
+    """TTL constants in seconds for Redis keys.
+
+    Plain int attributes (not IntEnum) so redis-py accepts them directly as
+    ex= / px= / exat= arguments. redis-py rejects IntEnum values for TTL
+    parameters with ResponseError even though IntEnum is a subclass of int.
+    """
+
+    SEMANTIC_CACHE_TRENDING: int = 3600
     SEMANTIC_CACHE_STABLE = 86400
     SESSION = 1800
     RATE_LIMIT = 60
@@ -70,6 +79,10 @@ class RedisTTL(Enum):
 
     # Circuit breaker recovery timeout
     CIRCUIT_BREAKER_RECOVERY = 60  # 60 seconds open before half-open retry
+
+    # Video enrichment
+    VIDEO_ENRICH_LOCK = 3600  # 1 hour — in-progress mutex; deleted on completion/failure
+    VIDEO_ENRICH_ENQUEUED = 90000  # 25 hours — matches Gemini daily quota reset window
 
 
 class EmbeddingBatchSize:

@@ -138,7 +138,7 @@ async def embed_texts(texts: list[str]) -> list[list[float]]:
             # Store as JSON string — compatible with decode_responses=True Redis client.
             # Binary struct.pack is NOT compatible because Redis client decodes all
             # responses as UTF-8, which crashes on float bytes ≥ 0x80.
-            pipe.setex(key, RedisTTL.EMBED_CACHE.value, json.dumps(vector))
+            pipe.setex(key, RedisTTL.EMBED_CACHE, json.dumps(vector))
         await pipe.execute()
 
         logger.info("embedder.done", embedded=len(uncached_indices))

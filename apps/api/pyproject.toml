@@ -37,6 +37,7 @@ dependencies = [
     "prometheus-client~=0.21.0",
     "defusedxml~=0.7.1",
     "vulture>=2.14",
+    "google-genai~=1.65",
     "hdbscan~=0.8.41",
     "scikit-learn~=1.6.0",
     "scipy~=1.15.0",

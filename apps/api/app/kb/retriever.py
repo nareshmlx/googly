@@ -243,7 +243,7 @@ async def retrieve(
         if hot_cache_key:
             try:
                 redis = await get_redis()
-                await redis.setex(hot_cache_key, RedisTTL.KB_HOT.value, json.dumps(results))
+                await redis.setex(hot_cache_key, RedisTTL.KB_HOT, json.dumps(results))
             except Exception:
                 logger.warning("retriever.hot_cache_write_error", query_hash=query_hash)
 
@@ -298,7 +298,7 @@ async def retrieve(
     if hot_cache_key:
         try:
             redis = await get_redis()
-            await redis.setex(hot_cache_key, RedisTTL.KB_HOT.value, json.dumps(results))
+            await redis.setex(hot_cache_key, RedisTTL.KB_HOT, json.dumps(results))
         except Exception:
             logger.warning("retriever.hot_cache_write_error", query_hash=query_hash)
 
