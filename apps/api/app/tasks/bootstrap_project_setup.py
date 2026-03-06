@@ -1,6 +1,4 @@
 """ARQ bootstrap task for async project setup after create/upload flows."""
-
-import json
 from datetime import UTC, datetime
 
 import structlog
@@ -125,7 +123,11 @@ async def bootstrap_project_setup(
 
         await project_repo.update_project_intent_for_service(project_id, merged_intent)
 
-        embedding_input = f"{project.get('description', '')}\n{json.dumps(merged_intent, sort_keys=True)}"
+        embedding_text = (
+            str(project.get("enriched_description") or "").strip()
+            or str(project.get("description") or "").strip()
+        )
+        embedding_input = project_service._build_hybrid_embedding_text(embedding_text, merged_intent)
         vectors = await embed_texts([embedding_input])
         if vectors:
             await project_repo.update_project_intent_embedding_for_service(project_id, vectors[0])

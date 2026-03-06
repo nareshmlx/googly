@@ -335,6 +335,55 @@ async def _expand_description(description: str) -> str:
     return expanded
 
 
+def _intent_keywords(structured_intent: dict | None, *, max_items: int = 40) -> list[str]:
+    if not isinstance(structured_intent, dict):
+        return []
+
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _push(value: object) -> None:
+        text = str(value or "").strip()
+        if not text:
+            return
+        key = text.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(text)
+
+    for field in ("keywords", "must_match_terms", "entities", "domain_terms"):
+        values = structured_intent.get(field)
+        if not isinstance(values, list | tuple | set):
+            continue
+        for item in values:
+            _push(item)
+            if len(out) >= max_items:
+                return out
+
+    domain = str(structured_intent.get("domain") or "").replace("_", " ").strip()
+    if domain:
+        _push(domain)
+
+    return out[:max_items]
+
+
+def _build_hybrid_embedding_text(base_text: str, structured_intent: dict | None) -> str:
+    primary = str(base_text or "").strip()
+    keywords = _intent_keywords(structured_intent)
+    if keywords:
+        keywords_block = ", ".join(keywords)
+        if primary:
+            return f"{primary}\n\nIntent Keywords: {keywords_block}"
+        return f"Intent Keywords: {keywords_block}"
+
+    if primary:
+        return primary
+    if isinstance(structured_intent, dict):
+        return json.dumps(structured_intent, sort_keys=True)
+    return ""
+
+
 async def create_project(
     user_id: str,
     title: str,
@@ -352,6 +401,9 @@ async def create_project(
     tavily_enabled: bool = True,
     exa_enabled: bool = True,
     openalex_enabled: bool | None = None,
+    enqueue_ingestion: bool = True,
+    skip_description_expansion: bool = False,
+    intent_seed_text: str | None = None,
 ) -> dict:
     """
     Create a project, extract structured intent, and enqueue initial KB ingestion.
@@ -389,18 +441,22 @@ async def create_project(
     logger.info("project_service.create.inserted", project_id=project_id)
 
     # 2. Expand and extract intent synchronously — safe to fail
-    try:
-        expanded = await asyncio.wait_for(
-            _expand_description(description),
-            timeout=settings.PROJECT_CREATE_INTENT_TIMEOUT,
-        )
-    except TimeoutError:
-        logger.warning(
-            "project_service.create.expand_timeout",
-            project_id=project_id,
-            timeout_seconds=settings.PROJECT_CREATE_INTENT_TIMEOUT,
-        )
-        expanded = description
+    seed_text = str(intent_seed_text or "").strip() or description
+    if skip_description_expansion:
+        expanded = seed_text
+    else:
+        try:
+            expanded = await asyncio.wait_for(
+                _expand_description(seed_text),
+                timeout=settings.PROJECT_CREATE_INTENT_TIMEOUT,
+            )
+        except TimeoutError:
+            logger.warning(
+                "project_service.create.expand_timeout",
+                project_id=project_id,
+                timeout_seconds=settings.PROJECT_CREATE_INTENT_TIMEOUT,
+            )
+            expanded = seed_text
 
     try:
         intent = await asyncio.wait_for(
@@ -444,7 +500,7 @@ async def create_project(
     await project_repo.update_project_intent_for_service(project_id, intent)
     project["structured_intent"] = intent
 
-    embedding_input = f"{expanded}\n{json.dumps(intent, sort_keys=True)}"
+    embedding_input = _build_hybrid_embedding_text(expanded, intent)
     try:
         vectors = await embed_texts([embedding_input])
         if vectors:
@@ -464,6 +520,14 @@ async def create_project(
     await _invalidate_projects_summary_cache(user_id)
 
     # 4. Enqueue initial KB population (non-blocking)
+    if enqueue_ingestion:
+        await enqueue_project_ingestion(project_id, arq_pool)
+
+    return project
+
+
+async def enqueue_project_ingestion(project_id: str, arq_pool: ArqRedis) -> bool:
+    """Enqueue background ingest job and persist queued status."""
     try:
         job = await arq_pool.enqueue_job("ingest_project", project_id)
         now = datetime.now(UTC).isoformat()
@@ -476,11 +540,11 @@ async def create_project(
             job_id=str(getattr(job, "job_id", "") or ""),
         )
         logger.info("project_service.create.ingestion_enqueued", project_id=project_id)
+        return True
     except Exception:
         # ARQ failure must not fail project creation — KB will be empty until user retries
         logger.warning("project_service.create.enqueue_failed", project_id=project_id)
-
-    return project
+        return False
 
 
 async def list_projects(user_id: str) -> list[dict]:
@@ -549,8 +613,13 @@ async def apply_wizard_overrides(
         enriched_description or None,
     )
 
-    embedding_text = (enriched_description or project.get("description") or "").strip()
-    embedding_input = f"{embedding_text}\n{json.dumps(merged_intent, sort_keys=True)}"
+    embedding_text = (
+        enriched_description
+        or project.get("enriched_description")
+        or project.get("description")
+        or ""
+    )
+    embedding_input = _build_hybrid_embedding_text(embedding_text, merged_intent)
     try:
         vectors = await embed_texts([embedding_input])
         if vectors:

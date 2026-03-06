@@ -136,6 +136,7 @@ class WizardCreateRequest(BaseModel):
     description: str = Field(..., min_length=10, max_length=5000)
     qa_pairs: list[WizardQAPair] = Field(default_factory=list)
     refresh_strategy: str = Field(default="once")
+    enriched_description: str = Field(default="", max_length=12000)
     domain_focus: str = Field(default="", max_length=255)
     key_entities: list[str] = Field(default_factory=list)
     must_match_terms: list[str] = Field(default_factory=list)

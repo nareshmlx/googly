@@ -226,59 +226,79 @@ async def wizard_create_project(
     source_toggles = _normalize_target_sources(body.target_sources)
 
     user_id = current_user["user_id"]
-    project = await _run_service_call(
-        action="wizard_create",
-        detail="Failed to create wizard project",
-        coro=project_service.create_project(
-            user_id=user_id,
-            title=body.title,
-            description=body.description,
-            refresh_strategy=body.refresh_strategy,
-            arq_pool=arq_pool,
-            tiktok_enabled=source_toggles["tiktok"],
-            instagram_enabled=source_toggles["instagram"],
-            youtube_enabled=source_toggles["youtube"],
-            reddit_enabled=source_toggles["reddit"],
-            x_enabled=source_toggles["x"],
-            papers_enabled=source_toggles["papers"],
-            patents_enabled=source_toggles["patents"],
-            perigon_enabled=source_toggles["news"],
-            tavily_enabled=source_toggles["web_tavily"],
-            exa_enabled=source_toggles["web_exa"],
-        ),
-    )
+    created_project_id = ""
+    try:
+        project = await _run_service_call(
+            action="wizard_create",
+            detail="Failed to create wizard project",
+            coro=project_service.create_project(
+                user_id=user_id,
+                title=body.title,
+                description=body.description,
+                refresh_strategy=body.refresh_strategy,
+                arq_pool=arq_pool,
+                tiktok_enabled=source_toggles["tiktok"],
+                instagram_enabled=source_toggles["instagram"],
+                youtube_enabled=source_toggles["youtube"],
+                reddit_enabled=source_toggles["reddit"],
+                x_enabled=source_toggles["x"],
+                papers_enabled=source_toggles["papers"],
+                patents_enabled=source_toggles["patents"],
+                perigon_enabled=source_toggles["news"],
+                tavily_enabled=source_toggles["web_tavily"],
+                exa_enabled=source_toggles["web_exa"],
+                enqueue_ingestion=False,
+                skip_description_expansion=True,
+                intent_seed_text=str(body.enriched_description or "").strip()
+                or str(body.description or "").strip(),
+            ),
+        )
+        created_project_id = str(project.get("id") or "")
 
-    synthesis_payload = await _run_service_call(
-        action="wizard_synthesize",
-        detail="Failed to synthesize enriched description",
-        coro=project_wizard_service.synthesize_wizard_review(
-            title=body.title,
-            description=body.description,
-            qa_pairs=_qa_payload(body.qa_pairs),
-            structured_intent=parse_metadata(project.get("structured_intent")),
-            source_toggles=source_toggles,
-        ),
-    )
+        enriched_description = str(body.enriched_description or "").strip() or str(
+            body.description or ""
+        ).strip()
 
-    updated = await _run_service_call(
-        action="wizard_merge",
-        detail="Failed to merge wizard overrides into intent",
-        coro=project_service.apply_wizard_overrides(
-            project_id=project["id"],
-            enriched_description=str(synthesis_payload.get("enriched_description") or ""),
-            overrides={
-                "domain_focus": body.domain_focus,
-                "key_entities": body.key_entities,
-                "must_match_terms": body.must_match_terms,
-                "time_horizon": body.time_horizon,
-                "target_sources": source_toggles,
-            },
-        ),
-    )
-
-    if not updated:
+        updated = await _run_service_call(
+            action="wizard_merge",
+            detail="Failed to merge wizard overrides into intent",
+            coro=project_service.apply_wizard_overrides(
+                project_id=created_project_id,
+                enriched_description=enriched_description,
+                overrides={
+                    "domain_focus": body.domain_focus,
+                    "key_entities": body.key_entities,
+                    "must_match_terms": body.must_match_terms,
+                    "time_horizon": body.time_horizon,
+                    "target_sources": source_toggles,
+                },
+            ),
+        )
+        if not updated:
+            raise HTTPException(status_code=500, detail="Failed to finalize wizard project")
+    except HTTPException:
+        if created_project_id:
+            deleted = await project_service.delete_project(created_project_id, user_id)
+            if not deleted:
+                logger.warning(
+                    "projects.wizard_create.rollback_failed",
+                    project_id=created_project_id,
+                    user_id=user_id,
+                )
+        raise
+    except Exception:
+        if created_project_id:
+            deleted = await project_service.delete_project(created_project_id, user_id)
+            if not deleted:
+                logger.warning(
+                    "projects.wizard_create.rollback_failed",
+                    project_id=created_project_id,
+                    user_id=user_id,
+                )
+        logger.exception("projects.wizard_create.unexpected")
         raise HTTPException(status_code=500, detail="Failed to finalize wizard project")
 
+    await project_service.enqueue_project_ingestion(created_project_id, arq_pool)
     return _serialize_project(updated)
 
 

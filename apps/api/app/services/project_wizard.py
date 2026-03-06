@@ -22,6 +22,8 @@ _CORE_DIMENSIONS: tuple[str, ...] = (
 )
 _DOMAIN_DIMENSION = "domain_specificity"
 _ALL_DIMENSIONS: tuple[str, ...] = (*_CORE_DIMENSIONS, _DOMAIN_DIMENSION)
+_CORE_STOP_THRESHOLD = 0.7
+_DOMAIN_STOP_THRESHOLD = 0.6
 
 _DEFAULT_TIME_HORIZON = "last 1 year"
 
@@ -38,18 +40,26 @@ _DEFAULT_SOURCE_TOGGLES: dict[str, bool] = {
     "web_exa": True,
 }
 
-_QUESTION_CATALOG: dict[str, str] = {
+_QUESTION_CATALOG: dict[str, tuple[str, ...]] = {
     "objective_clarity": (
-        "What exact research question should this project answer, and what decision will it support?"
+        "What exact research question should this project answer, and what decision will it support?",
+        "What is the single most important decision this research should enable in the next planning cycle?",
+        "If this project succeeds, what precise question will no longer be ambiguous for your team?",
     ),
     "pain_point_clarity": (
-        "What specific pain point, risk, or uncertainty are you trying to reduce with this research?"
+        "What specific pain point, risk, or uncertainty are you trying to reduce with this research?",
+        "What is the current consequence of not having this insight (for example delays, wasted spend, or poor prioritization)?",
+        "Where is your team currently guessing instead of using evidence, and what risk does that create?",
     ),
     "output_clarity": (
-        "What should the final output look like (for example: ranked opportunities, competitor matrix, or action plan)?"
+        "What should the final output look like (for example: ranked opportunities, competitor matrix, or action plan)?",
+        "What deliverable format would be most useful to decision makers (for example one-page brief, dashboard, or prioritized recommendations)?",
+        "How should findings be structured so stakeholders can act immediately?",
     ),
     "domain_specificity": (
-        "Which data platforms should be prioritized first (for example TikTok, Reddit, OpenAlex, Patents, News, Web)?"
+        "Which data platforms should be prioritized first (for example TikTok, Reddit, OpenAlex, Patents, News, Web)?",
+        "Which channels or evidence sources matter most for this decision, and which can be deprioritized?",
+        "Are there specific communities, publishers, datasets, or regions we should explicitly include or exclude?",
     ),
 }
 
@@ -71,6 +81,7 @@ Required schema:
 
 Rules:
 - Ask one clear question only.
+- Avoid repeating previously asked question wording; if revisiting a dimension, ask from a different angle.
 - Scores should reflect current project context with conservative confidence.
 - Domain specificity should stay low if source/platform preferences are not explicit.
 """
@@ -81,7 +92,7 @@ Return JSON only.
 
 Schema:
 {
-  "enriched_description": "<2-3 dense paragraphs for embeddings/search>",
+  "enriched_description": "<plain-text multi-section brief with explicit headings>",
   "domain_focus": "<short domain phrase>",
   "key_entities": ["..."],
   "must_match_terms": ["..."],
@@ -103,7 +114,15 @@ Schema:
 Rules:
 - Preserve explicit user constraints from Q&A.
 - Keep lists concise and specific.
-- Do not use markdown.
+- Use these section headings in this exact order inside enriched_description:
+  Project Goal (Research Goal):
+  User Pain Points:
+  Primary Users / Stakeholders:
+  Key Decisions and Output Format:
+  Scope and Evidence Priorities:
+  Constraints and Assumptions:
+  Success Signals and Next Steps:
+- Keep enriched_description plain text (no markdown syntax).
 """
 
 _MERGE_SYSTEM_PROMPT = """\
@@ -189,8 +208,64 @@ def _normalize_source_toggles(source_toggles: Mapping[str, object] | None) -> di
     return normalized
 
 
-def _fallback_question(dimension: str) -> str:
-    return _QUESTION_CATALOG.get(dimension, _QUESTION_CATALOG["objective_clarity"])
+def _normalize_question_text(value: str) -> str:
+    return " ".join(_tokenize(value))
+
+
+def _fallback_question(dimension: str, qa_pairs: list[dict[str, str]] | None = None) -> str:
+    templates = _QUESTION_CATALOG.get(dimension) or _QUESTION_CATALOG["objective_clarity"]
+    normalized_pairs = qa_pairs or []
+    asked_fingerprints = {
+        _normalize_question_text(str(row.get("question") or ""))
+        for row in normalized_pairs
+        if str(row.get("question") or "").strip()
+    }
+
+    for template in templates:
+        if _normalize_question_text(template) not in asked_fingerprints:
+            return template
+
+    dimension_count = sum(
+        1 for row in normalized_pairs if str(row.get("dimension") or "").strip() == dimension
+    )
+    return templates[dimension_count % len(templates)]
+
+
+def _asked_dimension_counts(qa_pairs: list[dict[str, str]]) -> dict[str, int]:
+    counts = {key: 0 for key in _ALL_DIMENSIONS}
+    for row in qa_pairs:
+        dimension = str(row.get("dimension") or "").strip()
+        if dimension in counts:
+            counts[dimension] += 1
+    return counts
+
+
+def _pick_next_dimension(
+    *,
+    candidates: list[str],
+    scores: Mapping[str, float],
+    qa_pairs: list[dict[str, str]],
+) -> str | None:
+    if not candidates:
+        return None
+
+    counts = _asked_dimension_counts(qa_pairs)
+    last_dimension = ""
+    for row in reversed(qa_pairs):
+        dimension = str(row.get("dimension") or "").strip()
+        if dimension in _ALL_DIMENSIONS:
+            last_dimension = dimension
+            break
+
+    ordered = sorted(
+        candidates,
+        key=lambda key: (counts.get(key, 0), scores.get(key, 0.0)),
+    )
+    if last_dimension and len(ordered) > 1:
+        alternatives = [key for key in ordered if key != last_dimension]
+        if alternatives:
+            return alternatives[0]
+    return ordered[0]
 
 
 def _heuristic_scores(
@@ -242,24 +317,42 @@ def _heuristic_scores(
         "x",
     }
 
+    def _dimension_signal(dimension: str) -> float:
+        answers = [
+            row["answer"]
+            for row in qa_pairs
+            if str(row.get("dimension") or "").strip() == dimension
+        ]
+        if not answers:
+            return 0.0
+        answer_token_lengths = [len(_tokenize(answer)) for answer in answers]
+        avg_length = mean(answer_token_lengths) if answer_token_lengths else 0.0
+        richness = min(1.0, avg_length / 24.0)
+        coverage = min(0.35, len(answers) * 0.12)
+        return _clamp_score(richness + coverage)
+
     density = min(1.0, len(desc_tokens) / 40.0)
     qa_boost = min(0.3, qa_count * 0.1)
+    objective_signal = _dimension_signal("objective_clarity")
+    pain_signal = _dimension_signal("pain_point_clarity")
+    output_signal = _dimension_signal("output_clarity")
+    domain_signal = _dimension_signal("domain_specificity")
 
-    objective = 0.3 + density * 0.45 + qa_boost
+    objective = 0.32 + density * 0.42 + qa_boost + objective_signal * 0.22
     if any(term in tokens for term in ("goal", "objective", "decide", "decision", "evaluate")):
-        objective += 0.12
+        objective += 0.08
 
-    pain = 0.25 + density * 0.4 + qa_boost
+    pain = 0.24 + density * 0.34 + qa_boost + pain_signal * 0.25
     if any(word in tokens for word in pain_words):
-        pain += 0.2
+        pain += 0.12
 
-    output = 0.25 + density * 0.4 + qa_boost
+    output = 0.24 + density * 0.34 + qa_boost + output_signal * 0.25
     if any(word in tokens for word in output_words):
-        output += 0.2
+        output += 0.12
 
-    domain = 0.15 + qa_boost * 0.8
+    domain = 0.12 + qa_boost * 0.7 + domain_signal * 0.35
     if any(word in tokens for word in domain_words):
-        domain += 0.45
+        domain += 0.2
 
     return {
         "objective_clarity": _clamp_score(objective),
@@ -278,14 +371,16 @@ def _resolve_next_dimension(
     if asked_count >= max_questions:
         return True, None
 
-    core_scores = [scores.get(key, 0.0) for key in _CORE_DIMENSIONS]
-    weakest_core = min(_CORE_DIMENSIONS, key=lambda key: scores.get(key, 0.0))
-    core_min = min(core_scores) if core_scores else 0.0
+    unresolved_core = [key for key in _CORE_DIMENSIONS if scores.get(key, 0.0) < _CORE_STOP_THRESHOLD]
+    if unresolved_core:
+        next_dimension = _pick_next_dimension(
+            candidates=unresolved_core,
+            scores=scores,
+            qa_pairs=qa_pairs,
+        )
+        return False, next_dimension
 
-    if core_min < 0.8:
-        return False, weakest_core
-
-    if scores.get(_DOMAIN_DIMENSION, 0.0) < 0.8:
+    if scores.get(_DOMAIN_DIMENSION, 0.0) < _DOMAIN_STOP_THRESHOLD:
         return False, _DOMAIN_DIMENSION
 
     return True, None
@@ -358,18 +453,28 @@ async def evaluate_project_sufficiency(
         llm_scores = _as_mapping(llm_payload.get("scores"))
         for key in _ALL_DIMENSIONS:
             if key in llm_scores:
-                scores[key] = _clamp_score(llm_scores.get(key))
+                llm_score = _clamp_score(llm_scores.get(key))
+                scores[key] = max(scores.get(key, 0.0), llm_score)
 
     should_stop, next_dimension = _resolve_next_dimension(scores, normalized_pairs, max_questions)
     weakest_dimension = min(_ALL_DIMENSIONS, key=lambda key: scores.get(key, 0.0))
 
     next_question = None
     if not should_stop and next_dimension:
-        next_question = _fallback_question(next_dimension)
+        next_question = _fallback_question(next_dimension, normalized_pairs)
         if llm_payload:
             llm_dimension = str(llm_payload.get("weakest_dimension") or "").strip()
             llm_question = str(llm_payload.get("next_question") or "").strip()
-            if llm_dimension == next_dimension and llm_question:
+            asked_question_keys = {
+                _normalize_question_text(pair["question"])
+                for pair in normalized_pairs
+                if pair["question"]
+            }
+            if (
+                llm_dimension == next_dimension
+                and llm_question
+                and _normalize_question_text(llm_question) not in asked_question_keys
+            ):
                 next_question = llm_question
 
     overall = mean([scores.get(key, 0.0) for key in _CORE_DIMENSIONS])
@@ -397,20 +502,6 @@ def _fallback_synthesis(
     answers = " ".join(pair["answer"] for pair in qa_pairs).strip()
     intent_domain = str(structured_intent.get("domain") or "").replace("_", " ").strip()
 
-    paragraph_1 = (
-        f"{title.strip()}. {description.strip()} "
-        "This project is scoped to produce an actionable research brief backed by cross-source evidence."
-    ).strip()
-    paragraph_2 = (
-        f"Current constraints from discovery Q&A: {answers}" if answers else
-        "Current constraints from discovery Q&A: no additional constraints provided."
-    )
-    paragraph_3 = (
-        "The output should prioritize high-signal findings, explicit trade-offs, and clear implications "
-        "for decision-making across selected data sources."
-    )
-    enriched_description = "\n\n".join([paragraph_1, paragraph_2, paragraph_3]).strip()
-
     keywords = _clean_list(structured_intent.get("keywords"), max_items=8)
     entities = _clean_list(structured_intent.get("entities"), max_items=8)
     must_terms = _clean_list(structured_intent.get("must_match_terms"), max_items=8)
@@ -421,6 +512,66 @@ def _fallback_synthesis(
         must_terms = keywords[:4]
 
     domain_focus = intent_domain or "research focus"
+    objective_answers = " ".join(
+        pair["answer"]
+        for pair in qa_pairs
+        if str(pair.get("dimension") or "").strip() == "objective_clarity"
+    ).strip()
+    pain_answers = " ".join(
+        pair["answer"]
+        for pair in qa_pairs
+        if str(pair.get("dimension") or "").strip() == "pain_point_clarity"
+    ).strip()
+    output_answers = " ".join(
+        pair["answer"]
+        for pair in qa_pairs
+        if str(pair.get("dimension") or "").strip() == "output_clarity"
+    ).strip()
+    domain_answers = " ".join(
+        pair["answer"]
+        for pair in qa_pairs
+        if str(pair.get("dimension") or "").strip() == "domain_specificity"
+    ).strip()
+
+    enabled_sources = [key for key, enabled in source_toggles.items() if enabled]
+    source_summary = ", ".join(enabled_sources[:8]) if enabled_sources else "none selected"
+    entity_summary = ", ".join(entities[:5]) if entities else "No explicit entities yet."
+    must_term_summary = ", ".join(must_terms[:6]) if must_terms else "No strict must-match terms yet."
+
+    project_goal = objective_answers or description.strip() or title.strip()
+    pain_points = pain_answers or (
+        "User pain points are partially specified; key uncertainty should be clarified in final review."
+    )
+    stakeholders = (
+        f"Primary stakeholders likely include teams focused on: {entity_summary}"
+        if entities
+        else "Primary stakeholders: brand, insights, and strategy decision makers."
+    )
+    key_decisions = output_answers or (
+        "Decision-ready output should include prioritized findings, trade-offs, and recommendations."
+    )
+    evidence_scope = domain_answers or (
+        f"Prioritize sources: {source_summary}. Domain focus: {domain_focus}."
+    )
+    constraints = (
+        f"Time horizon: {_DEFAULT_TIME_HORIZON}. Must-match terms: {must_term_summary}. "
+        f"Additional wizard context: {answers or 'none provided'}"
+    )
+    next_steps = (
+        "Success means stakeholders can act on a ranked set of opportunities and risks with clear evidence links."
+    )
+
+    enriched_description = "\n".join(
+        [
+            f"Project Goal (Research Goal): {project_goal}",
+            f"User Pain Points: {pain_points}",
+            f"Primary Users / Stakeholders: {stakeholders}",
+            f"Key Decisions and Output Format: {key_decisions}",
+            f"Scope and Evidence Priorities: {evidence_scope}",
+            f"Constraints and Assumptions: {constraints}",
+            f"Success Signals and Next Steps: {next_steps}",
+        ]
+    ).strip()
 
     return {
         "enriched_description": enriched_description,

@@ -10,6 +10,8 @@ Discover and project management remain available once a project is selected.
 """
 
 import uuid
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
@@ -22,6 +24,9 @@ import _api
 from agent import get_database
 
 IST_TZ = ZoneInfo("Asia/Kolkata")
+_WIZARD_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="wizard-ui")
+_UPLOAD_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="upload-ui")
+_WIZARD_PROGRESS_TIMEOUT_SECONDS = 25.0
 
 # ============ THEME CONFIG ============
 THEME_PRESETS: dict[str, dict[str, str]] = {
@@ -228,6 +233,52 @@ def reload_projects():
     st.session_state.projects_loaded = True
 
 
+def _selected_project() -> dict | None:
+    """Return the currently selected project from local session cache."""
+    project_id = st.session_state.selected_project_id
+    if not project_id:
+        return None
+    for project in st.session_state.projects:
+        if project.get("id") == project_id:
+            return project
+    return None
+
+
+def _upload_bootstrap_files(project_id: str, files: list | None) -> tuple[list[str], list[str]]:
+    """Upload bootstrap files in parallel and return (successful_upload_ids, failed_names)."""
+    payloads: list[tuple[str, bytes]] = []
+    for file in files or []:
+        name = str(getattr(file, "name", "") or "").strip()
+        if not name:
+            continue
+        content = file.read()
+        if not isinstance(content, bytes) or not content:
+            continue
+        payloads.append((name, content))
+
+    if not payloads:
+        return [], []
+
+    futures: list[tuple[str, Future]] = [
+        (name, _UPLOAD_EXECUTOR.submit(_api.upload_document, project_id, name, content))
+        for name, content in payloads
+    ]
+    upload_ids: list[str] = []
+    failed_names: list[str] = []
+
+    for name, future in futures:
+        try:
+            result = future.result()
+        except Exception:
+            result = None
+        if result and result.get("upload_id"):
+            upload_ids.append(str(result["upload_id"]))
+        else:
+            failed_names.append(name)
+
+    return upload_ids, failed_names
+
+
 def _sync_project_chunk_count_from_ingest(
     project_id: str, status_payload: dict | None
 ) -> None:
@@ -300,6 +351,167 @@ def _wizard_state_key(form_key: str) -> str:
     return f"{form_key}_wizard_state"
 
 
+def _wizard_async_state_key(form_key: str) -> str:
+    return f"{form_key}_wizard_async_refresh"
+
+
+def _wizard_run_refresh_job(
+    *,
+    title: str,
+    description: str,
+    qa_pairs: list[dict],
+    max_questions: int,
+    source_toggles: dict[str, bool],
+) -> dict:
+    """Run evaluate (and synthesize when complete) off the main Streamlit thread."""
+    evaluate_payload, evaluate_error = _api.wizard_evaluate(
+        title,
+        description,
+        qa_pairs=qa_pairs,
+        max_questions=max_questions,
+    )
+    if evaluate_error or not evaluate_payload:
+        return {
+            "error": evaluate_error or "Could not evaluate wizard state.",
+            "evaluate_payload": None,
+            "review_payload": None,
+        }
+
+    review_payload = None
+    if evaluate_payload.get("should_stop"):
+        review_payload, synth_error = _api.wizard_synthesize(
+            title=title,
+            description=description,
+            qa_pairs=qa_pairs,
+            structured_intent={},
+            source_toggles=source_toggles,
+        )
+        if synth_error or not review_payload:
+            return {
+                "error": synth_error or "Could not synthesize review.",
+                "evaluate_payload": evaluate_payload,
+                "review_payload": None,
+            }
+
+    return {
+        "error": None,
+        "evaluate_payload": evaluate_payload,
+        "review_payload": review_payload,
+    }
+
+
+def _start_wizard_async_refresh(
+    *,
+    form_key: str,
+    title: str,
+    description: str,
+    qa_pairs: list[dict],
+    max_questions: int,
+    source_toggles: dict[str, bool],
+    action_label: str,
+) -> None:
+    """Submit wizard refresh work to background thread and store task handle."""
+    future = _WIZARD_EXECUTOR.submit(
+        _wizard_run_refresh_job,
+        title=title,
+        description=description,
+        qa_pairs=list(qa_pairs),
+        max_questions=max_questions,
+        source_toggles=dict(source_toggles),
+    )
+    st.session_state[_wizard_async_state_key(form_key)] = {
+        "future": future,
+        "started_at": time.time(),
+        "cancelled": False,
+        "action_label": action_label,
+    }
+
+
+def _consume_wizard_async_refresh(form_key: str, state: dict) -> bool:
+    """
+    Render in-flight async status and apply completed results.
+
+    Returns True when async flow handled the current render path.
+    """
+    task_key = _wizard_async_state_key(form_key)
+    task = st.session_state.get(task_key)
+    if not isinstance(task, dict):
+        return False
+
+    future = task.get("future")
+    if not isinstance(future, Future):
+        st.session_state.pop(task_key, None)
+        return False
+
+    if not future.done():
+        elapsed = max(0.0, time.time() - float(task.get("started_at") or time.time()))
+        progress = min(0.95, elapsed / _WIZARD_PROGRESS_TIMEOUT_SECONDS)
+        action_label = str(task.get("action_label") or "Processing wizard request")
+        st.markdown(
+            f"""
+            <div class="wizard-phase-banner">
+                <span class="wizard-phase-pill">Working</span>
+                <strong>{escape(action_label)}</strong>
+                <small>You can cancel this request and continue editing.</small>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.progress(progress, text=f"In progress… {elapsed:.1f}s")
+        if st.button(
+            "Cancel request",
+            key=f"{form_key}_wizard_cancel_async",
+            use_container_width=True,
+        ):
+            task["cancelled"] = True
+            future.cancel()
+            st.session_state.pop(task_key, None)
+            st.warning("Cancelled current wizard request.")
+            st.rerun()
+        time.sleep(0.15)
+        st.rerun()
+        return True
+
+    st.session_state.pop(task_key, None)
+    if bool(task.get("cancelled", False)):
+        return False
+
+    try:
+        result = future.result()
+    except Exception as exc:
+        st.error(f"Wizard request failed: {exc}")
+        return False
+
+    if not isinstance(result, dict):
+        st.error("Wizard request returned an invalid response.")
+        return False
+
+    if result.get("error"):
+        st.error(str(result["error"]))
+        return False
+
+    evaluate_payload = result.get("evaluate_payload") or {}
+    state["scores"] = evaluate_payload.get("scores", {})
+    state["pending_question"] = evaluate_payload.get("next_question") or ""
+    state["pending_dimension"] = evaluate_payload.get("next_dimension") or ""
+
+    if evaluate_payload.get("should_stop"):
+        review_payload = result.get("review_payload")
+        if not isinstance(review_payload, dict):
+            st.error("Wizard finished but review payload was missing.")
+            return False
+        state["review_payload"] = review_payload
+        state["source_toggles"] = review_payload.get("target_sources") or state.get(
+            "source_toggles", {}
+        )
+        state["phase"] = "review"
+    else:
+        state["phase"] = "qa"
+
+    st.rerun()
+    return True
+
+
 def _wizard_default_sources(defaults: dict | None = None) -> dict[str, bool]:
     cfg = defaults or {}
     return {
@@ -320,6 +532,9 @@ def _reset_wizard_state(form_key: str, defaults: dict | None = None) -> None:
     state_key = _wizard_state_key(form_key)
     if state_key in st.session_state:
         del st.session_state[state_key]
+    async_key = _wizard_async_state_key(form_key)
+    if async_key in st.session_state:
+        del st.session_state[async_key]
 
     prefixes = (
         f"{form_key}_wizard_title",
@@ -331,6 +546,7 @@ def _reset_wizard_state(form_key: str, defaults: dict | None = None) -> None:
         f"{form_key}_wizard_time_horizon",
         f"{form_key}_wizard_refresh_strategy",
         f"{form_key}_wizard_enriched_description",
+        f"{form_key}_wizard_edit_answer_",
         f"{form_key}_wizard_src_",
     )
     for key in list(st.session_state.keys()):
@@ -386,6 +602,34 @@ def _ensure_review_widget_defaults(form_key: str, state: dict) -> None:
         st.session_state.setdefault(key, value)
 
 
+def _wizard_answer_guidance(dimension: str) -> tuple[str, str]:
+    guidance_map: dict[str, tuple[str, str]] = {
+        "objective_clarity": (
+            "Be specific about the decision this research should support and who will use it.",
+            "Example: Decide whether to prioritize niacinamide or ceramide claims for Q3 launch messaging in India.",
+        ),
+        "pain_point_clarity": (
+            "Describe the risk, uncertainty, or bottleneck you need to reduce.",
+            "Example: We see engagement but low conversion and need to know which claim themes are causing drop-off.",
+        ),
+        "output_clarity": (
+            "Describe the final artifact format and what actions it should enable.",
+            "Example: Provide a ranked opportunity matrix with top 5 claim angles and recommended next experiments.",
+        ),
+        "domain_specificity": (
+            "Name the sources/platforms to prioritize so retrieval focuses on the right evidence pool.",
+            "Example: Prioritize TikTok + Instagram for signal discovery, OpenAlex for validation, and patents for whitespace.",
+        ),
+    }
+    return guidance_map.get(
+        dimension or "",
+        (
+            "Give concrete context, constraints, and expected outcome.",
+            "Example: Focus on recent evidence, target audience, and decision criteria.",
+        ),
+    )
+
+
 def _render_create_project_form(
     *,
     form_key: str,
@@ -396,10 +640,31 @@ def _render_create_project_form(
     cfg = defaults or {}
     state = _ensure_wizard_state(form_key, cfg)
 
-    st.markdown("#### Project Wizard")
-    st.caption("Phase 1: Dynamic Q&A • Phase 2: Review & Confirm")
+    st.markdown(
+        """
+        <div class="wizard-shell">
+            <div class="wizard-shell-title">Project wizard</div>
+            <div class="wizard-shell-subtitle">
+                Phase 1 clarifies intent with focused questions. Phase 2 lets you review and refine before creation.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if _consume_wizard_async_refresh(form_key, state):
+        return
 
     if state.get("phase") == "intro":
+        st.markdown(
+            """
+            <div class="wizard-phase-banner">
+                <span class="wizard-phase-pill">Phase 1</span>
+                <strong>Set the project frame</strong>
+                <small>Start with a clear title and baseline description.</small>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
         title = st.text_input(
             "Title",
             max_chars=255,
@@ -425,43 +690,21 @@ def _render_create_project_form(
                 if len(description_value) < 10:
                     st.error("Description must be at least 10 characters.")
                     return
-                with st.spinner("Evaluating project clarity..."):
-                    payload, err = _api.wizard_evaluate(
-                        title_value,
-                        description_value,
-                        qa_pairs=[],
-                        max_questions=int(state.get("max_questions") or 5),
-                    )
-                if err or not payload:
-                    st.error(err or "Could not start wizard.")
-                    return
-
                 state["title"] = title_value
                 state["description"] = description_value
-                state["scores"] = payload.get("scores", {})
                 state["qa_pairs"] = []
-                state["pending_question"] = payload.get("next_question") or ""
-                state["pending_dimension"] = payload.get("next_dimension") or ""
-
-                if payload.get("should_stop"):
-                    with st.spinner("Synthesizing review fields..."):
-                        review_payload, synth_err = _api.wizard_synthesize(
-                            title=title_value,
-                            description=description_value,
-                            qa_pairs=[],
-                            structured_intent={},
-                            source_toggles=state.get("source_toggles") or {},
-                        )
-                    if synth_err or not review_payload:
-                        st.error(synth_err or "Could not synthesize review.")
-                        return
-                    state["review_payload"] = review_payload
-                    state["source_toggles"] = review_payload.get("target_sources") or state.get(
-                        "source_toggles", {}
-                    )
-                    state["phase"] = "review"
-                else:
-                    state["phase"] = "qa"
+                state["scores"] = {}
+                state["pending_question"] = ""
+                state["pending_dimension"] = ""
+                _start_wizard_async_refresh(
+                    form_key=form_key,
+                    title=title_value,
+                    description=description_value,
+                    qa_pairs=[],
+                    max_questions=int(state.get("max_questions") or 5),
+                    source_toggles=state.get("source_toggles") or {},
+                    action_label="Evaluating project clarity",
+                )
                 st.rerun()
         with col_reset:
             if st.button("Reset", key=f"{form_key}_wizard_intro_reset", use_container_width=True):
@@ -471,33 +714,56 @@ def _render_create_project_form(
 
     if state.get("phase") == "qa":
         scores = state.get("scores") or {}
-        st.markdown(
-            (
-                f"Clarity scores: objective **{scores.get('objective_clarity', 0.0):.2f}**, "
-                f"pain point **{scores.get('pain_point_clarity', 0.0):.2f}**, "
-                f"output **{scores.get('output_clarity', 0.0):.2f}**, "
-                f"domain **{scores.get('domain_specificity', 0.0):.2f}**"
-            )
-        )
-
         answered_pairs = list(state.get("qa_pairs") or [])
         pending_question = str(state.get("pending_question") or "").strip()
         pending_dimension = str(state.get("pending_dimension") or "").strip()
+        max_questions = int(state.get("max_questions") or 5)
 
-        labels = [f"Answered {idx + 1}" for idx in range(len(answered_pairs))]
+        st.markdown(
+            f"""
+            <div class="wizard-phase-banner">
+                <span class="wizard-phase-pill">Phase 1</span>
+                <strong>Answer focused questions</strong>
+                <small>{len(answered_pairs)} / {max_questions} answered</small>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        progress = 0.0 if max_questions <= 0 else min(1.0, len(answered_pairs) / max_questions)
+        st.progress(progress, text=f"Progress: {len(answered_pairs)} of {max_questions}")
+        st.markdown(
+            f"""
+            <div class="wizard-score-grid">
+                <div class="wizard-score-card"><span>Objective</span><strong>{scores.get("objective_clarity", 0.0):.2f}</strong></div>
+                <div class="wizard-score-card"><span>Pain point</span><strong>{scores.get("pain_point_clarity", 0.0):.2f}</strong></div>
+                <div class="wizard-score-card"><span>Output</span><strong>{scores.get("output_clarity", 0.0):.2f}</strong></div>
+                <div class="wizard-score-card"><span>Domain</span><strong>{scores.get("domain_specificity", 0.0):.2f}</strong></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        labels: list[str] = []
         if pending_question:
-            labels.append(f"Question {len(answered_pairs) + 1}")
+            labels.append(f"Current {len(answered_pairs) + 1}")
+        labels.extend([f"Answered {idx + 1}" for idx in range(len(answered_pairs))])
         tabs = st.tabs(labels or ["Question 1"])
-
-        for idx, item in enumerate(answered_pairs):
-            with tabs[idx]:
-                st.markdown(f"**Question:** {item.get('question', '')}")
-                st.markdown(f"**Answer:** {item.get('answer', '')}")
 
         if pending_question:
             answer_key = f"{form_key}_wizard_answer_{len(answered_pairs)}"
-            with tabs[-1]:
+            with tabs[0]:
+                st.markdown(
+                    """
+                    <div class="wizard-question-banner">
+                        <span class="wizard-phase-pill">Current question</span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
                 st.markdown(f"**Question:** {pending_question}")
+                guidance, example = _wizard_answer_guidance(pending_dimension)
+                st.caption(guidance)
+                st.caption(example)
                 answer = st.text_area(
                     "Your answer",
                     key=answer_key,
@@ -523,38 +789,15 @@ def _render_create_project_form(
                             }
                         )
                         state["qa_pairs"] = answered_pairs
-                        with st.spinner("Refining wizard context..."):
-                            payload, err = _api.wizard_evaluate(
-                                state.get("title", ""),
-                                state.get("description", ""),
-                                qa_pairs=answered_pairs,
-                                max_questions=int(state.get("max_questions") or 5),
-                            )
-                        if err or not payload:
-                            st.error(err or "Failed to process answer.")
-                            return
-
-                        state["scores"] = payload.get("scores", {})
-                        state["pending_question"] = payload.get("next_question") or ""
-                        state["pending_dimension"] = payload.get("next_dimension") or ""
-
-                        if payload.get("should_stop"):
-                            with st.spinner("Synthesizing review fields..."):
-                                review_payload, synth_err = _api.wizard_synthesize(
-                                    title=state.get("title", ""),
-                                    description=state.get("description", ""),
-                                    qa_pairs=answered_pairs,
-                                    structured_intent={},
-                                    source_toggles=state.get("source_toggles") or {},
-                                )
-                            if synth_err or not review_payload:
-                                st.error(synth_err or "Could not synthesize review.")
-                                return
-                            state["review_payload"] = review_payload
-                            state["source_toggles"] = review_payload.get("target_sources") or state.get(
-                                "source_toggles", {}
-                            )
-                            state["phase"] = "review"
+                        _start_wizard_async_refresh(
+                            form_key=form_key,
+                            title=str(state.get("title") or ""),
+                            description=str(state.get("description") or ""),
+                            qa_pairs=answered_pairs,
+                            max_questions=int(state.get("max_questions") or 5),
+                            source_toggles=state.get("source_toggles") or {},
+                            action_label="Refining wizard context",
+                        )
                         st.rerun()
                 with col_restart:
                     if st.button(
@@ -563,6 +806,58 @@ def _render_create_project_form(
                         use_container_width=True,
                     ):
                         _reset_wizard_state(form_key, cfg)
+                        st.rerun()
+
+        answered_offset = 1 if pending_question else 0
+        for idx, item in enumerate(answered_pairs):
+            with tabs[idx + answered_offset]:
+                st.markdown(f"**Question:** {item.get('question', '')}")
+                st.caption("You can edit this answer before Phase 2.")
+                answer_key = f"{form_key}_wizard_edit_answer_{idx}"
+                if answer_key not in st.session_state:
+                    st.session_state[answer_key] = str(item.get("answer", ""))
+                st.text_area(
+                    "Answer",
+                    key=answer_key,
+                    height=130,
+                    label_visibility="collapsed",
+                )
+                col_save, col_restore = st.columns(2)
+                with col_save:
+                    if st.button(
+                        "Save & Re-evaluate",
+                        key=f"{form_key}_wizard_edit_save_{idx}",
+                        use_container_width=True,
+                    ):
+                        edited_answer = str(st.session_state.get(answer_key) or "").strip()
+                        if not edited_answer:
+                            st.error("Answer cannot be empty.")
+                            return
+                        if edited_answer != str(item.get("answer", "")).strip():
+                            updated_pairs = list(answered_pairs)
+                            updated_pairs[idx] = {
+                                "question": str(item.get("question", "")),
+                                "answer": edited_answer,
+                                "dimension": str(item.get("dimension", "")),
+                            }
+                            state["qa_pairs"] = updated_pairs
+                            _start_wizard_async_refresh(
+                                form_key=form_key,
+                                title=str(state.get("title") or ""),
+                                description=str(state.get("description") or ""),
+                                qa_pairs=updated_pairs,
+                                max_questions=int(state.get("max_questions") or 5),
+                                source_toggles=state.get("source_toggles") or {},
+                                action_label="Re-evaluating edited answers",
+                            )
+                        st.rerun()
+                with col_restore:
+                    if st.button(
+                        "Restore",
+                        key=f"{form_key}_wizard_edit_restore_{idx}",
+                        use_container_width=True,
+                    ):
+                        st.session_state[answer_key] = str(item.get("answer", ""))
                         st.rerun()
         return
 
@@ -574,8 +869,16 @@ def _render_create_project_form(
     _ensure_review_widget_defaults(form_key, state)
     review_payload = state.get("review_payload") or {}
 
-    st.markdown("#### Review & Confirm")
-    st.caption("Edit fields below before creating the final project.")
+    st.markdown(
+        """
+        <div class="wizard-phase-banner">
+            <span class="wizard-phase-pill">Phase 2</span>
+            <strong>Review and confirm</strong>
+            <small>Refine brief, intent terms, and source strategy before creating the project.</small>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     with st.expander("Conversation Summary", expanded=False):
         st.markdown(f"**Title:** {state.get('title', '')}")
@@ -584,77 +887,82 @@ def _render_create_project_form(
             st.markdown(f"{idx + 1}. **Q:** {item.get('question', '')}")
             st.markdown(f"   **A:** {item.get('answer', '')}")
 
-    st.text_area(
-        "Enriched Description",
-        key=f"{form_key}_wizard_enriched_description",
-        height=220,
-        help="Dense semantic summary used for downstream ranking and retrieval.",
-    )
-
-    domain_focus = st.text_input(
-        "Domain Focus",
-        key=f"{form_key}_wizard_domain_focus",
-        max_chars=255,
-    )
-
-    key_entity_options = sorted(
-        set(
-            list(review_payload.get("key_entities") or [])
-            + list(review_payload.get("must_match_terms") or [])
+    with st.container(border=True):
+        st.markdown("##### Research Brief")
+        st.text_area(
+            "Enriched Description",
+            key=f"{form_key}_wizard_enriched_description",
+            height=240,
+            help="Dense semantic summary used for downstream ranking and retrieval.",
         )
-    )
-    st.multiselect(
-        "Key Entities",
-        options=key_entity_options,
-        key=f"{form_key}_wizard_entities",
-        accept_new_options=True,
-    )
-    st.multiselect(
-        "Must-Match Terms",
-        options=key_entity_options,
-        key=f"{form_key}_wizard_must_terms",
-        accept_new_options=True,
-    )
 
-    horizon_options = [
-        "last 6 months",
-        "last 1 year",
-        "last 2 years",
-        "last 5 years",
-        "all-time",
-    ]
-    current_horizon = st.session_state.get(f"{form_key}_wizard_time_horizon", "last 1 year")
-    if current_horizon not in horizon_options:
-        horizon_options.append(current_horizon)
-    st.selectbox(
-        "Time Horizon",
-        horizon_options,
-        key=f"{form_key}_wizard_time_horizon",
-    )
+    with st.container(border=True):
+        st.markdown("##### Intent Controls")
+        domain_focus = st.text_input(
+            "Domain Focus",
+            key=f"{form_key}_wizard_domain_focus",
+            max_chars=255,
+        )
 
-    st.selectbox(
-        "Refresh Strategy",
-        ["once", "daily", "weekly", "on_demand"],
-        key=f"{form_key}_wizard_refresh_strategy",
-        help="How often to refresh the KB from social and research sources.",
-    )
+        key_entity_options = sorted(
+            set(
+                list(review_payload.get("key_entities") or [])
+                + list(review_payload.get("must_match_terms") or [])
+            )
+        )
+        st.multiselect(
+            "Key Entities",
+            options=key_entity_options,
+            key=f"{form_key}_wizard_entities",
+            accept_new_options=True,
+        )
+        st.multiselect(
+            "Must-Match Terms",
+            options=key_entity_options,
+            key=f"{form_key}_wizard_must_terms",
+            accept_new_options=True,
+        )
 
-    st.markdown("**Target Data Sources**")
-    col_s1, col_s2 = st.columns(2)
-    with col_s1:
-        st.markdown("*Social*")
-        st.toggle("TikTok", key=f"{form_key}_wizard_src_tiktok")
-        st.toggle("Instagram", key=f"{form_key}_wizard_src_instagram")
-        st.toggle("YouTube", key=f"{form_key}_wizard_src_youtube")
-        st.toggle("Reddit", key=f"{form_key}_wizard_src_reddit")
-        st.toggle("X", key=f"{form_key}_wizard_src_x")
-    with col_s2:
-        st.markdown("*Research & Discovery*")
-        st.toggle("Papers", key=f"{form_key}_wizard_src_papers")
-        st.toggle("Patents", key=f"{form_key}_wizard_src_patents")
-        st.toggle("News", key=f"{form_key}_wizard_src_news")
-        st.toggle("Web (Tavily)", key=f"{form_key}_wizard_src_web_tavily")
-        st.toggle("Web (Exa)", key=f"{form_key}_wizard_src_web_exa")
+        horizon_options = [
+            "last 6 months",
+            "last 1 year",
+            "last 2 years",
+            "last 5 years",
+            "all-time",
+        ]
+        current_horizon = st.session_state.get(f"{form_key}_wizard_time_horizon", "last 1 year")
+        if current_horizon not in horizon_options:
+            horizon_options.append(current_horizon)
+        st.selectbox(
+            "Time Horizon",
+            horizon_options,
+            key=f"{form_key}_wizard_time_horizon",
+        )
+
+        st.selectbox(
+            "Refresh Strategy",
+            ["once", "daily", "weekly", "on_demand"],
+            key=f"{form_key}_wizard_refresh_strategy",
+            help="How often to refresh the KB from social and research sources.",
+        )
+
+    with st.container(border=True):
+        st.markdown("##### Target data sources")
+        col_s1, col_s2 = st.columns(2)
+        with col_s1:
+            st.markdown("*Social*")
+            st.toggle("TikTok", key=f"{form_key}_wizard_src_tiktok")
+            st.toggle("Instagram", key=f"{form_key}_wizard_src_instagram")
+            st.toggle("YouTube", key=f"{form_key}_wizard_src_youtube")
+            st.toggle("Reddit", key=f"{form_key}_wizard_src_reddit")
+            st.toggle("X", key=f"{form_key}_wizard_src_x")
+        with col_s2:
+            st.markdown("*Research & Discovery*")
+            st.toggle("Papers", key=f"{form_key}_wizard_src_papers")
+            st.toggle("Patents", key=f"{form_key}_wizard_src_patents")
+            st.toggle("News", key=f"{form_key}_wizard_src_news")
+            st.toggle("Web (Tavily)", key=f"{form_key}_wizard_src_web_tavily")
+            st.toggle("Web (Exa)", key=f"{form_key}_wizard_src_web_exa")
 
     bootstrap_files = st.file_uploader(
         "Optional bootstrap docs (pdf/docx/txt/md)",
@@ -687,6 +995,9 @@ def _render_create_project_form(
                     refresh_strategy=str(
                         st.session_state.get(f"{form_key}_wizard_refresh_strategy", "once")
                     ),
+                    enriched_description=str(
+                        st.session_state.get(f"{form_key}_wizard_enriched_description", "")
+                    ),
                     domain_focus=domain_focus,
                     key_entities=list(st.session_state.get(f"{form_key}_wizard_entities", [])),
                     must_match_terms=list(st.session_state.get(f"{form_key}_wizard_must_terms", [])),
@@ -700,13 +1011,16 @@ def _render_create_project_form(
                 st.error(create_error or "Failed to create project. Please try again.")
                 return
 
-            upload_ids: list[str] = []
-            for upload_file in bootstrap_files or []:
-                upload_result = _api.upload_document(
-                    result["id"], upload_file.name, upload_file.read()
+            upload_ids, failed_uploads = _upload_bootstrap_files(
+                result["id"],
+                list(bootstrap_files or []),
+            )
+            if failed_uploads:
+                st.warning(
+                    f"{len(failed_uploads)} bootstrap file(s) failed to upload: "
+                    + ", ".join(failed_uploads[:3])
+                    + ("..." if len(failed_uploads) > 3 else "")
                 )
-                if upload_result and upload_result.get("upload_id"):
-                    upload_ids.append(upload_result["upload_id"])
 
             with st.spinner("Starting project setup..."):
                 _api.bootstrap_project(result["id"], upload_ids)
@@ -778,14 +1092,36 @@ else:
 
         st.divider()
 
-        active_label = "None selected"
-        if st.session_state.selected_project_id:
-            for p in st.session_state.projects:
-                if p["id"] == st.session_state.selected_project_id:
-                    active_label = p["title"]
-                    break
+        active_project = _selected_project()
+        active_label = active_project["title"] if active_project else "None selected"
 
         st.markdown(f"**Active Project:** {active_label}")
+
+        if active_project:
+            base_description = str(active_project.get("description") or "").strip()
+            enriched_description = str(active_project.get("enriched_description") or "").strip()
+            base_html = escape(base_description or "No base description available.").replace("\n", "<br>")
+            enriched_html = escape(
+                enriched_description
+                or "No enriched description yet. Complete wizard and synthesis to generate one."
+            ).replace("\n", "<br>")
+            brief_state = "Ready" if enriched_description else "Pending"
+            with st.expander("Project description", expanded=False):
+                st.markdown(
+                    f"""
+                    <div class="sidebar-brief-card">
+                        <div class="sidebar-brief-head">
+                            <span class="sidebar-brief-pill">{brief_state}</span>
+                            <span class="sidebar-brief-meta">Project brief</span>
+                        </div>
+                        <div class="sidebar-brief-label">Base description</div>
+                        <div class="sidebar-brief-text">{base_html}</div>
+                        <div class="sidebar-brief-label">Enriched description</div>
+                        <div class="sidebar-brief-text sidebar-brief-enriched">{enriched_html}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
 
         if st.button("🔄 Refresh Projects", use_container_width=True):
             reload_projects()

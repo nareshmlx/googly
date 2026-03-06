@@ -96,6 +96,160 @@ footer {
     overflow-y: auto !important;
 }
 
+.wizard-shell {
+    border: 1px solid rgba(140, 108, 146, 0.22);
+    border-radius: 14px;
+    background: rgba(255, 255, 255, 0.72);
+    padding: 0.7rem 0.82rem;
+    margin-bottom: 0.58rem;
+}
+
+.wizard-shell-title {
+    font-size: 1.02rem;
+    font-weight: 800;
+    color: var(--text);
+    letter-spacing: 0.01em;
+}
+
+.wizard-shell-subtitle {
+    margin-top: 0.14rem;
+    color: var(--muted);
+    font-size: 0.82rem;
+    line-height: 1.35;
+}
+
+.wizard-phase-banner {
+    border: 1px solid rgba(148, 113, 145, 0.24);
+    border-radius: 13px;
+    background: linear-gradient(132deg, rgba(255, 229, 219, 0.78), rgba(226, 249, 243, 0.72));
+    padding: 0.54rem 0.68rem;
+    margin: 0.22rem 0 0.58rem;
+    display: grid;
+    gap: 0.12rem;
+}
+
+.wizard-phase-banner strong {
+    color: var(--text);
+    font-size: 0.92rem;
+}
+
+.wizard-phase-banner small {
+    color: #7c667b;
+    font-size: 0.76rem;
+}
+
+.wizard-phase-pill {
+    display: inline-flex;
+    align-items: center;
+    width: fit-content;
+    padding: 0.11rem 0.45rem;
+    border-radius: 999px;
+    border: 1px solid rgba(103, 156, 148, 0.28);
+    background: rgba(216, 244, 237, 0.82);
+    color: #2e8f82;
+    font-size: 0.69rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    font-weight: 700;
+}
+
+.wizard-score-grid {
+    margin-top: 0.35rem;
+    margin-bottom: 0.42rem;
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 0.42rem;
+}
+
+.wizard-score-card {
+    border: 1px solid rgba(148, 113, 145, 0.2);
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.78);
+    padding: 0.4rem 0.52rem;
+    display: grid;
+    gap: 0.12rem;
+}
+
+.wizard-score-card span {
+    color: #7f647d;
+    font-size: 0.72rem;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    font-weight: 700;
+}
+
+.wizard-score-card strong {
+    color: var(--text);
+    font-size: 0.95rem;
+    line-height: 1;
+}
+
+.wizard-question-banner {
+    margin-bottom: 0.25rem;
+}
+
+.sidebar-brief-card {
+    border: 1px solid rgba(144, 110, 145, 0.24);
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.82);
+    padding: 0.62rem 0.66rem;
+}
+
+.sidebar-brief-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.4rem;
+    margin-bottom: 0.46rem;
+}
+
+.sidebar-brief-pill {
+    display: inline-flex;
+    align-items: center;
+    border: 1px solid rgba(47, 185, 170, 0.32);
+    background: rgba(215, 246, 240, 0.75);
+    color: #1f7f73;
+    border-radius: 999px;
+    padding: 0.12rem 0.46rem;
+    font-size: 0.67rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.sidebar-brief-meta {
+    color: #7e6780;
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.sidebar-brief-label {
+    color: #b17744;
+    font-size: 0.67rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    font-weight: 800;
+    margin-top: 0.32rem;
+    margin-bottom: 0.22rem;
+}
+
+.sidebar-brief-text {
+    color: var(--text);
+    font-size: 0.81rem;
+    line-height: 1.4;
+    border: 1px solid rgba(141, 106, 143, 0.18);
+    background: rgba(255, 251, 249, 0.9);
+    border-radius: 10px;
+    padding: 0.46rem 0.52rem;
+}
+
+.sidebar-brief-enriched {
+    max-height: 260px;
+    overflow-y: auto;
+}
+
 /* Chat input styling */
 .stChatInput textarea {
     background: rgba(255, 255, 255, 0.95) !important;
@@ -615,6 +769,10 @@ footer {
 }
 
 @media (max-width: 980px) {
+    .wizard-score-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
     .home-topbar {
         flex-direction: column;
         align-items: flex-start;
@@ -726,6 +884,40 @@ footer {
     .project-tag {
         background: rgba(36, 83, 76, 0.5);
         color: #9ce8dc;
+    }
+
+    .wizard-shell,
+    .wizard-score-card,
+    .sidebar-brief-card {
+        background: rgba(31, 37, 56, 0.84);
+        border-color: rgba(205, 195, 219, 0.2);
+    }
+
+    .wizard-phase-banner {
+        border-color: rgba(205, 195, 219, 0.24);
+        background: linear-gradient(132deg, rgba(84, 57, 74, 0.74), rgba(42, 79, 82, 0.7));
+    }
+
+    .wizard-phase-banner small,
+    .wizard-score-card span,
+    .sidebar-brief-meta {
+        color: #cfc2df;
+    }
+
+    .wizard-phase-pill,
+    .sidebar-brief-pill {
+        border-color: rgba(108, 202, 187, 0.38);
+        background: rgba(39, 85, 77, 0.58);
+        color: #9de6da;
+    }
+
+    .sidebar-brief-label {
+        color: #f2bb83;
+    }
+
+    .sidebar-brief-text {
+        background: rgba(34, 41, 60, 0.86);
+        border-color: rgba(205, 195, 219, 0.2);
     }
 
     .discover-card {
