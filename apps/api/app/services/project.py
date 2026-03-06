@@ -22,6 +22,7 @@ from app.kb.embedder import embed_texts
 from app.kb.intent_extractor import extract_intent
 from app.repositories import project as project_repo
 from app.repositories import source_asset as source_asset_repo
+from app.services import project_wizard as project_wizard_service
 from app.tools.llm import expand_project_description
 
 logger = structlog.get_logger(__name__)
@@ -518,6 +519,52 @@ async def get_discover_feed(project_id: str) -> list[dict]:
         search=sum(1 for r in rows if r["source"] == "search"),
     )
     return rows
+
+
+async def apply_wizard_overrides(
+    *,
+    project_id: str,
+    enriched_description: str,
+    overrides: dict,
+) -> dict | None:
+    """
+    Apply wizard Phase-2 overrides with schema-preserving value enhancement.
+
+    Returns the updated project row or None when project does not exist.
+    """
+    project = await project_repo.fetch_project_by_id_for_service(project_id)
+    if not project:
+        return None
+
+    base_intent = parse_metadata(project.get("structured_intent"))
+    merged_intent = await project_wizard_service.merge_intent_with_overrides(
+        structured_intent=base_intent,
+        enriched_description=enriched_description,
+        overrides=overrides,
+    )
+
+    await project_repo.update_project_intent_for_service(project_id, merged_intent)
+    await project_repo.update_project_enriched_description_for_service(
+        project_id,
+        enriched_description or None,
+    )
+
+    embedding_text = (enriched_description or project.get("description") or "").strip()
+    embedding_input = f"{embedding_text}\n{json.dumps(merged_intent, sort_keys=True)}"
+    try:
+        vectors = await embed_texts([embedding_input])
+        if vectors:
+            await project_repo.update_project_intent_embedding_for_service(project_id, vectors[0])
+    except Exception as exc:
+        logger.warning(
+            "project_service.apply_wizard_overrides.intent_embedding_failed",
+            project_id=project_id,
+            error=str(exc),
+        )
+
+    await _invalidate_projects_summary_cache(str(project.get("user_id") or ""))
+    updated = await project_repo.fetch_project_by_id_for_service(project_id)
+    return updated
 
 
 async def delete_project(project_id: str, user_id: str) -> bool:

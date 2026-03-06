@@ -22,9 +22,15 @@ from app.models.schemas import (
     ProjectCreate,
     ProjectResponse,
     ProjectSetupStatusResponse,
+    WizardCreateRequest,
+    WizardEvaluateRequest,
+    WizardEvaluateResponse,
+    WizardSynthesizeRequest,
+    WizardSynthesizeResponse,
 )
 from app.services import project as project_service
 from app.services import project_discover
+from app.services import project_wizard as project_wizard_service
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(dependencies=[Depends(verify_internal_token)])
@@ -57,6 +63,7 @@ def _serialize_project(p: dict) -> ProjectResponse:
         id=p["id"],
         title=p["title"],
         description=p["description"],
+        enriched_description=p.get("enriched_description"),
         refresh_strategy=p["refresh_strategy"],
         structured_intent=structured_intent,
         kb_chunk_count=p.get("kb_chunk_count") or 0,
@@ -75,6 +82,40 @@ def _serialize_project(p: dict) -> ProjectResponse:
         else None,
         created_at=created_at,
     )
+
+
+def _normalize_target_sources(raw: dict | None) -> dict[str, bool]:
+    defaults = {
+        "tiktok": True,
+        "instagram": True,
+        "youtube": True,
+        "reddit": True,
+        "x": True,
+        "papers": True,
+        "patents": True,
+        "news": True,
+        "web_tavily": True,
+        "web_exa": True,
+    }
+    payload = raw or {}
+    if "web" in payload:
+        defaults["web_tavily"] = bool(payload.get("web"))
+        defaults["web_exa"] = bool(payload.get("web"))
+    for key in defaults:
+        if key in payload:
+            defaults[key] = bool(payload[key])
+    return defaults
+
+
+def _qa_payload(qa_pairs: list) -> list[dict]:
+    return [
+        {
+            "question": str(item.question),
+            "answer": str(item.answer),
+            "dimension": str(item.dimension or ""),
+        }
+        for item in qa_pairs
+    ]
 
 
 @router.post("/", response_model=ProjectResponse, status_code=201)
@@ -121,6 +162,124 @@ async def create_project(
     )
 
     return _serialize_project(project)
+
+
+@router.post("/wizard/evaluate", response_model=WizardEvaluateResponse)
+async def wizard_evaluate(
+    body: WizardEvaluateRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Evaluate wizard sufficiency and generate the next focused question."""
+    _ = current_user["user_id"]
+    payload = await _run_service_call(
+        action="wizard_evaluate",
+        detail="Failed to evaluate project wizard context",
+        coro=project_wizard_service.evaluate_project_sufficiency(
+            title=body.title,
+            description=body.description,
+            qa_pairs=_qa_payload(body.qa_pairs),
+            max_questions=body.max_questions,
+        ),
+    )
+    return WizardEvaluateResponse(**payload)
+
+
+@router.post("/wizard/synthesize", response_model=WizardSynthesizeResponse)
+async def wizard_synthesize(
+    body: WizardSynthesizeRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Synthesize wizard context into phase-2 review fields."""
+    _ = current_user["user_id"]
+    payload = await _run_service_call(
+        action="wizard_synthesize",
+        detail="Failed to synthesize wizard review payload",
+        coro=project_wizard_service.synthesize_wizard_review(
+            title=body.title,
+            description=body.description,
+            qa_pairs=_qa_payload(body.qa_pairs),
+            structured_intent=parse_metadata(body.structured_intent),
+            source_toggles=body.source_toggles,
+        ),
+    )
+    return WizardSynthesizeResponse(**payload)
+
+
+@router.post("/wizard/create", response_model=ProjectResponse, status_code=201)
+async def wizard_create_project(
+    body: WizardCreateRequest,
+    current_user: dict = Depends(get_current_user),
+    arq_pool=Depends(get_arq_pool),
+):
+    """
+    Create a project using two-phase wizard context and manual overrides.
+
+    Phase-1 context is used to produce an enriched description, then Phase-2
+    overrides are merged into structured_intent values while preserving schema.
+    """
+    if body.refresh_strategy not in ProjectRefresh.VALID_STRATEGIES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"refresh_strategy must be one of: {', '.join(sorted(ProjectRefresh.VALID_STRATEGIES))}",
+        )
+
+    source_toggles = _normalize_target_sources(body.target_sources)
+
+    user_id = current_user["user_id"]
+    project = await _run_service_call(
+        action="wizard_create",
+        detail="Failed to create wizard project",
+        coro=project_service.create_project(
+            user_id=user_id,
+            title=body.title,
+            description=body.description,
+            refresh_strategy=body.refresh_strategy,
+            arq_pool=arq_pool,
+            tiktok_enabled=source_toggles["tiktok"],
+            instagram_enabled=source_toggles["instagram"],
+            youtube_enabled=source_toggles["youtube"],
+            reddit_enabled=source_toggles["reddit"],
+            x_enabled=source_toggles["x"],
+            papers_enabled=source_toggles["papers"],
+            patents_enabled=source_toggles["patents"],
+            perigon_enabled=source_toggles["news"],
+            tavily_enabled=source_toggles["web_tavily"],
+            exa_enabled=source_toggles["web_exa"],
+        ),
+    )
+
+    synthesis_payload = await _run_service_call(
+        action="wizard_synthesize",
+        detail="Failed to synthesize enriched description",
+        coro=project_wizard_service.synthesize_wizard_review(
+            title=body.title,
+            description=body.description,
+            qa_pairs=_qa_payload(body.qa_pairs),
+            structured_intent=parse_metadata(project.get("structured_intent")),
+            source_toggles=source_toggles,
+        ),
+    )
+
+    updated = await _run_service_call(
+        action="wizard_merge",
+        detail="Failed to merge wizard overrides into intent",
+        coro=project_service.apply_wizard_overrides(
+            project_id=project["id"],
+            enriched_description=str(synthesis_payload.get("enriched_description") or ""),
+            overrides={
+                "domain_focus": body.domain_focus,
+                "key_entities": body.key_entities,
+                "must_match_terms": body.must_match_terms,
+                "time_horizon": body.time_horizon,
+                "target_sources": source_toggles,
+            },
+        ),
+    )
+
+    if not updated:
+        raise HTTPException(status_code=500, detail="Failed to finalize wizard project")
+
+    return _serialize_project(updated)
 
 
 @router.get("/", response_model=list[ProjectResponse])

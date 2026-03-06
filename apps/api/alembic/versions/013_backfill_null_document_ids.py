@@ -39,8 +39,8 @@ def upgrade() -> None:
     # 1) Insert missing knowledge_documents for chunks where document_id is null.
     #    CTE computes base_id once per chunk; GROUP BY references the alias so the
     #    REGEXP_REPLACE expression is never duplicated.
-    bind.execute(
-        sa.text(r"""
+    bind.exec_driver_sql(
+        r"""
         WITH resolved AS (
             SELECT
                 kc.project_id,
@@ -75,14 +75,14 @@ def upgrade() -> None:
         FROM resolved
         GROUP BY project_id, user_id, source, base_id
         ON CONFLICT (project_id, source, source_id) DO NOTHING
-    """).execution_options(no_parameters=True)
+    """
     )
 
     # 2) Link all null-document chunks to their document rows.
     #    CTE computes base_id once per chunk; outer UPDATE matches on kc.id
     #    (primary key) — exactly one document per chunk, no ambiguity.
-    bind.execute(
-        sa.text(r"""
+    bind.exec_driver_sql(
+        r"""
         WITH resolved AS (
             SELECT
                 kc.id AS chunk_id,
@@ -107,7 +107,7 @@ def upgrade() -> None:
          AND kd.source     = r.source
          AND kd.source_id  = r.base_id
         WHERE kc.id = r.chunk_id
-    """).execution_options(no_parameters=True)
+    """
     )
 
 

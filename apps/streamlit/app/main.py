@@ -296,137 +296,435 @@ def _short_datetime_ist(value: str | None) -> str:
     return dt.strftime("%Y-%m-%d %H:%M IST")
 
 
+def _wizard_state_key(form_key: str) -> str:
+    return f"{form_key}_wizard_state"
+
+
+def _wizard_default_sources(defaults: dict | None = None) -> dict[str, bool]:
+    cfg = defaults or {}
+    return {
+        "tiktok": bool(cfg.get("tiktok_enabled", True)),
+        "instagram": bool(cfg.get("instagram_enabled", True)),
+        "youtube": bool(cfg.get("youtube_enabled", True)),
+        "reddit": bool(cfg.get("reddit_enabled", True)),
+        "x": bool(cfg.get("x_enabled", True)),
+        "papers": bool(cfg.get("papers_enabled", True)),
+        "patents": bool(cfg.get("patents_enabled", True)),
+        "news": bool(cfg.get("perigon_enabled", True)),
+        "web_tavily": bool(cfg.get("tavily_enabled", True)),
+        "web_exa": bool(cfg.get("exa_enabled", True)),
+    }
+
+
+def _reset_wizard_state(form_key: str, defaults: dict | None = None) -> None:
+    state_key = _wizard_state_key(form_key)
+    if state_key in st.session_state:
+        del st.session_state[state_key]
+
+    prefixes = (
+        f"{form_key}_wizard_title",
+        f"{form_key}_wizard_description",
+        f"{form_key}_wizard_answer_",
+        f"{form_key}_wizard_domain_focus",
+        f"{form_key}_wizard_entities",
+        f"{form_key}_wizard_must_terms",
+        f"{form_key}_wizard_time_horizon",
+        f"{form_key}_wizard_refresh_strategy",
+        f"{form_key}_wizard_enriched_description",
+        f"{form_key}_wizard_src_",
+    )
+    for key in list(st.session_state.keys()):
+        if any(key.startswith(prefix) for prefix in prefixes):
+            del st.session_state[key]
+
+    cfg = defaults or {}
+    st.session_state[state_key] = {
+        "phase": "intro",
+        "title": str(cfg.get("title", "")),
+        "description": str(cfg.get("description", "")),
+        "refresh_strategy": str(cfg.get("refresh_strategy", "once")),
+        "source_toggles": _wizard_default_sources(cfg),
+        "qa_pairs": [],
+        "pending_question": "",
+        "pending_dimension": "",
+        "scores": {},
+        "max_questions": 5,
+        "review_payload": {},
+    }
+
+
+def _ensure_wizard_state(form_key: str, defaults: dict | None = None) -> dict:
+    state_key = _wizard_state_key(form_key)
+    if state_key not in st.session_state:
+        _reset_wizard_state(form_key, defaults)
+    return st.session_state[state_key]
+
+
+def _ensure_review_widget_defaults(form_key: str, state: dict) -> None:
+    payload = state.get("review_payload") or {}
+    source_toggles = payload.get("target_sources") or state.get("source_toggles") or {}
+
+    defaults = {
+        f"{form_key}_wizard_domain_focus": str(payload.get("domain_focus") or ""),
+        f"{form_key}_wizard_entities": list(payload.get("key_entities") or []),
+        f"{form_key}_wizard_must_terms": list(payload.get("must_match_terms") or []),
+        f"{form_key}_wizard_time_horizon": str(payload.get("time_horizon") or "last 1 year"),
+        f"{form_key}_wizard_refresh_strategy": str(state.get("refresh_strategy") or "once"),
+        f"{form_key}_wizard_enriched_description": str(payload.get("enriched_description") or ""),
+        f"{form_key}_wizard_src_tiktok": bool(source_toggles.get("tiktok", True)),
+        f"{form_key}_wizard_src_instagram": bool(source_toggles.get("instagram", True)),
+        f"{form_key}_wizard_src_youtube": bool(source_toggles.get("youtube", True)),
+        f"{form_key}_wizard_src_reddit": bool(source_toggles.get("reddit", True)),
+        f"{form_key}_wizard_src_x": bool(source_toggles.get("x", True)),
+        f"{form_key}_wizard_src_papers": bool(source_toggles.get("papers", True)),
+        f"{form_key}_wizard_src_patents": bool(source_toggles.get("patents", True)),
+        f"{form_key}_wizard_src_news": bool(source_toggles.get("news", True)),
+        f"{form_key}_wizard_src_web_tavily": bool(source_toggles.get("web_tavily", True)),
+        f"{form_key}_wizard_src_web_exa": bool(source_toggles.get("web_exa", True)),
+    }
+    for key, value in defaults.items():
+        st.session_state.setdefault(key, value)
+
+
 def _render_create_project_form(
     *,
     form_key: str,
     submit_label: str = "Create Project",
     defaults: dict | None = None,
 ) -> None:
-    """
-    Render and handle the create-project form.
-
-    Reused by Home and Projects pages to keep behavior consistent.
-    """
+    """Render and handle the two-phase project wizard."""
     cfg = defaults or {}
-    with st.form(form_key):
-        title = st.text_input("Title", max_chars=255, value=cfg.get("title", ""))
+    state = _ensure_wizard_state(form_key, cfg)
+
+    st.markdown("#### Project Wizard")
+    st.caption("Phase 1: Dynamic Q&A • Phase 2: Review & Confirm")
+
+    if state.get("phase") == "intro":
+        title = st.text_input(
+            "Title",
+            max_chars=255,
+            key=f"{form_key}_wizard_title",
+            value=state.get("title", ""),
+        )
         description = st.text_area(
             "Description",
             help="Describe what this project researches (min 10 chars)",
             max_chars=5000,
-            value=cfg.get("description", ""),
-        )
-        refresh_strategy = st.selectbox(
-            "Refresh Strategy",
-            ["once", "daily", "weekly", "on_demand"],
-            help="How often to refresh the KB from social sources",
-            index=["once", "daily", "weekly", "on_demand"].index(
-                cfg.get("refresh_strategy", "once")
-            ),
-        )
-        st.markdown("**Data Sources**")
-
-        col_s1, col_s2 = st.columns(2)
-        with col_s1:
-            st.markdown("*Social*")
-            tiktok_enabled = st.checkbox(
-                "TikTok", value=cfg.get("tiktok_enabled", True)
-            )
-            instagram_enabled = st.checkbox(
-                "Instagram", value=cfg.get("instagram_enabled", True)
-            )
-            youtube_enabled = st.checkbox(
-                "YouTube", value=cfg.get("youtube_enabled", True)
-            )
-            reddit_enabled = st.checkbox(
-                "Reddit", value=cfg.get("reddit_enabled", True)
-            )
-            x_enabled = st.checkbox(
-                "X", value=cfg.get("x_enabled", True)
-            )
-
-        with col_s2:
-            st.markdown("*Research*")
-            papers_enabled = st.checkbox(
-                "Papers", value=cfg.get("papers_enabled", True)
-            )
-            patents_enabled = st.checkbox(
-                "Patents", value=cfg.get("patents_enabled", True)
-            )
-
-        col_d1, col_d2, col_d3 = st.columns(3)
-        with col_d1:
-            st.markdown("*Discovery*")
-            perigon_enabled = st.checkbox(
-                "News", value=cfg.get("perigon_enabled", True)
-            )
-        with col_d2:
-            st.markdown("&nbsp;", unsafe_allow_html=True)
-            tavily_enabled = st.checkbox(
-                "Web (Tavily)", value=cfg.get("tavily_enabled", True)
-            )
-        with col_d3:
-            st.markdown("&nbsp;", unsafe_allow_html=True)
-            exa_enabled = st.checkbox("Web (Exa)", value=cfg.get("exa_enabled", True))
-
-        bootstrap_files = st.file_uploader(
-            "Optional bootstrap docs (pdf/docx/txt/md)",
-            type=["pdf", "docx", "txt", "md"],
-            accept_multiple_files=True,
-            key=f"{form_key}_bootstrap_files",
+            key=f"{form_key}_wizard_description",
+            value=state.get("description", ""),
         )
 
-        submitted = st.form_submit_button(submit_label, use_container_width=True)
+        col_start, col_reset = st.columns([3, 1])
+        with col_start:
+            if st.button("Start Wizard", key=f"{form_key}_wizard_start", use_container_width=True):
+                title_value = (title or "").strip()
+                description_value = (description or "").strip()
+                if not title_value:
+                    st.error("Title is required.")
+                    return
+                if len(description_value) < 10:
+                    st.error("Description must be at least 10 characters.")
+                    return
+                with st.spinner("Evaluating project clarity..."):
+                    payload, err = _api.wizard_evaluate(
+                        title_value,
+                        description_value,
+                        qa_pairs=[],
+                        max_questions=int(state.get("max_questions") or 5),
+                    )
+                if err or not payload:
+                    st.error(err or "Could not start wizard.")
+                    return
 
-    if not submitted:
+                state["title"] = title_value
+                state["description"] = description_value
+                state["scores"] = payload.get("scores", {})
+                state["qa_pairs"] = []
+                state["pending_question"] = payload.get("next_question") or ""
+                state["pending_dimension"] = payload.get("next_dimension") or ""
+
+                if payload.get("should_stop"):
+                    with st.spinner("Synthesizing review fields..."):
+                        review_payload, synth_err = _api.wizard_synthesize(
+                            title=title_value,
+                            description=description_value,
+                            qa_pairs=[],
+                            structured_intent={},
+                            source_toggles=state.get("source_toggles") or {},
+                        )
+                    if synth_err or not review_payload:
+                        st.error(synth_err or "Could not synthesize review.")
+                        return
+                    state["review_payload"] = review_payload
+                    state["source_toggles"] = review_payload.get("target_sources") or state.get(
+                        "source_toggles", {}
+                    )
+                    state["phase"] = "review"
+                else:
+                    state["phase"] = "qa"
+                st.rerun()
+        with col_reset:
+            if st.button("Reset", key=f"{form_key}_wizard_intro_reset", use_container_width=True):
+                _reset_wizard_state(form_key, cfg)
+                st.rerun()
         return
 
-    title_value = (title or "").strip()
-    description_value = (description or "").strip()
-
-    if not title_value:
-        st.error("Title is required.")
-        return
-    if len(description_value) < 10:
-        st.error("Description must be at least 10 characters.")
-        return
-
-    with st.spinner("Creating project..."):
-        result, create_error = _api.create_project(
-            title_value,
-            description_value,
-            refresh_strategy,
-            tiktok_enabled=tiktok_enabled,
-            instagram_enabled=instagram_enabled,
-            youtube_enabled=youtube_enabled,
-            reddit_enabled=reddit_enabled,
-            x_enabled=x_enabled,
-            papers_enabled=papers_enabled,
-            patents_enabled=patents_enabled,
-            perigon_enabled=perigon_enabled,
-            tavily_enabled=tavily_enabled,
-            exa_enabled=exa_enabled,
+    if state.get("phase") == "qa":
+        scores = state.get("scores") or {}
+        st.markdown(
+            (
+                f"Clarity scores: objective **{scores.get('objective_clarity', 0.0):.2f}**, "
+                f"pain point **{scores.get('pain_point_clarity', 0.0):.2f}**, "
+                f"output **{scores.get('output_clarity', 0.0):.2f}**, "
+                f"domain **{scores.get('domain_specificity', 0.0):.2f}**"
+            )
         )
 
-    if result:
-        upload_ids: list[str] = []
-        for upload_file in bootstrap_files or []:
-            upload_result = _api.upload_document(
-                result["id"], upload_file.name, upload_file.read()
-            )
-            if upload_result and upload_result.get("upload_id"):
-                upload_ids.append(upload_result["upload_id"])
+        answered_pairs = list(state.get("qa_pairs") or [])
+        pending_question = str(state.get("pending_question") or "").strip()
+        pending_dimension = str(state.get("pending_dimension") or "").strip()
 
-        with st.spinner("Starting project setup..."):
-            _api.bootstrap_project(result["id"], upload_ids)
+        labels = [f"Answered {idx + 1}" for idx in range(len(answered_pairs))]
+        if pending_question:
+            labels.append(f"Question {len(answered_pairs) + 1}")
+        tabs = st.tabs(labels or ["Question 1"])
 
-        st.session_state.selected_project_id = result["id"]
-        st.session_state.current_page = "Chat"
-        reload_projects()
-        st.success(f"Project '{result['title']}' created.")
+        for idx, item in enumerate(answered_pairs):
+            with tabs[idx]:
+                st.markdown(f"**Question:** {item.get('question', '')}")
+                st.markdown(f"**Answer:** {item.get('answer', '')}")
+
+        if pending_question:
+            answer_key = f"{form_key}_wizard_answer_{len(answered_pairs)}"
+            with tabs[-1]:
+                st.markdown(f"**Question:** {pending_question}")
+                answer = st.text_area(
+                    "Your answer",
+                    key=answer_key,
+                    height=130,
+                    placeholder="Add specific context and constraints...",
+                )
+                col_submit, col_restart = st.columns(2)
+                with col_submit:
+                    if st.button(
+                        "Submit Answer",
+                        key=f"{form_key}_wizard_submit_{len(answered_pairs)}",
+                        use_container_width=True,
+                    ):
+                        answer_value = (answer or "").strip()
+                        if not answer_value:
+                            st.error("Please answer the current question.")
+                            return
+                        answered_pairs.append(
+                            {
+                                "question": pending_question,
+                                "answer": answer_value,
+                                "dimension": pending_dimension,
+                            }
+                        )
+                        state["qa_pairs"] = answered_pairs
+                        with st.spinner("Refining wizard context..."):
+                            payload, err = _api.wizard_evaluate(
+                                state.get("title", ""),
+                                state.get("description", ""),
+                                qa_pairs=answered_pairs,
+                                max_questions=int(state.get("max_questions") or 5),
+                            )
+                        if err or not payload:
+                            st.error(err or "Failed to process answer.")
+                            return
+
+                        state["scores"] = payload.get("scores", {})
+                        state["pending_question"] = payload.get("next_question") or ""
+                        state["pending_dimension"] = payload.get("next_dimension") or ""
+
+                        if payload.get("should_stop"):
+                            with st.spinner("Synthesizing review fields..."):
+                                review_payload, synth_err = _api.wizard_synthesize(
+                                    title=state.get("title", ""),
+                                    description=state.get("description", ""),
+                                    qa_pairs=answered_pairs,
+                                    structured_intent={},
+                                    source_toggles=state.get("source_toggles") or {},
+                                )
+                            if synth_err or not review_payload:
+                                st.error(synth_err or "Could not synthesize review.")
+                                return
+                            state["review_payload"] = review_payload
+                            state["source_toggles"] = review_payload.get("target_sources") or state.get(
+                                "source_toggles", {}
+                            )
+                            state["phase"] = "review"
+                        st.rerun()
+                with col_restart:
+                    if st.button(
+                        "Start Over",
+                        key=f"{form_key}_wizard_qa_reset",
+                        use_container_width=True,
+                    ):
+                        _reset_wizard_state(form_key, cfg)
+                        st.rerun()
+        return
+
+    if state.get("phase") != "review":
+        _reset_wizard_state(form_key, cfg)
         st.rerun()
-    else:
-        st.error(create_error or "Failed to create project. Please try again.")
+        return
+
+    _ensure_review_widget_defaults(form_key, state)
+    review_payload = state.get("review_payload") or {}
+
+    st.markdown("#### Review & Confirm")
+    st.caption("Edit fields below before creating the final project.")
+
+    with st.expander("Conversation Summary", expanded=False):
+        st.markdown(f"**Title:** {state.get('title', '')}")
+        st.markdown(f"**Description:** {state.get('description', '')}")
+        for idx, item in enumerate(state.get("qa_pairs") or []):
+            st.markdown(f"{idx + 1}. **Q:** {item.get('question', '')}")
+            st.markdown(f"   **A:** {item.get('answer', '')}")
+
+    st.text_area(
+        "Enriched Description",
+        key=f"{form_key}_wizard_enriched_description",
+        height=220,
+        help="Dense semantic summary used for downstream ranking and retrieval.",
+    )
+
+    domain_focus = st.text_input(
+        "Domain Focus",
+        key=f"{form_key}_wizard_domain_focus",
+        max_chars=255,
+    )
+
+    key_entity_options = sorted(
+        set(
+            list(review_payload.get("key_entities") or [])
+            + list(review_payload.get("must_match_terms") or [])
+        )
+    )
+    st.multiselect(
+        "Key Entities",
+        options=key_entity_options,
+        key=f"{form_key}_wizard_entities",
+        accept_new_options=True,
+    )
+    st.multiselect(
+        "Must-Match Terms",
+        options=key_entity_options,
+        key=f"{form_key}_wizard_must_terms",
+        accept_new_options=True,
+    )
+
+    horizon_options = [
+        "last 6 months",
+        "last 1 year",
+        "last 2 years",
+        "last 5 years",
+        "all-time",
+    ]
+    current_horizon = st.session_state.get(f"{form_key}_wizard_time_horizon", "last 1 year")
+    if current_horizon not in horizon_options:
+        horizon_options.append(current_horizon)
+    st.selectbox(
+        "Time Horizon",
+        horizon_options,
+        key=f"{form_key}_wizard_time_horizon",
+    )
+
+    st.selectbox(
+        "Refresh Strategy",
+        ["once", "daily", "weekly", "on_demand"],
+        key=f"{form_key}_wizard_refresh_strategy",
+        help="How often to refresh the KB from social and research sources.",
+    )
+
+    st.markdown("**Target Data Sources**")
+    col_s1, col_s2 = st.columns(2)
+    with col_s1:
+        st.markdown("*Social*")
+        st.toggle("TikTok", key=f"{form_key}_wizard_src_tiktok")
+        st.toggle("Instagram", key=f"{form_key}_wizard_src_instagram")
+        st.toggle("YouTube", key=f"{form_key}_wizard_src_youtube")
+        st.toggle("Reddit", key=f"{form_key}_wizard_src_reddit")
+        st.toggle("X", key=f"{form_key}_wizard_src_x")
+    with col_s2:
+        st.markdown("*Research & Discovery*")
+        st.toggle("Papers", key=f"{form_key}_wizard_src_papers")
+        st.toggle("Patents", key=f"{form_key}_wizard_src_patents")
+        st.toggle("News", key=f"{form_key}_wizard_src_news")
+        st.toggle("Web (Tavily)", key=f"{form_key}_wizard_src_web_tavily")
+        st.toggle("Web (Exa)", key=f"{form_key}_wizard_src_web_exa")
+
+    bootstrap_files = st.file_uploader(
+        "Optional bootstrap docs (pdf/docx/txt/md)",
+        type=["pdf", "docx", "txt", "md"],
+        accept_multiple_files=True,
+        key=f"{form_key}_bootstrap_files",
+    )
+
+    target_sources = {
+        "tiktok": bool(st.session_state.get(f"{form_key}_wizard_src_tiktok", True)),
+        "instagram": bool(st.session_state.get(f"{form_key}_wizard_src_instagram", True)),
+        "youtube": bool(st.session_state.get(f"{form_key}_wizard_src_youtube", True)),
+        "reddit": bool(st.session_state.get(f"{form_key}_wizard_src_reddit", True)),
+        "x": bool(st.session_state.get(f"{form_key}_wizard_src_x", True)),
+        "papers": bool(st.session_state.get(f"{form_key}_wizard_src_papers", True)),
+        "patents": bool(st.session_state.get(f"{form_key}_wizard_src_patents", True)),
+        "news": bool(st.session_state.get(f"{form_key}_wizard_src_news", True)),
+        "web_tavily": bool(st.session_state.get(f"{form_key}_wizard_src_web_tavily", True)),
+        "web_exa": bool(st.session_state.get(f"{form_key}_wizard_src_web_exa", True)),
+    }
+
+    col_create, col_back, col_reset = st.columns([3, 1, 1])
+    with col_create:
+        if st.button(submit_label, key=f"{form_key}_wizard_create", use_container_width=True):
+            with st.spinner("Creating project..."):
+                result, create_error = _api.wizard_create(
+                    title=state.get("title", ""),
+                    description=state.get("description", ""),
+                    qa_pairs=list(state.get("qa_pairs") or []),
+                    refresh_strategy=str(
+                        st.session_state.get(f"{form_key}_wizard_refresh_strategy", "once")
+                    ),
+                    domain_focus=domain_focus,
+                    key_entities=list(st.session_state.get(f"{form_key}_wizard_entities", [])),
+                    must_match_terms=list(st.session_state.get(f"{form_key}_wizard_must_terms", [])),
+                    time_horizon=str(
+                        st.session_state.get(f"{form_key}_wizard_time_horizon", "last 1 year")
+                    ),
+                    target_sources=target_sources,
+                )
+
+            if not result:
+                st.error(create_error or "Failed to create project. Please try again.")
+                return
+
+            upload_ids: list[str] = []
+            for upload_file in bootstrap_files or []:
+                upload_result = _api.upload_document(
+                    result["id"], upload_file.name, upload_file.read()
+                )
+                if upload_result and upload_result.get("upload_id"):
+                    upload_ids.append(upload_result["upload_id"])
+
+            with st.spinner("Starting project setup..."):
+                _api.bootstrap_project(result["id"], upload_ids)
+
+            st.session_state.selected_project_id = result["id"]
+            st.session_state.current_page = "Chat"
+            _reset_wizard_state(form_key, cfg)
+            reload_projects()
+            st.success(f"Project '{result['title']}' created.")
+            st.rerun()
+    with col_back:
+        if st.button("Back", key=f"{form_key}_wizard_back_to_qa", use_container_width=True):
+            state["phase"] = "qa"
+            st.rerun()
+    with col_reset:
+        if st.button("Reset", key=f"{form_key}_wizard_review_reset", use_container_width=True):
+            _reset_wizard_state(form_key, cfg)
+            st.rerun()
 
 
 # Preload projects once so Home can render without sidebar interaction.

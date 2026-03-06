@@ -63,6 +63,7 @@ async def insert_project(
                  metadata, created_at, updated_at)
             VALUES ($1, $2, $3, $4, $5, $6::jsonb, 0, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17::jsonb, $18, $18)
             RETURNING id::text, user_id, title, description,
+                      enriched_description,
                       refresh_strategy, structured_intent,
                       kb_chunk_count,
                       tiktok_enabled, instagram_enabled, youtube_enabled, reddit_enabled, x_enabled, papers_enabled,
@@ -144,6 +145,7 @@ async def fetch_project(
         row = await conn.fetchrow(
             """
             SELECT id::text, user_id, title, description,
+                   enriched_description,
                    refresh_strategy, structured_intent,
                    kb_chunk_count, tiktok_enabled, instagram_enabled, youtube_enabled, reddit_enabled, x_enabled, papers_enabled,
                    patents_enabled, perigon_enabled, tavily_enabled, exa_enabled,
@@ -167,6 +169,7 @@ async def fetch_project_by_id(
         row = await conn.fetchrow(
             """
             SELECT id::text, user_id, title, description,
+                   enriched_description,
                    refresh_strategy, structured_intent,
                    kb_chunk_count, tiktok_enabled, instagram_enabled, youtube_enabled, reddit_enabled, x_enabled, papers_enabled,
                    patents_enabled, perigon_enabled, tavily_enabled, exa_enabled,
@@ -325,6 +328,7 @@ async def list_projects(
         rows = await conn.fetch(
             """
             SELECT id::text, user_id, title, description,
+                   enriched_description,
                    refresh_strategy, structured_intent,
                    kb_chunk_count, tiktok_enabled, instagram_enabled, youtube_enabled, reddit_enabled, x_enabled, papers_enabled,
                    patents_enabled, perigon_enabled, tavily_enabled, exa_enabled,
@@ -623,6 +627,37 @@ async def update_project_intent_for_service(
 ) -> None:
     """Update structured intent with internally managed pool for services."""
     await _with_service_pool(update_project_intent, project_id, structured_intent)
+
+
+async def update_project_enriched_description(
+    pool: asyncpg.Pool,
+    project_id: str,
+    enriched_description: str | None,
+) -> None:
+    """Persist enriched description text for a project."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE projects
+            SET enriched_description = $1,
+                updated_at = NOW()
+            WHERE id = $2::uuid
+            """,
+            enriched_description,
+            project_id,
+        )
+
+
+async def update_project_enriched_description_for_service(
+    project_id: str,
+    enriched_description: str | None,
+) -> None:
+    """Update enriched description with internally managed pool for services."""
+    await _with_service_pool(
+        update_project_enriched_description,
+        project_id,
+        enriched_description,
+    )
 
 
 async def update_project_kb_stats(

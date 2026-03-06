@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from app.services import project_wizard
 from app.tasks.ingest_filters import (
     _filter_relevance,
     _filter_stage1_embedding,
@@ -254,3 +255,153 @@ def test_looks_like_patent_url_rejects_non_patent_pages() -> None:
     )
     assert not _looks_like_patent_url("https://example.com/patent-news-roundup")
     assert not _looks_like_patent_url("https://x.com/someone/status/123")
+
+
+@pytest.mark.asyncio
+async def test_wizard_evaluate_returns_core_followup_for_sparse_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _no_llm(**_: object):
+        return None
+
+    monkeypatch.setattr(project_wizard, "_llm_json", _no_llm)
+
+    payload = await project_wizard.evaluate_project_sufficiency(
+        title="Beauty trends",
+        description="Need help.",
+        qa_pairs=[],
+        max_questions=5,
+    )
+
+    assert payload["should_stop"] is False
+    assert payload["next_dimension"] in {
+        "objective_clarity",
+        "pain_point_clarity",
+        "output_clarity",
+    }
+    assert isinstance(payload["next_question"], str)
+    assert payload["next_question"]
+
+
+@pytest.mark.asyncio
+async def test_wizard_evaluate_asks_domain_after_core_dimensions_are_clear(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _no_llm(**_: object):
+        return None
+
+    monkeypatch.setattr(project_wizard, "_llm_json", _no_llm)
+
+    payload = await project_wizard.evaluate_project_sufficiency(
+        title="Retinol portfolio strategy",
+        description=(
+            "We need to evaluate retinol product opportunity risks, compare competitor claims, "
+            "and produce a decision-ready recommendation roadmap for next-quarter portfolio planning."
+        ),
+        qa_pairs=[
+            {
+                "question": "What pain point are you solving?",
+                "answer": "We are uncertain which claims are defensible and where market risk is highest.",
+                "dimension": "pain_point_clarity",
+            },
+            {
+                "question": "What output do you need?",
+                "answer": "A ranked action plan with explicit trade-offs and priorities.",
+                "dimension": "output_clarity",
+            },
+        ],
+        max_questions=5,
+    )
+
+    assert payload["should_stop"] is False
+    assert payload["next_dimension"] == "domain_specificity"
+    assert "platform" in payload["next_question"].lower() or "data" in payload["next_question"].lower()
+
+
+@pytest.mark.asyncio
+async def test_wizard_synthesize_fallback_contains_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _no_llm(**_: object):
+        return None
+
+    monkeypatch.setattr(project_wizard, "_llm_json", _no_llm)
+
+    payload = await project_wizard.synthesize_wizard_review(
+        title="Skincare launch analysis",
+        description="Assess launch timing and claim strategy for sensitive-skin serums.",
+        qa_pairs=[
+            {
+                "question": "What should the output look like?",
+                "answer": "Executive summary with risk matrix.",
+                "dimension": "output_clarity",
+            }
+        ],
+        structured_intent={"domain": "skincare", "keywords": ["serum", "claims"]},
+        source_toggles={"tiktok": True, "web": False},
+    )
+
+    assert payload["enriched_description"]
+    assert "\n\n" in payload["enriched_description"]
+    assert payload["domain_focus"]
+    assert isinstance(payload["key_entities"], list)
+    assert isinstance(payload["must_match_terms"], list)
+    assert payload["target_sources"]["web_tavily"] is False
+    assert payload["target_sources"]["web_exa"] is False
+
+
+@pytest.mark.asyncio
+async def test_wizard_merge_preserves_schema_and_applies_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _fake_llm(**_: object):
+        return {
+            "domain": "should_be_overwritten",
+            "keywords": ["retinol", "encapsulation", "stability"],
+            "search_filters": {
+                "news": "retinol",
+                "papers": "retinol stability",
+                "patents": "retinol chemistry",
+                "tiktok": "#retinol",
+                "social": "#retinol",
+                "instagram": "retinol lab",
+                "extra_nested_key": "not_allowed",
+            },
+            "confidence": 0.91,
+            "extra_key": "not_allowed",
+        }
+
+    monkeypatch.setattr(project_wizard, "_llm_json", _fake_llm)
+
+    base_intent = {
+        "domain": "cosmetic_formulation",
+        "keywords": ["retinol"],
+        "search_filters": {
+            "news": "retinol skincare",
+            "papers": "retinol formulation",
+            "patents": "retinol delivery",
+            "tiktok": "#retinol",
+            "social": "#retinol",
+            "instagram": "retinol science",
+        },
+        "confidence": 0.3,
+    }
+
+    merged = await project_wizard.merge_intent_with_overrides(
+        structured_intent=base_intent,
+        enriched_description="Detailed enriched description about retinol encapsulation.",
+        overrides={
+            "domain_focus": "Skincare Formulation",
+            "key_entities": ["niacinamide", "retinol"],
+            "must_match_terms": ["microencapsulation"],
+            "time_horizon": "last 2 years",
+            "target_sources": {"tiktok": False},
+        },
+    )
+
+    assert set(merged.keys()) == set(base_intent.keys())
+    assert set(merged["search_filters"].keys()) == set(base_intent["search_filters"].keys())
+    assert merged["domain"] == "skincare_formulation"
+    assert "microencapsulation" in [term.lower() for term in merged["keywords"]]
+    assert merged["search_filters"]["tiktok"] == ""
+    assert merged["search_filters"]["social"] == ""

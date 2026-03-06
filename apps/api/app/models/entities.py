@@ -54,6 +54,7 @@ class Project(Base):
     user_id = Column(Text, nullable=False)
     title = Column(String(255), nullable=False)
     description = Column(Text, nullable=False)
+    enriched_description = Column(Text, nullable=True)
     structured_intent = Column(JSONB, nullable=False, server_default="{}")
     refresh_strategy = Column(String(50), nullable=False, server_default="once")
     last_refreshed_at = Column(DateTime(timezone=True), nullable=True)

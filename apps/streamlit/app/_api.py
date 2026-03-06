@@ -196,6 +196,140 @@ def create_project(
         return None, "Failed to reach backend while creating project."
 
 
+def wizard_evaluate(
+    title: str,
+    description: str,
+    qa_pairs: list[dict],
+    max_questions: int = 5,
+) -> tuple[dict | None, str | None]:
+    """Evaluate wizard sufficiency and fetch next dynamic question."""
+    try:
+        with httpx.Client(timeout=settings.FASTAPI_CREATE_PROJECT_TIMEOUT) as client:
+            resp = client.post(
+                f"{settings.FASTAPI_URL}/api/v1/projects/wizard/evaluate",
+                headers={**_headers(), "Content-Type": "application/json"},
+                json={
+                    "title": title,
+                    "description": description,
+                    "qa_pairs": qa_pairs,
+                    "max_questions": max_questions,
+                },
+            )
+            resp.raise_for_status()
+            return resp.json(), None
+    except httpx.TimeoutException as exc:
+        logger.warning("_api.wizard_evaluate.timeout", error=str(exc))
+        return None, "Wizard evaluation timed out. Please try again."
+    except httpx.HTTPStatusError as exc:
+        detail = _format_api_error_detail(exc.response)
+        logger.warning(
+            "_api.wizard_evaluate.http_error",
+            status_code=exc.response.status_code,
+            detail=detail,
+        )
+        return (
+            None,
+            f"Wizard evaluation failed ({exc.response.status_code}): {detail or 'Unknown error'}",
+        )
+    except Exception as exc:
+        logger.warning("_api.wizard_evaluate.error", error=str(exc))
+        return None, "Failed to evaluate wizard state."
+
+
+def wizard_synthesize(
+    *,
+    title: str,
+    description: str,
+    qa_pairs: list[dict],
+    structured_intent: dict,
+    source_toggles: dict[str, bool],
+) -> tuple[dict | None, str | None]:
+    """Generate phase-2 review payload from wizard context."""
+    try:
+        with httpx.Client(timeout=settings.FASTAPI_CREATE_PROJECT_TIMEOUT) as client:
+            resp = client.post(
+                f"{settings.FASTAPI_URL}/api/v1/projects/wizard/synthesize",
+                headers={**_headers(), "Content-Type": "application/json"},
+                json={
+                    "title": title,
+                    "description": description,
+                    "qa_pairs": qa_pairs,
+                    "structured_intent": structured_intent,
+                    "source_toggles": source_toggles,
+                },
+            )
+            resp.raise_for_status()
+            return resp.json(), None
+    except httpx.TimeoutException as exc:
+        logger.warning("_api.wizard_synthesize.timeout", error=str(exc))
+        return None, "Wizard synthesis timed out. Please try again."
+    except httpx.HTTPStatusError as exc:
+        detail = _format_api_error_detail(exc.response)
+        logger.warning(
+            "_api.wizard_synthesize.http_error",
+            status_code=exc.response.status_code,
+            detail=detail,
+        )
+        return (
+            None,
+            f"Wizard synthesis failed ({exc.response.status_code}): {detail or 'Unknown error'}",
+        )
+    except Exception as exc:
+        logger.warning("_api.wizard_synthesize.error", error=str(exc))
+        return None, "Failed to synthesize wizard review."
+
+
+def wizard_create(
+    *,
+    title: str,
+    description: str,
+    qa_pairs: list[dict],
+    refresh_strategy: str,
+    domain_focus: str,
+    key_entities: list[str],
+    must_match_terms: list[str],
+    time_horizon: str,
+    target_sources: dict[str, bool],
+) -> tuple[dict | None, str | None]:
+    """Create a project via two-phase wizard context and manual overrides."""
+    try:
+        with httpx.Client(timeout=settings.FASTAPI_CREATE_PROJECT_TIMEOUT) as client:
+            resp = client.post(
+                f"{settings.FASTAPI_URL}/api/v1/projects/wizard/create",
+                headers={**_headers(), "Content-Type": "application/json"},
+                json={
+                    "title": title,
+                    "description": description,
+                    "qa_pairs": qa_pairs,
+                    "refresh_strategy": refresh_strategy,
+                    "domain_focus": domain_focus,
+                    "key_entities": key_entities,
+                    "must_match_terms": must_match_terms,
+                    "time_horizon": time_horizon,
+                    "target_sources": target_sources,
+                },
+            )
+            resp.raise_for_status()
+            return resp.json(), None
+    except httpx.TimeoutException as exc:
+        logger.warning("_api.wizard_create.timeout", error=str(exc))
+        return None, "Wizard project creation timed out. Please try again."
+    except httpx.HTTPStatusError as exc:
+        detail = _format_api_error_detail(exc.response)
+        logger.warning(
+            "_api.wizard_create.http_error",
+            status_code=exc.response.status_code,
+            detail=detail,
+        )
+        return (
+            None,
+            f"Wizard project creation failed ({exc.response.status_code}): {detail or 'Unknown error'}",
+        )
+    except Exception as exc:
+        logger.warning("_api.wizard_create.error", error=str(exc))
+        return None, "Failed to create project with wizard flow."
+
+
 def delete_project(project_id: str) -> bool:
     """Delete a project. Returns True on success."""
     try:

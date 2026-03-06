@@ -68,6 +68,7 @@ class ProjectResponse(BaseModel):
     id: str
     title: str
     description: str
+    enriched_description: str | None = None
     refresh_strategy: str
     structured_intent: dict = Field(default_factory=dict)
     kb_chunk_count: int = 0
@@ -87,6 +88,59 @@ class ProjectResponse(BaseModel):
 
 class ProjectBootstrapRequest(BaseModel):
     upload_ids: list[str] = Field(default_factory=list)
+
+
+class WizardQAPair(BaseModel):
+    question: str = Field(..., min_length=1, max_length=1000)
+    answer: str = Field(..., min_length=1, max_length=5000)
+    dimension: str | None = Field(default=None, max_length=64)
+
+
+class WizardEvaluateRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=255)
+    description: str = Field(..., min_length=10, max_length=5000)
+    qa_pairs: list[WizardQAPair] = Field(default_factory=list)
+    max_questions: int = Field(default=5, ge=1, le=10)
+
+
+class WizardEvaluateResponse(BaseModel):
+    scores: dict = Field(default_factory=dict)
+    overall_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    weakest_dimension: str | None = None
+    next_dimension: str | None = None
+    next_question: str | None = None
+    should_stop: bool = False
+    asked_questions: int = Field(default=0, ge=0)
+    max_questions: int = Field(default=5, ge=1)
+
+
+class WizardSynthesizeRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=255)
+    description: str = Field(..., min_length=10, max_length=5000)
+    qa_pairs: list[WizardQAPair] = Field(default_factory=list)
+    structured_intent: dict = Field(default_factory=dict)
+    source_toggles: dict = Field(default_factory=dict)
+
+
+class WizardSynthesizeResponse(BaseModel):
+    enriched_description: str = Field(default="", max_length=12000)
+    domain_focus: str = Field(default="", max_length=255)
+    key_entities: list[str] = Field(default_factory=list)
+    must_match_terms: list[str] = Field(default_factory=list)
+    time_horizon: str = Field(default="", max_length=128)
+    target_sources: dict = Field(default_factory=dict)
+
+
+class WizardCreateRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=255)
+    description: str = Field(..., min_length=10, max_length=5000)
+    qa_pairs: list[WizardQAPair] = Field(default_factory=list)
+    refresh_strategy: str = Field(default="once")
+    domain_focus: str = Field(default="", max_length=255)
+    key_entities: list[str] = Field(default_factory=list)
+    must_match_terms: list[str] = Field(default_factory=list)
+    time_horizon: str = Field(default="", max_length=128)
+    target_sources: dict = Field(default_factory=dict)
 
 
 class ProjectSetupStatusResponse(BaseModel):
