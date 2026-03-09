@@ -10,6 +10,7 @@ Supports independently toggleable ingestion sources:
 import asyncio
 import json
 import re
+from collections.abc import Awaitable
 from datetime import UTC, datetime
 
 import structlog
@@ -585,6 +586,15 @@ async def _run_ingestion(
         if enabled
     )
 
+    def _ensure_source_diagnostics(source_key: str) -> dict:
+        diagnostics = source_diagnostics.setdefault(source_key, {})
+        diagnostics.setdefault("inserted_docs", 0)
+        diagnostics.setdefault("inserted_chunks", 0)
+        diagnostics.setdefault("fulltext_enqueued", 0)
+        diagnostics.setdefault("buffered_docs", 0)
+        diagnostics.setdefault("dedup_discarded_docs", 0)
+        return diagnostics
+
     # 1. Non-Social Processing — process tasks as they complete
     for completed_sources, task in enumerate(asyncio.as_completed(tasks), start=1):
         idx, result = await task
@@ -608,7 +618,22 @@ async def _run_ingestion(
             exists = await project_repo.project_exists_for_service(project_id)
             if not exists:
                 logger.info("ingestion.project_deleted", project_id=project_id)
-                break
+                for pending_task in tasks:
+                    if not pending_task.done():
+                        pending_task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                try:
+                    remaining_chunks = await project_repo.get_chunk_count_for_service(project_id)
+                except Exception:
+                    remaining_chunks = 0
+                return {
+                    "status": "failed",
+                    "message": "Project deleted during ingestion.",
+                    "source_counts": source_counts,
+                    "source_diagnostics": source_diagnostics,
+                    "fulltext_enqueued": fulltext_enqueued,
+                    "total_chunks": remaining_chunks,
+                }
 
         # Process all sources (including social) immediately as they complete
         # Social sources no longer delayed - processed in first loop
@@ -624,6 +649,7 @@ async def _run_ingestion(
             expansion_meta={},
         )
         source_diagnostics[source_key] = diagnostics
+        _ensure_source_diagnostics(source_key)
         any_source_completed = any_source_completed or source_completed
 
         if kept_docs:
@@ -636,9 +662,16 @@ async def _run_ingestion(
                     # Store source_key in metadata temporarily for sorting
                     d.metadata["_source_key"] = source_key
                 all_paper_docs.extend(kept_docs)
+                _ensure_source_diagnostics(source_key)["buffered_docs"] += len(kept_docs)
             else:
-                inserted += await ingest_documents(kept_docs)
-                fulltext_enqueued += await _schedule_fulltext_enrichment(ctx, None, kept_docs)
+                inserted_chunk_count = await ingest_documents(kept_docs)
+                inserted += inserted_chunk_count
+                fulltext_job_count = await _schedule_fulltext_enrichment(ctx, None, kept_docs)
+                fulltext_enqueued += fulltext_job_count
+                source_diag = _ensure_source_diagnostics(source_key)
+                source_diag["inserted_docs"] += len(kept_docs)
+                source_diag["inserted_chunks"] += int(inserted_chunk_count)
+                source_diag["fulltext_enqueued"] += int(fulltext_job_count)
                 if source_key == SourceType.SOCIAL_YOUTUBE:
                     # ctx["redis"] is the ArqRedis pool — only it has enqueue_job.
                     # The plain redis client (get_redis()) is used for lock ops.
@@ -670,8 +703,11 @@ async def _run_ingestion(
         unique_papers = []
         seen_dois = set()
         seen_titles = set()
+        accepted_paper_counts: dict[str, int] = {}
+        dedup_discarded_counts: dict[str, int] = {}
 
         for d in all_paper_docs:
+            paper_source_key = str(d.metadata.get("_source_key") or "paper_unknown")
             # Clean up the temporary sorting key
             d.metadata.pop("_source_key", None)
 
@@ -689,6 +725,9 @@ async def _run_ingestion(
             # 3. Comprehensive Duplicate Check
             # Priority sorting ensures higher quality sources are processed first
             if (doi and doi in seen_dois) or (norm_title and norm_title in seen_titles):
+                dedup_discarded_counts[paper_source_key] = (
+                    dedup_discarded_counts.get(paper_source_key, 0) + 1
+                )
                 continue
 
             if doi:
@@ -697,10 +736,33 @@ async def _run_ingestion(
                 seen_titles.add(norm_title)
 
             unique_papers.append(d)
+            accepted_paper_counts[paper_source_key] = accepted_paper_counts.get(paper_source_key, 0) + 1
+
+        for paper_source_key, discarded_count in dedup_discarded_counts.items():
+            _ensure_source_diagnostics(paper_source_key)["dedup_discarded_docs"] += discarded_count
 
         if unique_papers:
-            inserted += await ingest_documents(unique_papers)
-            fulltext_enqueued += await _schedule_fulltext_enrichment(ctx, None, unique_papers)
+            inserted_chunk_count = await ingest_documents(unique_papers)
+            inserted += inserted_chunk_count
+            fulltext_job_count = await _schedule_fulltext_enrichment(ctx, None, unique_papers)
+            fulltext_enqueued += fulltext_job_count
+
+            for paper_source_key, accepted_count in accepted_paper_counts.items():
+                _ensure_source_diagnostics(paper_source_key)["inserted_docs"] += accepted_count
+
+            unique_paper_source_keys = {
+                source_key for source_key, count in accepted_paper_counts.items() if count > 0
+            }
+            if len(unique_paper_source_keys) == 1:
+                only_source_key = next(iter(unique_paper_source_keys))
+                source_diag = _ensure_source_diagnostics(only_source_key)
+                source_diag["inserted_chunks"] += int(inserted_chunk_count)
+                source_diag["fulltext_enqueued"] += int(fulltext_job_count)
+            else:
+                paper_total_diag = _ensure_source_diagnostics("paper_total")
+                paper_total_diag["inserted_docs"] += len(unique_papers)
+                paper_total_diag["inserted_chunks"] += int(inserted_chunk_count)
+                paper_total_diag["fulltext_enqueued"] += int(fulltext_job_count)
 
     # 2. Social Processing & seed extraction (only if expansion is enabled)
     # Since expansion is disabled, this loop is skipped for better performance
@@ -752,82 +814,82 @@ async def _run_ingestion(
 
     # 3. Social Expansion
     if settings.INGEST_SOCIAL_EXPANSION_ENABLED and any(expansion_seeds.values()):
-        expansion_coros = []
+        expansion_coros: list[Awaitable[list[RawDocument]]] = []
 
         if tiktok_enabled and expansion_seeds["social_tiktok"]:
-            for q in list(expansion_seeds["social_tiktok"])[:5]:
-                expansion_coros.append(
-                    _run_source_with_timeout(
-                        "social_tiktok_exp",
-                        _ingest_tiktok(
-                            project_id=project_id,
-                            user_id=user_id,
-                            intent=intent,
-                            social_filter=q,
-                            redis=redis,
-                        ),
-                    )
+            expansion_coros.extend(
+                _run_source_with_timeout(
+                    "social_tiktok_exp",
+                    _ingest_tiktok(
+                        project_id=project_id,
+                        user_id=user_id,
+                        intent=intent,
+                        social_filter=q,
+                        redis=redis,
+                    ),
                 )
+                for q in list(expansion_seeds["social_tiktok"])[:5]
+            )
         if instagram_enabled and expansion_seeds["social_instagram"]:
-            for q in list(expansion_seeds["social_instagram"])[:5]:
-                expansion_coros.append(
-                    _run_source_with_timeout(
-                        "social_instagram_exp",
-                        _ingest_instagram(
-                            project_id=project_id,
-                            user_id=user_id,
-                            intent=intent,
-                            social_filter=q,
-                            oldest_timestamp=oldest_timestamp,
-                            redis=redis,
-                        ),
-                    )
+            expansion_coros.extend(
+                _run_source_with_timeout(
+                    "social_instagram_exp",
+                    _ingest_instagram(
+                        project_id=project_id,
+                        user_id=user_id,
+                        intent=intent,
+                        social_filter=q,
+                        oldest_timestamp=oldest_timestamp,
+                        redis=redis,
+                    ),
                 )
+                for q in list(expansion_seeds["social_instagram"])[:5]
+            )
         if youtube_enabled and expansion_seeds["social_youtube"]:
-            for q in list(expansion_seeds["social_youtube"])[:5]:
-                expansion_coros.append(
-                    _run_source_with_timeout(
-                        "social_youtube_exp",
-                        _ingest_youtube(
-                            project_id=project_id,
-                            user_id=user_id,
-                            intent=intent,
-                            social_filter=q,
-                            expansion_mode=True,
-                            redis=redis,
-                        ),
-                    )
+            expansion_coros.extend(
+                _run_source_with_timeout(
+                    "social_youtube_exp",
+                    _ingest_youtube(
+                        project_id=project_id,
+                        user_id=user_id,
+                        intent=intent,
+                        social_filter=q,
+                        expansion_mode=True,
+                        redis=redis,
+                    ),
                 )
+                for q in list(expansion_seeds["social_youtube"])[:5]
+            )
         if reddit_enabled and expansion_seeds["social_reddit"]:
-            for q in list(expansion_seeds["social_reddit"])[:5]:
-                expansion_coros.append(
-                    _run_source_with_timeout(
-                        "social_reddit_exp",
-                        _ingest_reddit(
-                            project_id=project_id,
-                            user_id=user_id,
-                            intent=intent,
-                            social_filter=q,
-                            expansion_mode=True,
-                            redis=redis,
-                        ),
-                    )
+            expansion_coros.extend(
+                _run_source_with_timeout(
+                    "social_reddit_exp",
+                    _ingest_reddit(
+                        project_id=project_id,
+                        user_id=user_id,
+                        intent=intent,
+                        social_filter=q,
+                        expansion_mode=True,
+                        redis=redis,
+                    ),
                 )
+                for q in list(expansion_seeds["social_reddit"])[:5]
+            )
         if x_enabled and expansion_seeds["social_x"]:
-            for q in list(expansion_seeds["social_x"])[:5]:
-                expansion_coros.append(
-                    _run_source_with_timeout(
-                        "social_x_exp",
-                        _ingest_x(
-                            project_id=project_id,
-                            user_id=user_id,
-                            intent=intent,
-                            social_filter=q,
-                            expansion_mode=True,
-                            redis=redis,
-                        ),
-                    )
+            expansion_coros.extend(
+                _run_source_with_timeout(
+                    "social_x_exp",
+                    _ingest_x(
+                        project_id=project_id,
+                        user_id=user_id,
+                        intent=intent,
+                        social_filter=q,
+                        expansion_mode=True,
+                        redis=redis,
+                    ),
                 )
+                for q in list(expansion_seeds["social_x"])[:5]
+            )
 
         if expansion_coros:
             logger.info("ingestion.social_expansion.start", task_count=len(expansion_coros))
@@ -896,6 +958,49 @@ async def _run_ingestion(
         )
     except Exception:
         logger.warning("ingestion.db_stats_update_failed", project_id=project_id)
+
+    if settings.INSIGHTS_ENABLED:
+        try:
+            running_lock_key = RedisKeys.CLUSTER_LOCK.format(project_id=project_id)
+            enqueue_lock_key = RedisKeys.CLUSTER_ENQUEUE_LOCK.format(project_id=project_id)
+            dirty_key = RedisKeys.CLUSTER_DIRTY.format(project_id=project_id)
+            enqueue_ttl = max(int(settings.CLUSTER_LOCK_TTL), int(settings.ARQ_WORKER_JOB_TIMEOUT))
+            if await redis.exists(running_lock_key):
+                await redis.set(dirty_key, "1", ex=enqueue_ttl)
+                logger.info("ingestion.cluster_project_marked_dirty", project_id=project_id)
+            else:
+                enqueue_slot = await redis.set(
+                    enqueue_lock_key,
+                    "1",
+                    ex=enqueue_ttl,
+                    nx=True,
+                )
+                if not enqueue_slot:
+                    logger.debug(
+                        "ingestion.cluster_project_enqueue_skipped.lock_exists",
+                        project_id=project_id,
+                    )
+                else:
+                    arq_pool = ctx.get("redis")
+                    if arq_pool is not None:
+                        try:
+                            await arq_pool.enqueue_job("cluster_project_task", project_id)
+                            logger.info("ingestion.cluster_project_enqueued", project_id=project_id)
+                        except Exception:
+                            await redis.delete(enqueue_lock_key)
+                            raise
+                    else:
+                        await redis.delete(enqueue_lock_key)
+                        logger.warning(
+                            "ingestion.cluster_project_enqueue_skipped.no_arq_pool",
+                            project_id=project_id,
+                        )
+        except Exception as exc:
+            logger.warning(
+                "ingestion.cluster_project_enqueue_failed",
+                project_id=project_id,
+                error=str(exc),
+            )
 
     await _set_ingest_status(
         redis,

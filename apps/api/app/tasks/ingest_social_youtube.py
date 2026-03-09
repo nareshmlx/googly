@@ -223,6 +223,7 @@ async def _ingest_youtube(
                     "author": video.get("author") or "",
                     "thumbnail_url": video.get("thumbnail_url") or "",
                     "cover_url": video.get("thumbnail_url") or "",
+                    "video_url": video.get("url") or video.get("video_url") or "",
                     "likes": _as_int(video.get("likes")),
                     "views": _as_int(video.get("views")),
                     "comments": _as_int(video.get("comments")),

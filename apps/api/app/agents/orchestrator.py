@@ -17,13 +17,16 @@ Called from ChatService. Yields SSE-formatted strings.
 """
 
 import asyncio
-import json
 import math
 import re
 import time
+from collections import Counter
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
+from functools import cache
+from typing import Any
 
+import orjson
 import structlog
 from agno.run.agent import RunContentEvent
 
@@ -45,6 +48,7 @@ from app.core.normalize import coerce_int
 from app.core.paper_schema import normalize_paper_schema
 from app.core.query_policy import lexical_entity_coverage
 from app.core.redis import get_redis
+from app.core.utils import dedup_terms
 from app.kb.retriever import retrieve
 from app.tools.news_perigon import search_perigon
 from app.tools.papers_arxiv import search_arxiv
@@ -55,48 +59,34 @@ from app.tools.search_tavily import search_tavily
 
 logger = structlog.get_logger(__name__)
 
-# Module-level singletons — initialised once, reused across all requests
+
+# Module-level singletons — initialised once on first call, reused across all requests
 # (Agno agents are stateless per arun() call — safe to share across requests)
-_intent_agent = None
-_query_enhancer_agent = None
-_synthesis_agent = None
-_project_relevance_agent = None
-_patent_agent = None
 
 
+@cache
 def _get_intent_agent():
-    global _intent_agent
-    if _intent_agent is None:
-        _intent_agent = build_intent_agent()
-    return _intent_agent
+    return build_intent_agent()
 
 
+@cache
 def _get_query_enhancer_agent():
-    global _query_enhancer_agent
-    if _query_enhancer_agent is None:
-        _query_enhancer_agent = build_query_enhancer_agent()
-    return _query_enhancer_agent
+    return build_query_enhancer_agent()
 
 
+@cache
 def _get_synthesis_agent():
-    global _synthesis_agent
-    if _synthesis_agent is None:
-        _synthesis_agent = build_synthesis_agent()
-    return _synthesis_agent
+    return build_synthesis_agent()
 
 
+@cache
 def _get_project_relevance_agent():
-    global _project_relevance_agent
-    if _project_relevance_agent is None:
-        _project_relevance_agent = build_project_relevance_agent()
-    return _project_relevance_agent
+    return build_project_relevance_agent()
 
 
+@cache
 def _get_patent_agent():
-    global _patent_agent
-    if _patent_agent is None:
-        _patent_agent = build_patent_agent()
-    return _patent_agent
+    return build_patent_agent()
 
 
 def _safe_int(value: object) -> int:
@@ -119,14 +109,8 @@ def _extract_social_insights(kb_results: list[dict]) -> dict:
     if not social_chunks:
         return {}
 
-    platform_counts: dict[str, int] = {
-        "instagram": 0,
-        "tiktok": 0,
-        "youtube": 0,
-        "reddit": 0,
-        "x": 0,
-    }
-    creator_counts: dict[str, int] = {}
+    platform_counts: Counter[str] = Counter()
+    creator_counts: Counter[str] = Counter()
     top_posts: list[dict] = []
     newest_ts: int | None = None
     oldest_ts: int | None = None
@@ -154,7 +138,7 @@ def _extract_social_insights(kb_results: list[dict]) -> dict:
             or "unknown"
         )
         author = str(author)
-        creator_counts[author] = creator_counts.get(author, 0) + 1
+        creator_counts[author] += 1
 
         likes = _safe_int(metadata.get("like_count") or metadata.get("likes"))
         views = _safe_int(metadata.get("view_count") or metadata.get("views"))
@@ -177,8 +161,7 @@ def _extract_social_insights(kb_results: list[dict]) -> dict:
             newest_ts = ts_int if newest_ts is None else max(newest_ts, ts_int)
             oldest_ts = ts_int if oldest_ts is None else min(oldest_ts, ts_int)
 
-    top_creator_pairs = sorted(creator_counts.items(), key=lambda item: item[1], reverse=True)[:5]
-    top_creators = [{"author": author, "posts": posts} for author, posts in top_creator_pairs]
+    top_creators = [{"author": a, "posts": n} for a, n in creator_counts.most_common(5)]
 
     top_posts.sort(key=lambda x: x["engagement"], reverse=True)
     top_posts = top_posts[:5]
@@ -655,7 +638,7 @@ def _format_openalex_paper_list_answer(query: str, papers: list[dict]) -> str:
     return "\n".join(lines)
 
 
-async def _enhance_query_pre_intent(query: str) -> dict:
+async def _enhance_query_pre_intent(query: str) -> dict[str, Any]:
     """Normalize raw query before intent extraction while preserving specific terms."""
     default = {
         "rewritten_query": str(query or "").strip(),
@@ -663,28 +646,26 @@ async def _enhance_query_pre_intent(query: str) -> dict:
         "expanded_terms": [],
         "domain_terms": [],
         "query_specificity": "broad",
+        "target_domain": None,
     }
+    default_typed: dict[str, Any] = default
     if not settings.QUERY_ENABLE_PRE_INTENT_ENHANCER:
-        return default
+        return default_typed
     if not settings.OPENAI_API_KEY:
-        return default
+        return default_typed
 
     try:
         enhancer = _get_query_enhancer_agent()
         result = await enhancer.arun(query)
         text = result.content if result and result.content else ""
         if not isinstance(text, str) or not text.strip():
-            return default
-        parsed = json.loads(text.strip())
-        rewritten_query = str(parsed.get("rewritten_query") or default["rewritten_query"]).strip()
+            return default_typed
+        parsed = orjson.loads(text.strip())
+        rewritten_query = str(parsed.get("rewritten_query") or default_typed["rewritten_query"]).strip()
         must_terms = parsed.get("must_match_terms") or []
         if not isinstance(must_terms, list):
             must_terms = []
         must_terms = [str(term).strip() for term in must_terms if str(term).strip()][:5]
-        expanded_terms = parsed.get("expanded_terms") or []
-        if not isinstance(expanded_terms, list):
-            expanded_terms = []
-        expanded_terms = [str(term).strip() for term in expanded_terms if str(term).strip()][:8]
         domain_terms = parsed.get("domain_terms") or []
         if not isinstance(domain_terms, list):
             domain_terms = []
@@ -695,13 +676,15 @@ async def _enhance_query_pre_intent(query: str) -> dict:
         return {
             "rewritten_query": rewritten_query or default["rewritten_query"],
             "must_match_terms": must_terms,
-            "expanded_terms": expanded_terms,
-            "domain_terms": domain_terms,
-            "query_specificity": specificity,
+            "expanded_terms": parsed.get("expanded_terms") or [],
+            "domain_terms": parsed.get("domain_terms") or [],
+            "query_specificity": str(parsed.get("query_specificity") or "broad").lower(),
         }
+    except orjson.JSONDecodeError:
+        logger.warning("orchestrator.pre_intent_parse_error")
     except Exception:
-        logger.exception("orchestrator.query_enhancer_error")
-        return default
+        logger.exception("orchestrator.pre_intent_error")
+    return default_typed
 
 
 def _max_coverage_for_kb(kb_results: list[dict], must_match_terms: list[str]) -> float:
@@ -736,7 +719,7 @@ def _filter_papers_by_entity_coverage(
     return [paper for _, paper in scored[: max(1, min(5, len(scored)))]]
 
 
-async def _extract_intent(query: str) -> dict:
+async def _extract_intent(query: str) -> dict[str, Any]:
     """
     Run IntentAgent and parse the JSON response.
 
@@ -758,6 +741,7 @@ async def _extract_intent(query: str) -> dict:
         "confidence": 0.5,
         "is_research_query": False,
     }
+    default_typed: dict[str, Any] = default
 
     # Normalise query for cache key (lowercase + strip whitespace)
     query_normalised = query.lower().strip()
@@ -769,7 +753,7 @@ async def _extract_intent(query: str) -> dict:
         redis = await get_redis()
         cached_raw = await redis.get(cache_key)
         if cached_raw:
-            cached = json.loads(cached_raw)
+            cached = orjson.loads(cached_raw)
             logger.info("orchestrator.intent.cache_hit", cache_key=cache_key)
             return cached
     except Exception:
@@ -784,55 +768,25 @@ async def _extract_intent(query: str) -> dict:
         result = await agent.arun(intent_query)
         text = result.content if result and result.content else ""
         if isinstance(text, str) and text.strip():
-            parsed = json.loads(text.strip())
-            intent = {**default, **parsed}
+            parsed = orjson.loads(text.strip())
+            intent: dict[str, Any] = {**default_typed, **parsed}
             # Merge pre-intent enhancer constraints as a guardrail against
             # losing specific user entities during intent extraction.
             enhancer_terms = enhanced.get("must_match_terms") or []
             if enhancer_terms and isinstance(enhancer_terms, list):
-                merged = []
-                for term in enhancer_terms + (intent.get("must_match_terms") or []):
-                    value = str(term).strip()
-                    if value:
-                        merged.append(value)
-                seen: set[str] = set()
-                deduped: list[str] = []
-                for value in merged:
-                    key = value.lower()
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    deduped.append(value)
-                intent["must_match_terms"] = deduped[:5]
+                intent["must_match_terms"] = dedup_terms(
+                    enhancer_terms, intent.get("must_match_terms"), limit=5
+                )
             enhancer_expanded = enhanced.get("expanded_terms") or []
             if isinstance(enhancer_expanded, list):
-                merged_expanded = []
-                for term in enhancer_expanded + (intent.get("expanded_terms") or []):
-                    value = str(term).strip()
-                    if value:
-                        merged_expanded.append(value)
-                seen_expanded: set[str] = set()
-                deduped_expanded: list[str] = []
-                for value in merged_expanded:
-                    key = value.lower()
-                    if key in seen_expanded:
-                        continue
-                    seen_expanded.add(key)
-                    deduped_expanded.append(value)
-                intent["expanded_terms"] = deduped_expanded[:8]
+                intent["expanded_terms"] = dedup_terms(
+                    enhancer_expanded, intent.get("expanded_terms"), limit=8
+                )
             enhancer_domain_terms = enhanced.get("domain_terms") or []
             if isinstance(enhancer_domain_terms, list):
-                deduped_domain_terms = []
-                seen_domain: set[str] = set()
-                for term in enhancer_domain_terms:
-                    value = str(term).strip()
-                    key = value.lower()
-                    if not value or key in seen_domain:
-                        continue
-                    seen_domain.add(key)
-                    deduped_domain_terms.append(value)
-                if deduped_domain_terms:
-                    intent["domain_terms"] = deduped_domain_terms[:4]
+                merged_domain = dedup_terms(enhancer_domain_terms, limit=4)
+                if merged_domain:
+                    intent["domain_terms"] = merged_domain
             if str(intent.get("query_specificity") or "").lower() not in {"specific", "broad"}:
                 intent["query_specificity"] = str(
                     enhanced.get("query_specificity") or "broad"
@@ -841,7 +795,7 @@ async def _extract_intent(query: str) -> dict:
             # --- Cache write (only if Redis is available) ---
             if redis is not None:
                 try:
-                    await redis.setex(cache_key, settings.INTENT_CACHE_TTL, json.dumps(intent))
+                    await redis.setex(cache_key, settings.INTENT_CACHE_TTL, orjson.dumps(intent))
                     logger.info("orchestrator.intent.cache_write", cache_key=cache_key)
                 except Exception:
                     # Cache write failure is non-fatal — result still returned to caller
@@ -850,7 +804,7 @@ async def _extract_intent(query: str) -> dict:
                     )
 
             return intent
-    except json.JSONDecodeError:
+    except orjson.JSONDecodeError:
         logger.warning("orchestrator.intent_parse_error", query_preview=query[:60])
     except Exception:
         logger.exception("orchestrator.intent_error")
@@ -872,13 +826,12 @@ async def _get_relevant_project_ids(
     if len(all_projects) <= 1:
         return [primary_project_id]
 
-    projects_json = json.dumps(
+    projects_json = orjson.dumps(
         [
             {"id": p["id"], "title": p.get("title", ""), "description": p.get("description", "")}
             for p in all_projects
         ],
-        indent=2,
-    )
+    ).decode("utf-8")
     prompt = f"query: {query}\n\nprojects:\n{projects_json}"
 
     try:
@@ -886,7 +839,7 @@ async def _get_relevant_project_ids(
         result = await agent.arun(prompt)
         text = result.content if result and result.content else ""
         if isinstance(text, str) and text.strip():
-            parsed = json.loads(text.strip())
+            parsed = orjson.loads(text.strip())
             relevant_ids = parsed.get("relevant_project_ids") or []
             if isinstance(relevant_ids, list) and relevant_ids:
                 # Validate returned IDs exist in all_projects
@@ -899,7 +852,7 @@ async def _get_relevant_project_ids(
                         query_preview=query[:60],
                     )
                     return filtered
-    except json.JSONDecodeError:
+    except orjson.JSONDecodeError:
         logger.warning("orchestrator.relevance_parse_error", query_preview=query[:60])
     except Exception:
         logger.exception("orchestrator.relevance_error")
@@ -939,11 +892,23 @@ async def run_query(
 
     # Step 1 & 2: Intent extraction + Project relevance in PARALLEL
     # Task 2.1 improvement: 12.2s → 7.7s (4.5s savings)
-    intent, relevant_project_ids = await asyncio.gather(
+    intent_result, relevance_result = await asyncio.gather(
         _extract_intent(cleaned_query),
         _get_relevant_project_ids(cleaned_query, primary_project_id, all_projects),
-        return_exceptions=False,
+        return_exceptions=True,
     )
+
+    # Graceful degradation: if one sub-task fails, use defaults for it
+    if isinstance(intent_result, BaseException):
+        logger.warning("orchestrator.intent_extraction_failed", error=str(intent_result))
+        intent: dict[str, Any] = {"query_type": "general", "is_research_query": False}
+    else:
+        intent = {**intent_result}
+    if isinstance(relevance_result, BaseException):
+        logger.warning("orchestrator.relevance_extraction_failed", error=str(relevance_result))
+        relevant_project_ids = [primary_project_id]
+    else:
+        relevant_project_ids = relevance_result
 
     query_type = intent.get("query_type", "general")
     is_research_query = bool(intent.get("is_research_query", False)) or _looks_like_research_query(
@@ -1317,7 +1282,7 @@ async def run_query(
     # users consistently get multiple papers instead of sparse summarisation.
     if openalex_papers and _asks_for_paper_list(cleaned_query) and not kb_has_paper:
         direct_answer = _format_openalex_paper_list_answer(cleaned_query, openalex_papers)
-        yield f"data: {json.dumps({'token': direct_answer})}\n\n"
+        yield f"data: {orjson.dumps({'token': direct_answer}).decode('utf-8')}\n\n"
         yield "data: [DONE]\n\n"
         logger.info(
             "orchestrator.openalex_direct_answer",
@@ -1340,7 +1305,8 @@ async def run_query(
         max_score = max(scores) if scores else 0.0
 
         # Count source types for logging
-        source_counts: dict[str, int] = {}
+        from collections import Counter
+        source_counts: Counter = Counter()
         # Check for URL availability in paper metadata
         papers_with_doi = 0
         papers_with_url = 0
@@ -1348,7 +1314,7 @@ async def run_query(
 
         for chunk in kb_results:
             source = chunk.get("source", "unknown")
-            source_counts[source] = source_counts.get(source, 0) + 1
+            source_counts[source] += 1
 
             # Track URL availability for papers
             if source == "paper":
@@ -1432,7 +1398,7 @@ async def run_query(
         if is_social_like_query or social_insights:
             social_block = (
                 "Structured Social Insights (precomputed from retrieved social evidence):\n"
-                f"{json.dumps(social_insights, ensure_ascii=True)}\n\n"
+                f"{orjson.dumps(social_insights).decode('utf-8')}\n\n"
             )
 
         # Build requirements dynamically — only instruct the LLM to include a section
@@ -1452,9 +1418,9 @@ async def run_query(
         req_num += 1
         if openalex_papers:
             req_parts.append(
-                f"{req_num}) Include a '## Latest Papers' section with 6–8 distinct papers. "
+                f"{req_num}) Include a '## Latest Papers' section with 6-8 distinct papers. "
                 "For each paper include: title as a markdown link using its DOI or OpenAlex URL, "
-                "publication year, and a 1–2 sentence summary of its key finding."
+                "publication year, and a 1-2 sentence summary of its key finding."
             )
             req_num += 1
         if is_social_like_query or social_insights:
@@ -1464,7 +1430,7 @@ async def run_query(
             )
             req_num += 1
         req_parts.append(
-            f"{req_num}) Cite at least 3–4 distinct sources spread throughout the response, not "
+            f"{req_num}) Cite at least 3-4 distinct sources spread throughout the response, not "
             "clustered only at the end."
         )
         req_num += 1
@@ -1514,11 +1480,11 @@ async def run_query(
                 delta = event.content
                 if delta and isinstance(delta, str):
                     full_response_parts.append(delta)
-                    yield f"data: {json.dumps({'token': delta})}\n\n"
+                    yield f"data: {orjson.dumps({'token': delta}).decode('utf-8')}\n\n"
     except Exception:
         logger.exception("orchestrator.synthesis_error")
         error_msg = "I encountered an error generating the response. Please try again."
-        yield f"data: {json.dumps({'token': error_msg})}\n\n"
+        yield f"data: {orjson.dumps({'token': error_msg}).decode('utf-8')}\n\n"
 
     yield "data: [DONE]\n\n"
 

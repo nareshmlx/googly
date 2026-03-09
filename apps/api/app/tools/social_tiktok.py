@@ -8,7 +8,7 @@ The EnsembleData SDK is synchronous; all calls are wrapped in asyncio.to_thread
 so they do not block the event loop.
 
 EnsembleData observed response times:
-  /tiktok/hashtag/search   ~2–5s depending on hashtag volume
+  /tiktok/hashtag/search   ~2-5s depending on hashtag volume
 Timeout is handled by the underlying SDK; the to_thread call is wrapped in a
 try/except so any SDK-level exception is caught and logged gracefully.
 """
@@ -16,41 +16,24 @@ try/except so any SDK-level exception is caught and logged gracefully.
 import asyncio
 import json
 import os
+from contextlib import suppress
 from typing import Literal
 
 import certifi
 import httpx
 import structlog
 
-try:
-    from ensembledata.api import EDClient
-except ImportError:  # pragma: no cover - environment-dependent optional dependency
-    EDClient = None  # type: ignore[assignment]
-
 from app.core.cache_keys import build_search_cache_key, build_stale_cache_key
 from app.core.config import settings
+from app.tools.social_common import (
+    ensemble_sdk_call,
+    ensure_ssl_ca_bundle,
+    extract_items_from_payload,
+    extract_items_from_sdk_result,
+)
 
 logger = structlog.get_logger(__name__)
-_SDK_WARNED = False
 
-
-def _ensure_ssl_ca_bundle() -> None:
-    """Ensure a valid CA bundle path exists for SDK/httpx TLS verification."""
-    certifi_path = certifi.where()
-    if certifi_path and os.path.exists(certifi_path):
-        os.environ.setdefault("SSL_CERT_FILE", certifi_path)
-        os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi_path)
-
-
-def _sdk_available() -> bool:
-    """Return whether EnsembleData SDK is importable in this runtime."""
-    global _SDK_WARNED
-    if EDClient is None:
-        if not _SDK_WARNED:
-            logger.warning("social_tiktok.sdk_missing")
-            _SDK_WARNED = True
-        return False
-    return True
 
 
 def _safe_url(url_list: object) -> str:
@@ -86,104 +69,10 @@ def _map_video(video: dict) -> dict:
     }
 
 
-def _extract_items(result) -> list[dict]:
-    """Extract list payloads from common EnsembleData response variants."""
-    raw_items: list = []
-    if result and result.data:
-        data = result.data
-        if isinstance(data, dict):
-            raw_items = data.get("data") or data.get("items") or []
-        elif isinstance(data, list):
-            raw_items = data
-    if not isinstance(raw_items, list):
-        return []
-    return [item for item in raw_items if isinstance(item, dict)]
 
 
-def _extract_items_from_payload(payload: object) -> list[dict]:
-    """Extract list payloads from common HTTP JSON response variants."""
-    if not isinstance(payload, dict):
-        return []
-    data = payload.get("data")
-    if isinstance(data, dict):
-        raw_items = data.get("data") or data.get("items") or []
-    elif isinstance(data, list):
-        raw_items = data
-    else:
-        raw_items = payload.get("items") or payload.get("results") or []
-    if not isinstance(raw_items, list):
-        return []
-    return [item for item in raw_items if isinstance(item, dict)]
 
 
-def _fetch_hashtag_sync(tag: str) -> list[dict]:
-    """
-    Call the EnsembleData hashtag_search endpoint synchronously.
-
-    Isolated into its own function so asyncio.to_thread has a clean, picklable
-    callable with no closure over async state.
-
-    Args:
-        tag: A single hashtag string without the leading ``#``, e.g. ``"beautytrends"``.
-
-    Returns:
-        List of mapped video dicts, or ``[]`` on any exception.
-    """
-    try:
-        if not _sdk_available():
-            return []
-        _ensure_ssl_ca_bundle()
-        client = EDClient(token=settings.ENSEMBLE_API_TOKEN or "")
-        result = client.tiktok.hashtag_search(hashtag=tag)
-
-        return [_map_video(v) for v in _extract_items(result)]
-    except Exception as exc:
-        try:
-            logger.exception("social_tiktok.hashtag_fetch.failed", tag=tag)
-        except Exception:
-            logger.error(
-                "social_tiktok.hashtag_fetch.failed_fallback",
-                tag=str(tag).encode("ascii", "ignore").decode("ascii"),
-                error_type=type(exc).__name__,
-                error=str(exc),
-            )
-        return []
-
-
-def _fetch_keyword_sync(
-    query: str,
-    *,
-    exact_match: bool,
-    period: Literal["0", "1", "7", "30", "90", "180"],
-) -> list[dict]:
-    """Call the EnsembleData keyword_search endpoint synchronously."""
-    try:
-        if not _sdk_available():
-            return []
-        _ensure_ssl_ca_bundle()
-        client = EDClient(token=settings.ENSEMBLE_API_TOKEN or "")
-        result = client.tiktok.keyword_search(
-            keyword=query,
-            period=period,
-            sorting="0",
-            match_exactly=exact_match,
-            get_author_stats=True,
-        )
-        return [_map_video(v) for v in _extract_items(result)]
-    except Exception as exc:
-        try:
-            logger.exception(
-                "social_tiktok.keyword_fetch.failed", query=query, exact_match=exact_match
-            )
-        except Exception:
-            logger.error(
-                "social_tiktok.keyword_fetch.failed_fallback",
-                query=str(query).encode("ascii", "ignore").decode("ascii"),
-                exact_match=exact_match,
-                error_type=type(exc).__name__,
-                error=str(exc),
-            )
-        return []
 
 
 def _dedupe_videos(batches: list[list[dict]], *, max_results: int) -> list[dict]:
@@ -252,15 +141,13 @@ async def fetch_tiktok_posts(
         return results
     except Exception as exc:
         if redis:
-            try:
+            with suppress(Exception):
                 stale = await redis.get(stale_key)
                 if stale:
                     logger.info(
                         "social_tiktok.serving_stale", project_id=project_id, error=str(exc)
                     )
                     return json.loads(stale)
-            except Exception:
-                pass
         raise
 
 
@@ -299,7 +186,7 @@ async def _fetch_tiktok_posts_impl(
     if not settings.ENSEMBLE_API_TOKEN:
         logger.warning("social_tiktok.no_api_key")
         return []
-    sdk_available = _sdk_available()
+    is_sdk_available = sdk_available("tiktok")
 
     deduped_queries: list[str] = []
     seen_query: set[str] = set()
@@ -323,19 +210,24 @@ async def _fetch_tiktok_posts_impl(
     )
 
     batches: list[list[dict]] = []
-    if deduped_queries and sdk_available:
-        keyword_batches = await asyncio.gather(
+    if deduped_queries:
+        keyword_results = await asyncio.gather(
             *[
-                asyncio.to_thread(
-                    _fetch_keyword_sync,
-                    query,
-                    exact_match=exact_match,
+                ensemble_sdk_call(
+                    "tiktok",
+                    "tiktok.keyword_search",
+                    keyword=query,
                     period=period,
+                    sorting="0",
+                    match_exactly=exact_match,
+                    get_author_stats=True,
                 )
                 for query in deduped_queries
             ]
         )
-        batches.extend(keyword_batches)
+        batches.extend(
+            [[_map_video(v) for v in extract_items_from_sdk_result(r)] for r in keyword_results if r]
+        )
 
     deduped = _dedupe_videos(batches, max_results=max_results)
     if deduped_queries and len(deduped) < max_results:
@@ -351,11 +243,14 @@ async def _fetch_tiktok_posts_impl(
         )
         deduped = _dedupe_videos([deduped, *full_batches], max_results=max_results)
 
-    if len(deduped) < max_results and tags and sdk_available:
-        hashtag_batches = await asyncio.gather(
-            *[asyncio.to_thread(_fetch_hashtag_sync, tag) for tag in tags]
+    if len(deduped) < max_results and tags:
+        hashtag_results = await asyncio.gather(
+            *[ensemble_sdk_call("tiktok", "tiktok.hashtag_search", hashtag=tag) for tag in tags]
         )
-        deduped = _dedupe_videos([deduped, *hashtag_batches], max_results=max_results)
+        batches_tags = [
+            [_map_video(v) for v in extract_items_from_sdk_result(r)] for r in hashtag_results if r
+        ]
+        deduped = _dedupe_videos([deduped, *batches_tags], max_results=max_results)
 
     if not deduped and not deduped_queries and not tags:
         logger.warning("social_tiktok.no_queries_parsed", hashtags=hashtags)
@@ -433,7 +328,7 @@ async def _fetch_keyword_full_http(
                 response = await client.get(endpoint, params=params)
                 response.raise_for_status()
                 payload = response.json()
-            items = _extract_items_from_payload(payload)
+            items = extract_items_from_payload(payload)
             if not items:
                 continue
             return [_map_video(v) for v in items]

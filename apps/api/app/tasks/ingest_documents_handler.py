@@ -90,13 +90,13 @@ async def _prepare_kept_documents_for_source(
         )
 
     fetched_count = len(filtered_result)
-    social_terms_for_source = strict_social_terms if source in SOCIAL_SOURCES else []
+    social_terms_for_source: list[str] = []
     filtered_items = await _filter_relevance(
         filter_items,
         intent_text,
         source,
         redis,
-        must_match_terms=social_terms_for_source if source in SOCIAL_SOURCES else [],
+        must_match_terms=social_terms_for_source,
         social_match_terms=social_terms_for_source,
         intent_embedding=intent_embedding,
     )
@@ -133,6 +133,7 @@ async def _set_ingest_status(
     finished_at: str | None = None,
     source_counts: dict | None = None,
     source_diagnostics: dict | None = None,
+    cluster_diagnostics: dict | None = None,
     fulltext_enqueued: int = 0,
     total_chunks: int | None = None,
     job_id: str | None = None,
@@ -153,6 +154,7 @@ async def _set_ingest_status(
         "updated_at": updated_at or datetime.now(UTC).isoformat(),
         "source_counts": source_counts or {},
         "source_diagnostics": source_diagnostics or {},
+        "cluster_diagnostics": cluster_diagnostics or {},
         "fulltext_enqueued": int(fulltext_enqueued),
     }
 
@@ -175,6 +177,52 @@ async def _set_ingest_status(
         await redis.setex(key, RedisTTL.PROJECT_INGEST_STATUS, json.dumps(data))
     except Exception:
         logger.exception("set_ingest_status.failed", project_id=project_id)
+
+
+async def _merge_ingest_status(
+    redis,
+    project_id: str,
+    *,
+    source_diagnostics: dict | None = None,
+    cluster_diagnostics: dict | None = None,
+    updated_at: str | None = None,
+) -> None:
+    """Merge additional diagnostics into the existing ingest-status payload."""
+    if redis is None:
+        return
+
+    key = RedisKeys.PROJECT_INGEST_STATUS.format(project_id=project_id)
+    payload: dict = {"project_id": project_id}
+    try:
+        raw = await redis.get(key)
+        if raw:
+            parsed = parse_metadata(raw)
+            if isinstance(parsed, dict):
+                payload.update(parsed)
+    except Exception:
+        logger.warning("merge_ingest_status.read_failed", project_id=project_id)
+
+    payload.setdefault("source_counts", {})
+    payload.setdefault("source_diagnostics", {})
+    payload.setdefault("cluster_diagnostics", {})
+    payload["updated_at"] = updated_at or datetime.now(UTC).isoformat()
+
+    if source_diagnostics:
+        merged_source_diagnostics = dict(payload.get("source_diagnostics") or {})
+        for source_key, diagnostics in source_diagnostics.items():
+            current = dict(merged_source_diagnostics.get(source_key) or {})
+            if isinstance(diagnostics, dict):
+                current.update(diagnostics)
+            merged_source_diagnostics[source_key] = current
+        payload["source_diagnostics"] = merged_source_diagnostics
+
+    if cluster_diagnostics is not None:
+        payload["cluster_diagnostics"] = cluster_diagnostics
+
+    try:
+        await redis.setex(key, RedisTTL.PROJECT_INGEST_STATUS, json.dumps(payload))
+    except Exception:
+        logger.exception("merge_ingest_status.write_failed", project_id=project_id)
 
 
 async def _schedule_fulltext_enrichment(

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import TypeVar
+from typing import Any, TypeVar, cast
 
 import asyncpg
 
@@ -13,10 +14,10 @@ from app.core.db import get_db_pool
 T = TypeVar("T")
 
 
-async def _with_service_pool(fn, *args, **kwargs) -> T:
+async def _with_service_pool(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> T:
     """Execute a pool-injected repository function using the shared DB pool."""
     pool = await get_db_pool()
-    return await fn(pool, *args, **kwargs)
+    return cast(T, await fn(pool, *args, **kwargs))
 
 
 async def upsert_source_asset(
@@ -53,15 +54,6 @@ async def upsert_source_asset(
                 resolved_url = EXCLUDED.resolved_url,
                 source_url   = EXCLUDED.source_url,
                 title        = EXCLUDED.title,
-                -- Reset fetch lifecycle so re-ingested assets get a fresh attempt.
-                -- Without this, an exhausted row (attempt_count >= max) would be
-                -- immediately marked attempts_exhausted again on the next ingest run.
-                fetch_status    = 'pending',
-                extract_status  = 'pending',
-                attempt_count   = 0,
-                error_code      = NULL,
-                error_message   = NULL,
-                next_attempt_at = NULL,
                 updated_at      = EXCLUDED.updated_at
             RETURNING id::text
             """,

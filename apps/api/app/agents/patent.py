@@ -37,7 +37,7 @@ separate lines so the downstream synthesis layer can build proper citations:
   - Google Patents URL: https://patents.google.com/patent/US{patent_number}
   - Grant date
   - Inventors (full names)
-  - Key technical details from the abstract (2–3 sentences)
+  - Key technical details from the abstract (2-3 sentences)
 
 Return patents sorted by relevance and date (most recent first).
 CRITICAL: Always include the full Google Patents URL for every patent. This is required for citations.

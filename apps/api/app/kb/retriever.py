@@ -21,8 +21,8 @@ Design decisions:
 """
 
 import asyncio
-import json
 
+import orjson
 import structlog
 
 from app.core.cache_keys import stable_hash
@@ -205,9 +205,10 @@ async def retrieve(
         redis = await get_redis()
         sorted_project_ids = sorted(project_ids)
         project_key_part = stable_hash(sorted_project_ids)
-        versions = []
-        for pid in sorted_project_ids:
-            versions.append(await get_project_cache_version(redis, pid))
+        versions = [
+            await get_project_cache_version(redis, pid)
+            for pid in sorted_project_ids
+        ]
         version_part = stable_hash(versions)[:8]
         # Cache variant encodes both the exclude_papers flag and the retrieval mode so
         # per-source and legacy results are never served interchangeably.
@@ -219,7 +220,7 @@ async def retrieve(
         cached = await redis.get(hot_cache_key)
         if cached:
             logger.info("retriever.hot_cache_hit", query_hash=query_hash)
-            return json.loads(cached)
+            return orjson.loads(cached)
     except Exception:
         logger.warning("retriever.hot_cache_read_error", query_preview=query[:60])
         hot_cache_key = None  # skip cache write too
@@ -243,7 +244,7 @@ async def retrieve(
         if hot_cache_key:
             try:
                 redis = await get_redis()
-                await redis.setex(hot_cache_key, RedisTTL.KB_HOT, json.dumps(results))
+                await redis.setex(hot_cache_key, RedisTTL.KB_HOT, orjson.dumps(results))
             except Exception:
                 logger.warning("retriever.hot_cache_write_error", query_hash=query_hash)
 
@@ -298,7 +299,7 @@ async def retrieve(
     if hot_cache_key:
         try:
             redis = await get_redis()
-            await redis.setex(hot_cache_key, RedisTTL.KB_HOT, json.dumps(results))
+            await redis.setex(hot_cache_key, RedisTTL.KB_HOT, orjson.dumps(results))
         except Exception:
             logger.warning("retriever.hot_cache_write_error", query_hash=query_hash)
 

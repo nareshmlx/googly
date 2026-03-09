@@ -42,7 +42,7 @@ async def verify_session_ownership(
         return True
 
     # Session exists — check if it belongs to current user
-    return row["user_id"] == user_id
+    return row["user_id"] == user_id  # type: ignore[no-any-return]
 
 
 async def insert_chat_turn(

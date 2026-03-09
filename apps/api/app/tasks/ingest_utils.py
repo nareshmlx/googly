@@ -13,6 +13,7 @@ import structlog
 from app.core.config import settings
 from app.core.constants import SourceType
 from app.core.normalize import coerce_int
+from app.core.query_sanitize import sanitize_search_seed
 from app.core.utils import metadata_pick
 from app.kb.ingester import RawDocument
 from app.tools.search_exa import search_exa
@@ -134,6 +135,27 @@ _PROJECT_TEXT_STOPWORDS: set[str] = {
     "instagram",
     "platform",
     "platforms",
+    "goal",
+    "goals",
+    "conduct",
+    "conducting",
+    "focus",
+    "focusing",
+    "short",
+    "term",
+    "stakeholder",
+    "stakeholders",
+    "decision",
+    "decisions",
+    "output",
+    "format",
+    "scope",
+    "constraints",
+    "assumptions",
+    "success",
+    "signals",
+    "next",
+    "steps",
 }
 
 
@@ -285,6 +307,23 @@ def _build_brand_terms(intent: dict) -> set[str]:
 
 def _project_context_query(project_title: str, project_description: str) -> str:
     """Create a short fallback query from project title/description."""
+    title_seed = sanitize_search_seed(project_title, max_terms=3)
+    description_seed = sanitize_search_seed(project_description, max_terms=6)
+    if title_seed or description_seed:
+        merged_terms: list[str] = []
+        seen: set[str] = set()
+        for seed in (title_seed, description_seed):
+            for token in str(seed or "").split():
+                normalized = token.strip().lower()
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                merged_terms.append(token.strip())
+                if len(merged_terms) >= 8:
+                    return " ".join(merged_terms)
+        if merged_terms:
+            return " ".join(merged_terms)
+
     combined = f"{project_title} {project_description}".strip()
     tokens = re.findall(r"[a-zA-Z0-9]{3,}", combined.lower())
     seen = set()
@@ -332,17 +371,13 @@ def _prioritize_social_terms(intent: dict, terms: list[str], *, budget: int) -> 
 
     out = []
     # Pass 1: Must match
-    for t in terms:
-        if t in must:
-            out.append(t)
+    out.extend(t for t in terms if t in must)
+
     # Pass 2: Entities
-    for t in terms:
-        if t in entities and t not in must:
-            out.append(t)
+    out.extend(t for t in terms if t in entities and t not in must)
+
     # Pass 3: Fillers
-    for t in terms:
-        if t not in must and t not in entities:
-            out.append(t)
+    out.extend(t for t in terms if t not in must and t not in entities)
 
     return out[:budget]
 
@@ -406,7 +441,7 @@ def _query_for_social(
 
         merged = _prioritize_social_terms(intent, merged, budget=query_budget)
         if merged:
-            return " ".join(explicit_handles + merged).strip()
+            return " ".join([*explicit_handles, *merged]).strip()
 
     terms = _social_query_terms(
         intent,
@@ -416,10 +451,10 @@ def _query_for_social(
     )
     terms = _prioritize_social_terms(intent, terms, budget=query_budget)
     if terms:
-        return " ".join(explicit_handles + terms).strip()
+        return " ".join([*explicit_handles, *terms]).strip()
 
     return " ".join(
-        explicit_handles + [_project_context_query(project_title, project_description)]
+        [*explicit_handles, _project_context_query(project_title, project_description)]
     ).strip()
 
 
@@ -437,7 +472,9 @@ def _query_for_patents(
 
     direct = str(search_filters.get("patents") or search_filters.get("papers") or "").strip()
     if direct:
-        return direct
+        cleaned_direct = sanitize_search_seed(direct, max_terms=10)
+        if cleaned_direct:
+            return cleaned_direct
 
     terms: list[str] = []
     if entities:
@@ -487,11 +524,15 @@ def _query_for_papers(
 
     direct = str(search_filters.get("papers") or "").strip()
     if direct:
-        return direct
+        cleaned_direct = sanitize_search_seed(direct, max_terms=10)
+        if cleaned_direct:
+            return cleaned_direct
 
     news_fallback = str(search_filters.get("news") or "").strip()
     if news_fallback:
-        return news_fallback
+        cleaned_news = sanitize_search_seed(news_fallback, max_terms=10)
+        if cleaned_news:
+            return cleaned_news
 
     terms = [str(value).strip() for value in entities[:2] if str(value).strip()]
     terms.extend(str(value).strip() for value in keywords[:6] if str(value).strip())
@@ -530,7 +571,9 @@ def _query_for_news_or_web(intent: dict, *, source: str = "perigon") -> str:
     )
     normalized = str(seed_query or "").strip()
     if normalized:
-        return normalized
+        cleaned = sanitize_search_seed(normalized, max_terms=10)
+        if cleaned:
+            return cleaned
 
     project_title = str(intent.get("project_title") or "").strip()
     project_description = str(intent.get("project_description") or "").strip()
@@ -892,34 +935,6 @@ async def _social_web_fallback_docs(
 async def _noop() -> list[RawDocument]:
     """Return an empty source result for disabled gather slots."""
     return []
-
-
-def _build_source_counts(documents: list[RawDocument]) -> dict[str, int]:
-    """Build per-source counters from kept documents (single pass)."""
-    from collections import Counter
-
-    return dict(Counter(doc.source for doc in documents))
-
-
-def _build_expanded_social_filter(
-    intent: dict,
-    *,
-    social_filter: str = "",
-    project_title: str = "",
-    project_description: str = "",
-) -> str:
-    """Build a broader social search query for expansion when initial results are sparse."""
-    terms = _social_query_terms(
-        intent,
-        social_filter=social_filter,
-        project_title=project_title,
-        project_description=project_description,
-    )
-    # Filter out very common/stop words and keep high-signal ones
-    signal_terms = [t for t in terms if len(t) > 3]
-    if not signal_terms:
-        return social_filter or project_title
-    return " ".join(signal_terms[: settings.INGEST_SOCIAL_EXPANDED_QUERY_MAX_TERMS])
 
 
 def _extract_expansion_links(docs: list[RawDocument]) -> dict[str, set[str]]:

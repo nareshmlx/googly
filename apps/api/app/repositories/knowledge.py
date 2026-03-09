@@ -150,6 +150,7 @@ async def retrieve_relevant_chunks(
             SELECT
                 id::text,
                 project_id::text,
+                document_id::text,
                 source,
                 title,
                 content,
@@ -205,6 +206,7 @@ async def retrieve_relevant_chunks_for_sources(
             SELECT
                 id::text,
                 project_id::text,
+                document_id::text,
                 source,
                 title,
                 content,
@@ -247,7 +249,6 @@ async def upsert_documents(records: list[dict]) -> dict[tuple[str, str, str | No
                 NOW()
             ON CONFLICT (project_id, source, source_id) DO UPDATE SET
                 title = CASE WHEN EXCLUDED.title = '' THEN knowledge_documents.title ELSE EXCLUDED.title END,
-                summary = EXCLUDED.summary,
                 metadata = knowledge_documents.metadata || EXCLUDED.metadata,
                 updated_at = NOW()
             RETURNING project_id::text, source, source_id, id::text
@@ -264,6 +265,94 @@ async def upsert_documents(records: list[dict]) -> dict[tuple[str, str, str | No
         (row["project_id"], row["source"], row["source_id"]): row["id"]
         for row in [dict(r) for r in rows]
     }
+
+
+async def update_document_summary(
+    conn: asyncpg.Connection,
+    *,
+    doc_id: str,
+    summary: str,
+) -> None:
+    """Set AI-generated document summary once; never overwrite an existing summary.
+
+    Summary ownership belongs to the LLM summarization path in ingest. Re-ingest runs
+    may upsert metadata/chunks repeatedly, but should not replace an already generated
+    summary with raw source content or another fallback value.
+    """
+    await conn.execute(
+        """
+        UPDATE knowledge_documents
+        SET summary = $1,
+            updated_at = NOW()
+        WHERE id = $2::uuid
+          AND summary IS NULL
+        """,
+        summary,
+        doc_id,
+    )
+
+
+async def list_documents_without_summary(
+    conn: asyncpg.Connection,
+    *,
+    doc_ids: list[str],
+) -> set[str]:
+    """Return document IDs that still have no summary."""
+    ids = [str(doc_id).strip() for doc_id in doc_ids if str(doc_id).strip()]
+    if not ids:
+        return set()
+    rows = await conn.fetch(
+        """
+        SELECT id::text
+        FROM knowledge_documents
+        WHERE id = ANY($1::uuid[])
+          AND summary IS NULL
+        """,
+        ids,
+    )
+    return {str(row["id"]) for row in rows}
+
+
+async def list_documents_without_summary_for_service(*, doc_ids: list[str]) -> set[str]:
+    """Return unsummarized document IDs using an internally managed pool."""
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        return await list_documents_without_summary(conn, doc_ids=doc_ids)
+
+
+async def update_document_summaries_for_service(*, summaries: dict[str, str]) -> int:
+    """Apply document summaries in a single batch UPDATE and return updated count."""
+    if not summaries:
+        return 0
+    ids: list[str] = []
+    texts: list[str] = []
+    for doc_id, summary in summaries.items():
+        text = str(summary or "").strip()
+        if not text:
+            continue
+        ids.append(str(doc_id).strip())
+        texts.append(text)
+    if not ids:
+        return 0
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        result = await conn.fetchval(
+            """
+            WITH updated AS (
+                UPDATE knowledge_documents
+                SET summary = batch.summary,
+                    updated_at = NOW()
+                FROM unnest($1::uuid[], $2::text[]) AS batch(id, summary)
+                WHERE knowledge_documents.id = batch.id
+                  AND knowledge_documents.summary IS NULL
+                RETURNING 1
+            )
+            SELECT COUNT(*)::int FROM updated
+            """,
+            ids,
+            texts,
+        )
+    return int(result or 0)
 
 
 async def set_document_enrichment_status(

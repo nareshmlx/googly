@@ -30,6 +30,17 @@ logger = structlog.get_logger(__name__)
 _PERIGON_BASE_URL = "https://api.goperigon.com/v1/all"
 _CATEGORIES = "Business,Tech,Lifestyle"
 
+# Module-level HTTP client pool (reused across requests to prevent TLS overhead)
+_http_client: httpx.AsyncClient | None = None
+
+
+async def _get_http_client() -> httpx.AsyncClient:
+    """Get or create shared HTTP client pool for module."""
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(timeout=settings.PERIGON_TIMEOUT_SECONDS)
+    return _http_client
+
 
 def _build_perigon_query(
     query: str,
@@ -75,21 +86,21 @@ async def _search_with_retry(query: str, category: str) -> dict | None:
     from_date = (datetime.now(UTC) - timedelta(days=settings.PERIGON_DAYS_LOOKBACK)).isoformat()
 
     async def _fetch() -> dict:
-        async with httpx.AsyncClient(timeout=settings.PERIGON_TIMEOUT_SECONDS) as client:
-            response = await client.get(
-                _PERIGON_BASE_URL,
-                params={
-                    "apiKey": settings.PERIGON_API_KEY,
-                    "q": query,
-                    "sortBy": "relevance",
-                    "showReprints": "false",
-                    "showNumResults": "true",
-                    "category": category,
-                    "from": from_date,
-                },
-            )
-            response.raise_for_status()
-            return response.json()
+        client = await _get_http_client()
+        response = await client.get(
+            _PERIGON_BASE_URL,
+            params={
+                "apiKey": settings.PERIGON_API_KEY,
+                "q": query,
+                "sortBy": "relevance",
+                "showReprints": "false",
+                "showNumResults": "true",
+                "category": category,
+                "from": from_date,
+            },
+        )
+        response.raise_for_status()
+        return response.json()
 
     # Wrap in rate limiter + retry
     result = await retry_with_backoff(
@@ -165,9 +176,16 @@ async def _search_impl(query: str, category: str) -> list[dict]:
                     "title": article.get("title", ""),
                     "url": article.get("url", ""),
                     "content": article.get("description", ""),
+                    "summary": article.get("description", ""),
                     "source": "perigon",
                     "published_date": article.get("pubDate"),
                     "source_name": source_name,
+                    "cover_url": (
+                        article.get("imageUrl")
+                        or article.get("image_url")
+                        or article.get("thumbnail_url")
+                        or ""
+                    ),
                 }
             )
         except Exception:

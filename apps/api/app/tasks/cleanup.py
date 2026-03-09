@@ -7,6 +7,7 @@ import structlog
 from app.core.config import settings
 from app.core.redis import get_redis
 from app.repositories import chat_history as chat_history_repo
+from app.repositories import cluster_followup_history as followup_history_repo
 
 logger = structlog.get_logger(__name__)
 
@@ -81,5 +82,25 @@ async def cleanup_old_chat_messages(ctx: dict) -> dict:
     return {
         "postgres_deleted": postgres_deleted,
         "redis_deleted": redis_deleted,
+        "cutoff_date": cutoff_date.isoformat(),
+    }
+
+
+async def cleanup_old_cluster_followup_messages(ctx: dict) -> dict:
+    """Delete stale cluster follow-up rows older than configured retention."""
+    cutoff_date = datetime.now(UTC) - timedelta(days=settings.FOLLOWUP_HISTORY_RETENTION_DAYS)
+    deleted = 0
+    try:
+        deleted = await followup_history_repo.delete_history_older_than_for_service(cutoff_date)
+        logger.info(
+            "cleanup.cluster_followup.done",
+            deleted=deleted,
+            cutoff_date=cutoff_date.isoformat(),
+        )
+    except Exception:
+        logger.exception("cleanup.cluster_followup.failed")
+
+    return {
+        "deleted": deleted,
         "cutoff_date": cutoff_date.isoformat(),
     }

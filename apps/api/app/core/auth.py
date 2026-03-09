@@ -111,7 +111,7 @@ async def get_current_user(authorization: str | None = Header(None)) -> dict[str
         raise HTTPException(status_code=401, detail="Could not verify token signature")
     except jwt.InvalidTokenError as e:
         logger.warning("auth.token_invalid", error=str(e))
-        raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
+        raise HTTPException(status_code=401, detail=f"Invalid token: {e!s}")
     except HTTPException:
         raise
     except Exception:

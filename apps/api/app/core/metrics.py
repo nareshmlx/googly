@@ -144,3 +144,40 @@ fulltext_upsert_total = Counter(
     "Total fulltext chunk upsert attempts",
     ["source", "status"],  # success|failed
 )
+
+# Insights metrics
+insights_cluster_jobs_total = Counter(
+    "insights_cluster_jobs_total",
+    "Total cluster_project executions",
+    ["status"],  # started|success|failed|skipped_lock|skipped_small|skipped_empty|skipped_disabled
+)
+
+insights_cluster_job_duration_seconds = Histogram(
+    "insights_cluster_job_duration_seconds",
+    "cluster_project duration in seconds",
+    buckets=[0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0],
+)
+
+insights_full_report_total = Counter(
+    "insights_full_report_total",
+    "Total full report generation attempts",
+    ["status"],  # started|success|failed|cancelled|lock_contention|skipped_disabled|daily_cap
+)
+
+insights_full_report_duration_seconds = Histogram(
+    "insights_full_report_duration_seconds",
+    "Insight full-report generation duration in seconds",
+    buckets=[0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0],
+)
+
+insights_followup_requests_total = Counter(
+    "insights_followup_requests_total",
+    "Total insight follow-up requests",
+    ["context_source"],  # cluster|cluster_docs_expanded|no_context|error|disabled
+)
+
+insights_backfill_total = Counter(
+    "insights_backfill_total",
+    "Total insights backfill outcomes",
+    ["status"],  # discovered|enqueued|skipped_locked|enqueue_failed
+)

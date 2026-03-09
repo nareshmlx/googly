@@ -13,7 +13,7 @@ logger = structlog.get_logger(__name__)
 
 
 class RequestIDMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next) -> Response:
+    async def dispatch(self, request: Request, call_next) -> Response:  # type: ignore[no-untyped-def]
         request_id = str(uuid.uuid4())
         request.state.request_id = request_id
 
@@ -31,4 +31,4 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
         )
 
         response.headers["X-Request-ID"] = request_id
-        return response
+        return response  # type: ignore[no-any-return]

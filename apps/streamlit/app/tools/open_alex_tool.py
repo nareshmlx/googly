@@ -7,19 +7,6 @@ This tool enables searching OpenAlex for research papers.
 import httpx
 import settings
 
-# Global storage for discovered papers (can be accessed by Streamlit if needed)
-_discovered_papers = []
-
-
-def get_discovered_papers():
-    """Return the list of discovered papers."""
-    return _discovered_papers
-
-
-def clear_discovered_papers():
-    """Clear the discovered papers list."""
-    global _discovered_papers
-    _discovered_papers = []
 
 
 def search_openalex(query: str) -> str:
@@ -32,7 +19,6 @@ def search_openalex(query: str) -> str:
     Returns:
         A formatted string containing search results with paper information
     """
-    global _discovered_papers
 
     email = settings.OPENALEX_EMAIL
     base_url = "https://api.openalex.org/works"
@@ -93,21 +79,6 @@ def search_openalex(query: str) -> str:
                 "best_oa_location", {}
             ).get("pdf_url")
 
-            # Store for discovery
-            paper_data = {
-                "id": work.get("id"),
-                "title": title,
-                "authors": authors,
-                "year": publication_year,
-                "cited_by_count": cited_by_count,
-                "abstract": abstract,
-                "pdf_url": pdf_url,
-                "doi": work.get("doi"),
-                "landing_page_url": work.get("id"),  # OpenAlex ID is a URL
-            }
-
-            if not any(p["id"] == paper_data["id"] for p in _discovered_papers):
-                _discovered_papers.append(paper_data)
 
             # Format string output
             formatted_results.append(f"\n📄 Paper {i}: {title}")

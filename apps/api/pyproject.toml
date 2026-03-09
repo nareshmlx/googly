@@ -19,38 +19,36 @@ dependencies = [
     "httpx~=0.28.0",
     "tenacity~=9.0.0",
     "PyJWT~=2.10.0",
-    "structlog>=24.0.0",
-    "ruff~=0.9.0",
-    "mypy~=1.14.0",
-    "pytest>=8.0.0",
-    "pytest-asyncio>=0.24.0",
-    "coverage~=7.6.0",
+    "structlog~=25.5.0",
     "python-dotenv~=1.0.0",
     "openai>=1.66.0",
-    "psycopg2-binary~=2.9.0",
     "pypdf~=5.1.0",
     "python-docx~=1.1.0",
     "ensembledata~=0.2.0",
     "aiolimiter~=1.2.0",
-    "pybreaker~=1.4.0",
     "cachetools~=7.0.0",
     "prometheus-client~=0.21.0",
     "defusedxml~=0.7.1",
-    "vulture>=2.14",
     "google-genai~=1.65",
-    "hdbscan~=0.8.41",
-    "scikit-learn~=1.6.0",
-    "scipy~=1.15.0",
+    "scikit-learn~=1.8.0",
+    "scipy~=1.17.1",
+    "rapidfuzz~=3.11.0",
+    "orjson~=3.10.15",
+    "aiobreaker>=1.2.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest",
-    "pytest-asyncio",
-    "pytest-cov",
-    "ruff",
-    "mypy",
+    "ruff~=0.9.0",
+    "mypy~=1.14.0",
+    "vulture>=2.14",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov~=6.0.0",
+    "coverage~=7.6.0",
     "fakeredis~=2.30.0",
+    "types-cachetools~=5.5.0",
+    "psycopg2-binary~=2.9.0",
 ]
 
 [build-system]
@@ -65,8 +63,9 @@ target-version = "py311"
 line-length = 100
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM"]
-ignore = ["E501", "B008", "B904"]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "S", "T20", "PT", "RUF", "PIE", "PERF", "DTZ"]
+ignore = ["E501", "B008", "B904", "S101", "S603", "S607"]
+
 
 [tool.mypy]
 python_version = "3.11"
@@ -78,6 +77,16 @@ namespace_packages = true
 explicit_package_bases = true
 ignore_missing_imports = true
 disable_error_code = ["no-any-return", "no-untyped-call", "no-untyped-def", "func-returns-value", "misc", "type-arg", "unused-ignore"]
+
+[[tool.mypy.overrides]]
+module = [
+    "app.core.*",
+    "app.repositories.*",
+    "app.services.*"
+]
+disallow_untyped_defs = true
+ignore_missing_imports = true
+
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

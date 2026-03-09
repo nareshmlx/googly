@@ -9,7 +9,9 @@ they are easy to test with a real or mock pool.
 """
 
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime
+from typing import Any
 from uuid import uuid4
 
 import asyncpg
@@ -21,7 +23,9 @@ from app.core.db import get_db_pool
 logger = structlog.get_logger(__name__)
 
 
-async def _with_service_pool(fn, *args, **kwargs):
+
+
+async def _with_service_pool(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     """Execute a pool-injected repository function using the shared DB pool."""
     pool = await get_db_pool()
     return await fn(pool, *args, **kwargs)

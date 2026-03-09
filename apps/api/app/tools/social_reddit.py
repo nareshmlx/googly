@@ -2,13 +2,31 @@
 
 import json
 import re
+from contextlib import suppress
+from typing import Annotated, Any
 
 import httpx
 import structlog
+from pydantic import BaseModel, Field
 
 from app.core.cache_keys import build_search_cache_key, build_stale_cache_key
+from app.core.circuit import ensemble_breaker
 from app.core.config import settings
-from app.core.normalize import coerce_int
+from app.tools.social_common import RobustInt, extract_items_from_payload
+
+
+
+
+class RedditPostSchema(BaseModel):
+    source_id: str = Field(default="")
+    title: str = Field(default="")
+    content: str = Field(default="")
+    author: str = Field(default="")
+    subreddit: str = Field(default="")
+    score: RobustInt = Field(default=0)
+    comments: RobustInt = Field(default=0)
+    published_at: str = Field(default="")
+    url: str = Field(default="")
 
 logger = structlog.get_logger(__name__)
 
@@ -130,19 +148,7 @@ def _extract_items(payload: object) -> list[dict]:
     """Extract list records from common API envelope shapes."""
     if isinstance(payload, list):
         return [row for row in payload if isinstance(row, dict)]
-    if not isinstance(payload, dict):
-        return []
-
-    candidates = [payload.get("data"), payload.get("posts"), payload.get("results")]
-    for value in candidates:
-        if isinstance(value, list):
-            return [row for row in value if isinstance(row, dict)]
-        if isinstance(value, dict):
-            for nested_key in ("data", "posts", "results"):
-                nested = value.get(nested_key)
-                if isinstance(nested, list):
-                    return [row for row in nested if isinstance(row, dict)]
-    return []
+    return extract_items_from_payload(payload)
 
 
 def _normalize_row(row: dict) -> dict:
@@ -234,15 +240,13 @@ async def search_reddit_posts(
         return results
     except Exception as exc:
         if redis:
-            try:
+            with suppress(Exception):
                 stale = await redis.get(stale_key)
                 if stale:
                     logger.info(
                         "social_reddit.serving_stale", project_id=project_id, error=str(exc)
                     )
                     return json.loads(stale)
-            except Exception:
-                pass
         raise
 
 
@@ -292,7 +296,8 @@ async def _search_reddit_posts_impl(
                 payload: object | None = None
                 for endpoint in endpoints:
                     try:
-                        response = await client.get(
+                        protected_get = ensemble_breaker(client.get)
+                        response = await protected_get(
                             endpoint,
                             params=params,
                             headers={"Accept": "application/json"},
@@ -300,22 +305,12 @@ async def _search_reddit_posts_impl(
                         response.raise_for_status()
                         payload = response.json()
                         break
-                    except httpx.HTTPStatusError as exc:
-                        logger.warning(
-                            "social_reddit.subreddit_endpoint_failed",
-                            subreddit=subreddit,
-                            endpoint=endpoint,
-                            status_code=int(exc.response.status_code),
-                            response_preview=str(exc.response.text or "")[:200],
-                        )
-                        continue
                     except Exception as exc:
                         logger.warning(
                             "social_reddit.subreddit_endpoint_failed",
                             subreddit=subreddit,
                             endpoint=endpoint,
                             error_type=type(exc).__name__,
-                            error=str(exc)[:200],
                         )
                         continue
                 if payload is None:
@@ -362,19 +357,20 @@ async def _search_reddit_posts_impl(
         subreddit_name = str(row.get("subreddit_name") or row.get("subreddit") or "").strip()
         if not permalink and not url and subreddit_name and source_id:
             permalink = f"https://www.reddit.com/r/{subreddit_name}/comments/{source_id}"
-        deduped.append(
+        model = RedditPostSchema.model_validate(
             {
                 "source_id": source_id,
                 "title": str(row.get("title") or "").strip(),
                 "content": str(row.get("selftext") or "").strip(),
                 "author": str(row.get("author_username") or row.get("author") or "").strip(),
                 "subreddit": subreddit_name,
-                "score": coerce_int(row.get("score")),
-                "comments": coerce_int(row.get("num_comments") or row.get("comment_count")),
-                "published_at": row.get("create_time") or row.get("created_utc") or "",
+                "score": row.get("score") or 0,
+                "comments": row.get("num_comments") or row.get("comment_count") or 0,
+                "published_at": str(row.get("create_time") or row.get("created_utc") or ""),
                 "url": permalink or url,
             }
         )
+        deduped.append(model.model_dump())
         if len(deduped) >= limit:
             break
 

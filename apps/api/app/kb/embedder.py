@@ -11,30 +11,19 @@ Design decisions:
 
 import asyncio
 import hashlib
-import json
 
+import orjson
 import structlog
-from openai import AsyncOpenAI
 
 from app.core.config import settings
 from app.core.constants import EMBEDDING_DIM, EmbeddingBatchSize, RedisKeys, RedisTTL
+from app.core.openai_client import get_openai_client
 from app.core.redis import get_redis
 
 logger = structlog.get_logger(__name__)
 
 EMBEDDING_MODEL = "text-embedding-3-small"
 
-# Module-level singleton — one connection pool per worker process, reused across
-# all embed_texts() calls. Creating a new AsyncOpenAI() per call creates a new
-# httpx.AsyncClient on every invocation, which wastes connections under load.
-_openai_client: AsyncOpenAI | None = None
-
-
-def _get_client() -> AsyncOpenAI:
-    global _openai_client
-    if _openai_client is None:
-        _openai_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
-    return _openai_client
 
 
 async def embed_texts(texts: list[str]) -> list[list[float]]:
@@ -52,7 +41,7 @@ async def embed_texts(texts: list[str]) -> list[list[float]]:
         if not t.strip():
             raise ValueError(f"Empty text at index {i} — cannot embed blank content")
 
-    redis = await get_redis()
+    redis = None
     results: list[list[float] | None] = [None] * len(texts)
     uncached_indices: list[int] = []
     uncached_texts: list[str] = []
@@ -67,12 +56,17 @@ async def embed_texts(texts: list[str]) -> list[list[float]]:
         )
         for t in texts
     ]
-    cached_values = await redis.mget(*cache_keys)
+    cached_values: list[str | None] = [None] * len(cache_keys)
+    try:
+        redis = await get_redis()
+        cached_values = await redis.mget(*cache_keys)
+    except Exception as exc:
+        logger.warning("embedder.cache_read_failed", error=str(exc), text_count=len(texts))
 
     for i, cached in enumerate(cached_values):
         if cached is not None:
             try:
-                results[i] = json.loads(cached)
+                results[i] = orjson.loads(cached)
             except Exception:
                 # Corrupted / old binary-format entry — treat as cache miss
                 uncached_indices.append(i)
@@ -88,38 +82,51 @@ async def embed_texts(texts: list[str]) -> list[list[float]]:
             cached=len(texts) - len(uncached_indices),
             calling_api=len(uncached_indices),
         )
-        client = _get_client()
+        client = get_openai_client()
 
         # Batch in chunks of EmbeddingBatchSize.DEFAULT (100) to stay within API limits
         batch_size = EmbeddingBatchSize.DEFAULT
 
+        async def _embed_via_openai(batch_texts: list[str]) -> list[list[float]]:
+            """Call OpenAI directly when cache/rate-limit state is unavailable."""
+            response = await client.embeddings.create(model=EMBEDDING_MODEL, input=batch_texts)
+            vectors = [item.embedding for item in response.data]
+            if vectors and len(vectors[0]) != EMBEDDING_DIM:
+                raise ValueError(
+                    f"unexpected_embedding_dim:{len(vectors[0])} expected:{EMBEDDING_DIM}"
+                )
+            return vectors
+
         # Win #4: Parallelize OpenAI batches with Global Redis Fixed Window Limit
-        async def _embed_batch(batch_texts: list[str]):
+        async def _embed_batch(batch_texts: list[str]) -> list[list[float]]:
             import time
 
+            if redis is None:
+                return await _embed_via_openai(batch_texts)
+
             while True:
-                minute = int(time.time() / 60)
-                key = f"sys:ratelimit:embed:{minute}"
-                count = await redis.incr(key)
-                if count == 1:
-                    await redis.expire(key, 120)
+                try:
+                    minute = int(time.time() / 60)
+                    key = f"sys:ratelimit:embed:{minute}"
+                    current_count = int(await redis.get(key) or 0)
+                    if current_count >= 2500:
+                        await asyncio.sleep(1.0)
+                        continue
+                    count = await redis.incr(key)
+                    if count == 1:
+                        await redis.expire(key, 120)
+                except Exception as exc:
+                    logger.warning(
+                        "embedder.rate_limit_cache_unavailable",
+                        error=str(exc),
+                        batch_size=len(batch_texts),
+                    )
+                    return await _embed_via_openai(batch_texts)
 
                 # OpenAI Tier 1 limit is roughly 3000 requests per minute
                 if count <= 2500:
-                    response = await client.embeddings.create(
-                        model=EMBEDDING_MODEL, input=batch_texts
-                    )
-                    vectors = [item.embedding for item in response.data]
-                    if vectors and len(vectors[0]) != EMBEDDING_DIM:
-                        raise ValueError(
-                            f"unexpected_embedding_dim:{len(vectors[0])} expected:{EMBEDDING_DIM}"
-                        )
-                    return vectors
+                    return await _embed_via_openai(batch_texts)
 
-                # Rate-limited: release the Redis connection BEFORE sleeping.
-                # The original code slept while still holding a connection
-                # from the pool, which exhausted the 50-connection pool under
-                # high concurrency (many parallel embed batches per ingestion).
                 await asyncio.sleep(1.0)
 
         batches = [
@@ -130,16 +137,22 @@ async def embed_texts(texts: list[str]) -> list[list[float]]:
         all_vectors = [vec for sublist in batch_results for vec in sublist]
 
         # Win #3: Binary storage in Redis
-        pipe = redis.pipeline()
         for list_pos, orig_idx in enumerate(uncached_indices):
-            vector = all_vectors[list_pos]
-            results[orig_idx] = vector
-            key = cache_keys[orig_idx]
-            # Store as JSON string — compatible with decode_responses=True Redis client.
-            # Binary struct.pack is NOT compatible because Redis client decodes all
-            # responses as UTF-8, which crashes on float bytes ≥ 0x80.
-            pipe.setex(key, RedisTTL.EMBED_CACHE, json.dumps(vector))
-        await pipe.execute()
+            results[orig_idx] = all_vectors[list_pos]
+
+        if redis is not None:
+            try:
+                pipe = redis.pipeline()
+                for list_pos, orig_idx in enumerate(uncached_indices):
+                    vector = all_vectors[list_pos]
+                    key = cache_keys[orig_idx]
+                    # Store as JSON string — compatible with decode_responses=True Redis client.
+                    # Binary struct.pack is NOT compatible because Redis client decodes all
+                    # responses as UTF-8, which crashes on float bytes ≥ 0x80.
+                    pipe.setex(key, RedisTTL.EMBED_CACHE, orjson.dumps(vector).decode())
+                await pipe.execute()
+            except Exception as exc:
+                logger.warning("embedder.cache_write_failed", error=str(exc), text_count=len(texts))
 
         logger.info("embedder.done", embedded=len(uncached_indices))
 

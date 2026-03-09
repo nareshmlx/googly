@@ -89,6 +89,7 @@ class Project(Base):
     chat_messages = relationship(
         "ChatMessage", back_populates="project", cascade="all, delete-orphan"
     )
+    insights = relationship("ProjectInsight", back_populates="project", cascade="all, delete-orphan")
     source_assets = relationship(
         "KnowledgeSourceAsset", back_populates="project", cascade="all, delete-orphan"
     )
@@ -252,4 +253,79 @@ class KnowledgeSourceAsset(Base):
         Index("ix_ksa_fetch_status", "fetch_status"),
         Index("ix_ksa_next_attempt_at", "next_attempt_at"),
         Index("ix_ksa_project_source", "project_id", "source"),
+    )
+
+
+class ProjectInsight(Base):
+    """Stores one clustered insight card/report state for a project."""
+
+    __tablename__ = "project_insights"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+    project_id = Column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    topic_label = Column(Text, nullable=False)
+    executive_summary = Column(Text, nullable=False)
+    key_findings = Column(JSONB, nullable=False, server_default="[]")
+    trend_signal = Column(String(32), nullable=False, server_default="unknown")
+    contradictions = Column(Text, nullable=True)
+    chunk_ids = Column(JSONB, nullable=False, server_default="[]")
+    source_doc_ids = Column(JSONB, nullable=False, server_default="[]")
+    cluster_size = Column(Integer, nullable=False, server_default="0")
+    full_report = Column(Text, nullable=True)
+    full_report_status = Column(String(32), nullable=False, server_default="pending")
+    source_type_counts = Column(JSONB, nullable=False, server_default="{}")
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        nullable=False,
+    )
+
+    project = relationship("Project", back_populates="insights")
+    followup_messages = relationship(
+        "ClusterFollowupMessage",
+        back_populates="insight",
+        cascade="all, delete-orphan",
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "full_report_status IN ('pending', 'generating', 'done', 'failed')",
+            name="ck_project_insights_full_report_status",
+        ),
+        Index("ix_project_insights_project_id", "project_id"),
+    )
+
+
+class ClusterFollowupMessage(Base):
+    """Stores per-insight follow-up thread messages for one user."""
+
+    __tablename__ = "cluster_followup_messages"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+    insight_id = Column(
+        UUID(as_uuid=True), ForeignKey("project_insights.id", ondelete="CASCADE"), nullable=False
+    )
+    project_id = Column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id = Column(Text, nullable=False)
+    role = Column(String(20), nullable=False)
+    content = Column(Text, nullable=False)
+    context_source = Column(String(32), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False)
+
+    insight = relationship("ProjectInsight", back_populates="followup_messages")
+
+    __table_args__ = (
+        CheckConstraint("role IN ('user', 'assistant')", name="ck_cfm_role"),
+        CheckConstraint(
+            "context_source IN ('cluster', 'cluster_docs_expanded')",
+            name="ck_cfm_context_source",
+        ),
+        Index("ix_cfm_insight_user", "insight_id", "user_id"),
+        Index("ix_cfm_project_user_created", "project_id", "user_id", "created_at"),
     )

@@ -221,6 +221,12 @@ class Settings(BaseSettings):
         le=180.0,
         description="Per-source timeout for ingest source calls (seconds).",
     )
+    INGEST_RETRY_ATTEMPTS: int = Field(
+        default=2,
+        ge=1,
+        le=10,
+        description="Maximum retry attempts for retry-wrapped ingestion source calls.",
+    )
     INGEST_SOCIAL_SOURCE_TIMEOUT: float = Field(
         default=150.0,
         ge=10.0,
@@ -299,6 +305,15 @@ class Settings(BaseSettings):
         ge=0.1,
         le=1.0,
         description="Top ratio of candidates retained by stage-1 embedding relevance filter.",
+    )
+    INGEST_FILTER_STAGE2_MIN_SURVIVORS: int = Field(
+        default=3,
+        ge=1,
+        le=20,
+        description=(
+            "Minimum paper/patent candidates kept from stage 1 when the stage-2 LLM judge "
+            "returns no survivors."
+        ),
     )
     INGEST_SOCIAL_RECENCY_FALLBACK_SCORE: float = Field(
         default=0.4,
@@ -612,6 +627,48 @@ class Settings(BaseSettings):
     PROJECT_DISCOVER_LIMIT: int = 500
     PROJECT_UPLOAD_SUMMARIES_LIMIT: int = 40
     SEARCH_QUERY_MAX_LEN: int = 1000
+
+    # === Insights / Clustering ===
+    INSIGHTS_ENABLED: bool = True
+    INSIGHTS_FULL_REPORT_ENABLED: bool = True
+    INSIGHTS_FOLLOWUP_ENABLED: bool = True
+    CLUSTER_MIN_CLUSTER_SIZE: int = Field(default=3, ge=2, le=100)
+    CLUSTER_MIN_SAMPLES: int = Field(default=2, ge=1, le=100)
+    CLUSTER_MAX_CLUSTERS: int = Field(default=30, ge=1, le=200)
+    CLUSTER_MAX_CHUNKS: int = Field(default=3000, ge=10, le=10000)
+    CLUSTER_MAX_CHUNKS_PER_DOCUMENT: int = Field(default=8, ge=1, le=100)
+    CLUSTER_TARGET_CLUSTER_SIZE: int = Field(default=24, ge=5, le=500)
+    CLUSTER_MAX_CLUSTER_SIZE: int = Field(default=32, ge=8, le=1000)
+    CLUSTER_NOISE_ASSIGNMENT_MIN_SIMILARITY: float = Field(default=0.35, ge=0.0, le=1.0)
+    CLUSTER_MERGE_DUPLICATE_TITLES: bool = True
+    CLUSTER_DUPLICATE_TITLE_MIN_DOC_JACCARD: float = Field(default=0.15, ge=0.0, le=1.0)
+    CLUSTER_DUPLICATE_TITLE_MIN_SUMMARY_JACCARD: float = Field(default=0.22, ge=0.0, le=1.0)
+    CLUSTER_LOCK_TTL: int = Field(default=600, ge=30, le=7200)
+    CLUSTER_LOCK_HEARTBEAT_SECONDS: int = Field(default=30, ge=5, le=600)
+    INSIGHTS_RECLUSTER_COOLDOWN_SECONDS: int = Field(default=900, ge=30, le=86400)
+    CLUSTER_CPU_WORKERS: int = Field(default=2, ge=1, le=16)
+    CLUSTER_EXTRACTION_MAX_CONCURRENCY: int = Field(default=4, ge=1, le=64)
+    BACKFILL_INSIGHTS_BATCH_SIZE: int = Field(default=10, ge=1, le=500)
+    INSIGHT_REPORT_MODEL: str = "gpt-4o"
+    INSIGHTS_PREGENERATE_REPORTS_ON_CLUSTER: bool = False
+    INSIGHTS_REPORT_VERIFY_ENABLED: bool = True
+    INSIGHT_REPORT_VERIFIER_MODEL: str = "gpt-4.1"
+    INSIGHT_REPORT_VERIFY_MAX_TOKENS: int = Field(default=3500, ge=200, le=8000)
+    INSIGHT_REPORT_VERIFY_EVIDENCE_MAX_CHUNKS: int = Field(default=24, ge=8, le=80)
+    INSIGHTS_MAX_REPORTS_PER_PROJECT_PER_DAY: int = Field(default=30, ge=1, le=10000)
+    FOLLOWUP_RATE_LIMIT: int = Field(default=20, ge=1, le=1000)
+    FOLLOWUP_RATE_WINDOW_SECONDS: int = Field(default=60, ge=10, le=3600)
+    FOLLOWUP_HISTORY_RETENTION_DAYS: int = Field(default=30, ge=1, le=3650)
+    DOC_SUMMARIZE_ENABLED: bool = True
+    DOC_SUMMARIZE_BATCH_SIZE: int = Field(default=20, ge=1, le=200)
+    DOC_SUMMARIZE_TARGET_MIN_WORDS: int = Field(default=100, ge=20, le=300)
+    DOC_SUMMARIZE_TARGET_MAX_WORDS: int = Field(default=120, ge=20, le=400)
+    DOC_SUMMARIZE_MAX_TOKENS: int = Field(default=260, ge=64, le=1024)
+    INSIGHTS_BACKFILL_SUMMARIES_ON_DETAIL_READ: bool = True
+    CLUSTER_MAX_KEY_FINDINGS: int = Field(default=5, ge=1, le=20)
+    CLUSTER_REPORT_LAMBDA: float = Field(default=0.6, ge=0.0, le=1.0)
+    CLUSTER_REPORT_MAX_CHUNKS: int = Field(default=32, ge=1, le=200)
+    CLUSTER_REPORT_MAX_TOKENS: int = Field(default=8000, ge=100, le=8000)
 
     # === Cache TTL Configuration ===
     CACHE_TTL_PAPERS: int = Field(

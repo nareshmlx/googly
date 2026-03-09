@@ -86,7 +86,7 @@ async def _acquire_gemini_slot(redis: Redis) -> None:
     """Block until a Gemini API rate-limit slot is available (RPM + RPD), then claim it.
 
     Two counters are checked atomically via a Lua INCR script:
-    - Per-minute window: keyed on epoch // window, expires after 2× window.
+    - Per-minute window: keyed on epoch // window, expires after 2x window.
     - Per-day counter: keyed on UTC date (YYYY-MM-DD), expires after 25 hours.
 
     Both counters are shared across all worker pods via Redis, so limits are

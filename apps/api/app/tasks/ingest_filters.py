@@ -1,6 +1,7 @@
 """Relevance filtering logic for ingestion (Embedding, LLM judging)."""
 
 import asyncio
+from contextlib import suppress
 
 import numpy as np
 import structlog
@@ -43,12 +44,26 @@ async def _filter_relevance(
 
     # Stage 2: LLM-based qualitative judging
     if source in ("paper", "patent"):
-        return await _filter_stage2_llm(
+        kept = await _filter_stage2_llm(
             candidates,
             intent_text,
             source,
             must_match_terms=must_match_terms,
         )
+        if kept:
+            return kept
+
+        fallback_count = min(
+            len(candidates),
+            max(1, int(settings.INGEST_FILTER_STAGE2_MIN_SURVIVORS)),
+        )
+        logger.warning(
+            "filter_stage2_llm.empty_fallback_to_stage1",
+            source=source,
+            candidates=len(candidates),
+            fallback_count=fallback_count,
+        )
+        return candidates[:fallback_count]
     elif source in (
         "social_instagram",
         "social_tiktok",
@@ -102,7 +117,7 @@ async def _filter_stage1_embedding(
 
         # Win #5: Reuse intent_embedding if provided
         if intent_embedding is None:
-            all_embs = await embed_texts([intent_text] + texts)
+            all_embs = await embed_texts([intent_text, *texts])
             intent_emb = np.array(all_embs[0])
             doc_embs = [np.array(e) for e in all_embs[1:]]
         else:
@@ -160,7 +175,7 @@ async def _filter_stage2_llm(
     # Extract a concise summary from the intent (which may be a JSON blob).
     # Prefer keywords and domain fields over the full JSON string.
     _intent_summary = intent_text
-    try:
+    with suppress(Exception):
         import json as _json
 
         _parsed = _json.loads(intent_text)
@@ -174,8 +189,6 @@ async def _filter_stage2_llm(
                 _parts.extend(str(k) for k in _parsed["domain_terms"][:5])
             if _parts:
                 _intent_summary = ", ".join(_parts)
-    except Exception:
-        pass  # fall back to raw intent_text
 
     logger.info(
         "filter_stage2_llm.start",
@@ -226,8 +239,14 @@ async def _filter_stage2_llm(
             logger.warning("filter_stage2_llm.llm_error_fail_open", source=source, title=title)
             return True
 
-    results = await asyncio.gather(*[_judge(it) for it in items])
-    kept = [it for it, keep in zip(items, results, strict=False) if keep]
+    results = await asyncio.gather(*[_judge(it) for it in items], return_exceptions=True)
+    kept = []
+    for it, res in zip(items, results, strict=False):
+        if isinstance(res, Exception):
+            kept.append(it)  # Fail open
+        elif res:
+            kept.append(it)
+
     logger.info(
         "filter_stage2_llm.complete",
         source=source,
@@ -300,8 +319,14 @@ async def _filter_stage2_llm_social(
                 return False, "llm_error_no_terms"
             return True, "llm_error_fail_open"
 
-    results = await asyncio.gather(*[_judge_social(it) for it in items])
-    kept = [it for it, (keep, _reason) in zip(items, results, strict=False) if keep]
+    results = await asyncio.gather(*[_judge_social(it) for it in items], return_exceptions=True)
+    kept = []
+    for it, res in zip(items, results, strict=False):
+        if isinstance(res, Exception):
+            kept.append(it)  # Fail open
+        elif res and isinstance(res, tuple) and res[0]:
+            kept.append(it)
+
 
     logger.info(
         "filter_stage2_social.complete",

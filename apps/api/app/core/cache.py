@@ -12,13 +12,12 @@ Usage:
 from __future__ import annotations
 
 import asyncio
-import json
-from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
+import orjson
 import structlog
-from cachetools import TTLCache  # type: ignore[import-untyped]
+from cachetools import TTLCache
 from redis.asyncio import Redis
 
 from app.core.config import settings
@@ -27,15 +26,11 @@ from app.core.metrics import cache_hits_total, cache_misses_total
 logger = structlog.get_logger(__name__)
 
 
-class SafeJSONEncoder(json.JSONEncoder):
-    """JSON encoder that handles datetime and Decimal objects."""
-
-    def default(self, o: Any) -> Any:
-        if isinstance(o, datetime):
-            return o.isoformat()
-        if isinstance(o, Decimal):
-            return float(o)
-        return super().default(o)
+def orjson_default(obj: Any) -> Any:
+    """Fallback serialization for types not natively handled by orjson."""
+    if isinstance(obj, Decimal):
+        return float(obj)
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
 class TwoTierCache:
@@ -80,7 +75,7 @@ class TwoTierCache:
                 cache_misses_total.labels(cache_tier="L2", cache_type="search").inc()
                 return None
 
-            value = json.loads(raw)
+            value = orjson.loads(raw)
             logger.debug("cache.l2.hit", key_preview=key[:50])
             cache_misses_total.labels(cache_tier="L1", cache_type="search").inc()
             cache_hits_total.labels(cache_tier="L2", cache_type="search").inc()
@@ -91,7 +86,7 @@ class TwoTierCache:
                     self._l1_cache[key] = value
 
             return value
-        except json.JSONDecodeError:
+        except orjson.JSONDecodeError:
             logger.warning("cache.l2.invalid_json", key_preview=key[:50])
             cache_misses_total.labels(cache_tier="L2", cache_type="search").inc()
             return None
@@ -105,7 +100,7 @@ class TwoTierCache:
 
         L1 stores Python dict directly (no serialization, TTL-enforced).
         L2 stores JSON-serialized string with TTL.
-        Uses SafeJSONEncoder to handle datetime/Decimal objects.
+        Uses orjson_default to handle Decimal objects.
 
         L2 write runs in background - errors logged but don't block caller.
         Task is tracked and awaited on shutdown to prevent losing in-flight writes.
@@ -124,11 +119,11 @@ class TwoTierCache:
     async def _write_l2(self, key: str, value: dict, ttl: int) -> None:
         """Background L2 write to prevent blocking caller."""
         try:
-            serialized = json.dumps(value, cls=SafeJSONEncoder)
+            serialized = orjson.dumps(value, default=orjson_default)
             await self._redis.setex(key, ttl, serialized)
             logger.debug("cache.l2.set", key_preview=key[:50], ttl=ttl)
-        except (TypeError, ValueError) as exc:
-            # JSON serialization failure (should not happen with SafeJSONEncoder)
+        except (TypeError, ValueError, orjson.JSONEncodeError) as exc:
+            # JSON serialization failure
             logger.error("cache.l2.serialization_error", key_preview=key[:50], error=str(exc))
         except Exception:
             logger.exception("cache.l2.set_error", key_preview=key[:50])

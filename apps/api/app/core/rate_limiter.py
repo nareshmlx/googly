@@ -86,9 +86,9 @@ async def rate_limited_call(
     Returns:
         Result from func
     """
-    start = time.monotonic()
+    start = time.perf_counter()
     async with limiter:
-        wait_time = time.monotonic() - start
+        wait_time = time.perf_counter() - start
         # Track throttling if we had to wait >10ms (indicates rate limit hit)
         if wait_time > 0.01:
             rate_limiter_throttled_total.labels(api_name=api_name).inc()

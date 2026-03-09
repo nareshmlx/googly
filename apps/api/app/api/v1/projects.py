@@ -249,8 +249,12 @@ async def wizard_create_project(
                 exa_enabled=source_toggles["web_exa"],
                 enqueue_ingestion=False,
                 skip_description_expansion=True,
-                intent_seed_text=str(body.enriched_description or "").strip()
-                or str(body.description or "").strip(),
+                intent_seed_text=project_wizard_service.build_intent_seed_text(
+                    description=body.description,
+                    domain_focus=body.domain_focus,
+                    key_entities=body.key_entities,
+                    must_match_terms=body.must_match_terms,
+                ),
             ),
         )
         created_project_id = str(project.get("id") or "")
@@ -402,21 +406,5 @@ async def bootstrap_project(
             upload_ids=body.upload_ids,
             arq_pool=arq_pool,
         ),
-    )
-    return ProjectSetupStatusResponse(**payload)
-
-
-@router.get("/{project_id}/setup-status", response_model=ProjectSetupStatusResponse)
-async def get_setup_status(
-    project_id: str,
-    current_user: dict = Depends(get_current_user),
-):
-    """Return latest async setup/bootstrap status for a project."""
-    user_id = current_user["user_id"]
-    await require_owned_project(project_id, user_id)
-    payload = await _run_service_call(
-        action="setup_status",
-        detail="Failed to fetch setup status",
-        coro=project_service.get_project_setup_status(project_id),
     )
     return ProjectSetupStatusResponse(**payload)

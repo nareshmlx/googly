@@ -1,5 +1,5 @@
 """
-Beauty Social AI — Project-first Streamlit UI.
+Beauty Social AI - Project-first Streamlit UI.
 
 Flow:
 1. Land on Home.
@@ -9,24 +9,66 @@ Flow:
 Discover and project management remain available once a project is selected.
 """
 
+import importlib.util
+import re
+import sys
 import uuid
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from html import escape
 from pathlib import Path
-from urllib.parse import urlparse
+from types import ModuleType
 from zoneinfo import ZoneInfo
+from collections.abc import Generator
 
 import streamlit as st
-
-import _api
 from agent import get_database
+from source_cards import (
+    build_source_card_media,
+    build_source_card_summaries,
+    should_show_source_summary_button,
+)
 
 IST_TZ = ZoneInfo("Asia/Kolkata")
 _WIZARD_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="wizard-ui")
 _UPLOAD_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="upload-ui")
 _WIZARD_PROGRESS_TIMEOUT_SECONDS = 25.0
+_EMOJI_OR_SYMBOL_PATTERN = re.compile(
+    r"[\U0001F1E6-\U0001F1FF\U0001F300-\U0001FAFF\u2600-\u27BF\u200D\uFE0E\uFE0F]"
+)
+
+
+def _strip_emoji_symbols(text: object) -> str:
+    """Remove emoji-like symbols so unsupported fonts do not render tofu boxes."""
+    raw = str(text or "")
+    if not raw:
+        return ""
+    cleaned = _EMOJI_OR_SYMBOL_PATTERN.sub("", raw)
+    return " ".join(cleaned.split())
+
+
+def _load_local_api_module() -> ModuleType:
+    """Load the local `_api.py` file explicitly to avoid module-resolution ambiguity."""
+    module_path = Path(__file__).with_name("_api.py")
+    spec = importlib.util.spec_from_file_location("googly_streamlit_api", module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load API client module from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+try:
+    import _api as _api_module
+except Exception:
+    _api_module = _load_local_api_module()
+
+if not hasattr(_api_module, "get_insights"):
+    _api_module = _load_local_api_module()
+
+_api = _api_module
 
 # ============ THEME CONFIG ============
 THEME_PRESETS: dict[str, dict[str, str]] = {
@@ -178,7 +220,7 @@ def _apply_theme(theme_name: str) -> None:
 # ============ PAGE CONFIG ============
 st.set_page_config(
     page_title="Beauty Social AI",
-    page_icon="💄",
+    page_icon="B",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -218,8 +260,16 @@ if "projects_loaded" not in st.session_state:
     st.session_state.projects_loaded = False
 if "project_history_loaded" not in st.session_state:
     st.session_state.project_history_loaded = set()
-if "setup_status_last" not in st.session_state:
-    st.session_state.setup_status_last = {}
+if "show_sources_drawer" not in st.session_state:
+    st.session_state.show_sources_drawer = False
+if "drawer_insight_id" not in st.session_state:
+    st.session_state.drawer_insight_id = None
+if "selected_insight_id" not in st.session_state:
+    st.session_state.selected_insight_id = None
+if "insight_report_cache" not in st.session_state:
+    st.session_state.insight_report_cache = {}
+if "insight_report_requested" not in st.session_state:
+    st.session_state.insight_report_requested = set()
 
 _apply_theme("Rose Glow")
 
@@ -244,7 +294,9 @@ def _selected_project() -> dict | None:
     return None
 
 
-def _upload_bootstrap_files(project_id: str, files: list | None) -> tuple[list[str], list[str]]:
+def _upload_bootstrap_files(
+    project_id: str, files: list | None
+) -> tuple[list[str], list[str]]:
     """Upload bootstrap files in parallel and return (successful_upload_ids, failed_names)."""
     payloads: list[tuple[str, bytes]] = []
     for file in files or []:
@@ -277,6 +329,40 @@ def _upload_bootstrap_files(project_id: str, files: list | None) -> tuple[list[s
             failed_names.append(name)
 
     return upload_ids, failed_names
+
+
+def _clear_source_card_flip_state(insight_id: str | None = None) -> None:
+    """Clear source-card flip state keys for one insight or globally."""
+    prefix = "source_card_state_flip_"
+    keys_to_delete: list[str] = []
+    marker = f"{insight_id}_" if insight_id else ""
+    for key in list(st.session_state.keys()):
+        if not key.startswith(prefix):
+            continue
+        if marker and not key.startswith(f"{prefix}{marker}"):
+            continue
+        keys_to_delete.append(key)
+    for key in keys_to_delete:
+        del st.session_state[key]
+
+
+def _reset_insight_view_state() -> None:
+    """Clear insight-detail and sources-drawer state."""
+    _clear_source_card_flip_state()
+    st.session_state.selected_insight_id = None
+    st.session_state.drawer_insight_id = None
+    st.session_state.show_sources_drawer = False
+    st.session_state.insight_report_requested = set()
+
+
+def _select_project(project_id: str, target_page: str) -> None:
+    """Switch active project and clear project-scoped UI state when project changes."""
+    previous_project_id = str(st.session_state.selected_project_id or "")
+    next_project_id = str(project_id or "")
+    if previous_project_id and previous_project_id != next_project_id:
+        _reset_insight_view_state()
+    st.session_state.selected_project_id = project_id
+    st.session_state.current_page = target_page
 
 
 def _sync_project_chunk_count_from_ingest(
@@ -327,7 +413,7 @@ def _parse_to_ist(value: str | None) -> datetime | None:
     except ValueError:
         return None
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.replace(tzinfo=UTC)
     return dt.astimezone(IST_TZ)
 
 
@@ -335,7 +421,7 @@ def _short_date(value: str | None) -> str:
     """Return YYYY-MM-DD in IST from an ISO datetime-like string."""
     dt = _parse_to_ist(value)
     if not dt:
-        return "—"
+        return "-"
     return dt.strftime("%Y-%m-%d")
 
 
@@ -343,7 +429,7 @@ def _short_datetime_ist(value: str | None) -> str:
     """Return YYYY-MM-DD HH:MM IST from an ISO datetime-like string."""
     dt = _parse_to_ist(value)
     if not dt:
-        return "—"
+        return "-"
     return dt.strftime("%Y-%m-%d %H:%M IST")
 
 
@@ -584,9 +670,15 @@ def _ensure_review_widget_defaults(form_key: str, state: dict) -> None:
         f"{form_key}_wizard_domain_focus": str(payload.get("domain_focus") or ""),
         f"{form_key}_wizard_entities": list(payload.get("key_entities") or []),
         f"{form_key}_wizard_must_terms": list(payload.get("must_match_terms") or []),
-        f"{form_key}_wizard_time_horizon": str(payload.get("time_horizon") or "last 1 year"),
-        f"{form_key}_wizard_refresh_strategy": str(state.get("refresh_strategy") or "once"),
-        f"{form_key}_wizard_enriched_description": str(payload.get("enriched_description") or ""),
+        f"{form_key}_wizard_time_horizon": str(
+            payload.get("time_horizon") or "last 1 year"
+        ),
+        f"{form_key}_wizard_refresh_strategy": str(
+            state.get("refresh_strategy") or "once"
+        ),
+        f"{form_key}_wizard_enriched_description": str(
+            payload.get("enriched_description") or ""
+        ),
         f"{form_key}_wizard_src_tiktok": bool(source_toggles.get("tiktok", True)),
         f"{form_key}_wizard_src_instagram": bool(source_toggles.get("instagram", True)),
         f"{form_key}_wizard_src_youtube": bool(source_toggles.get("youtube", True)),
@@ -595,7 +687,9 @@ def _ensure_review_widget_defaults(form_key: str, state: dict) -> None:
         f"{form_key}_wizard_src_papers": bool(source_toggles.get("papers", True)),
         f"{form_key}_wizard_src_patents": bool(source_toggles.get("patents", True)),
         f"{form_key}_wizard_src_news": bool(source_toggles.get("news", True)),
-        f"{form_key}_wizard_src_web_tavily": bool(source_toggles.get("web_tavily", True)),
+        f"{form_key}_wizard_src_web_tavily": bool(
+            source_toggles.get("web_tavily", True)
+        ),
         f"{form_key}_wizard_src_web_exa": bool(source_toggles.get("web_exa", True)),
     }
     for key, value in defaults.items():
@@ -681,7 +775,9 @@ def _render_create_project_form(
 
         col_start, col_reset = st.columns([3, 1])
         with col_start:
-            if st.button("Start Wizard", key=f"{form_key}_wizard_start", use_container_width=True):
+            if st.button(
+                "Start Wizard", key=f"{form_key}_wizard_start", use_container_width=True
+            ):
                 title_value = (title or "").strip()
                 description_value = (description or "").strip()
                 if not title_value:
@@ -707,7 +803,9 @@ def _render_create_project_form(
                 )
                 st.rerun()
         with col_reset:
-            if st.button("Reset", key=f"{form_key}_wizard_intro_reset", use_container_width=True):
+            if st.button(
+                "Reset", key=f"{form_key}_wizard_intro_reset", use_container_width=True
+            ):
                 _reset_wizard_state(form_key, cfg)
                 st.rerun()
         return
@@ -729,8 +827,12 @@ def _render_create_project_form(
             """,
             unsafe_allow_html=True,
         )
-        progress = 0.0 if max_questions <= 0 else min(1.0, len(answered_pairs) / max_questions)
-        st.progress(progress, text=f"Progress: {len(answered_pairs)} of {max_questions}")
+        progress = (
+            0.0 if max_questions <= 0 else min(1.0, len(answered_pairs) / max_questions)
+        )
+        st.progress(
+            progress, text=f"Progress: {len(answered_pairs)} of {max_questions}"
+        )
         st.markdown(
             f"""
             <div class="wizard-score-grid">
@@ -829,7 +931,9 @@ def _render_create_project_form(
                         key=f"{form_key}_wizard_edit_save_{idx}",
                         use_container_width=True,
                     ):
-                        edited_answer = str(st.session_state.get(answer_key) or "").strip()
+                        edited_answer = str(
+                            st.session_state.get(answer_key) or ""
+                        ).strip()
                         if not edited_answer:
                             st.error("Answer cannot be empty.")
                             return
@@ -930,7 +1034,9 @@ def _render_create_project_form(
             "last 5 years",
             "all-time",
         ]
-        current_horizon = st.session_state.get(f"{form_key}_wizard_time_horizon", "last 1 year")
+        current_horizon = st.session_state.get(
+            f"{form_key}_wizard_time_horizon", "last 1 year"
+        )
         if current_horizon not in horizon_options:
             horizon_options.append(current_horizon)
         st.selectbox(
@@ -973,36 +1079,52 @@ def _render_create_project_form(
 
     target_sources = {
         "tiktok": bool(st.session_state.get(f"{form_key}_wizard_src_tiktok", True)),
-        "instagram": bool(st.session_state.get(f"{form_key}_wizard_src_instagram", True)),
+        "instagram": bool(
+            st.session_state.get(f"{form_key}_wizard_src_instagram", True)
+        ),
         "youtube": bool(st.session_state.get(f"{form_key}_wizard_src_youtube", True)),
         "reddit": bool(st.session_state.get(f"{form_key}_wizard_src_reddit", True)),
         "x": bool(st.session_state.get(f"{form_key}_wizard_src_x", True)),
         "papers": bool(st.session_state.get(f"{form_key}_wizard_src_papers", True)),
         "patents": bool(st.session_state.get(f"{form_key}_wizard_src_patents", True)),
         "news": bool(st.session_state.get(f"{form_key}_wizard_src_news", True)),
-        "web_tavily": bool(st.session_state.get(f"{form_key}_wizard_src_web_tavily", True)),
+        "web_tavily": bool(
+            st.session_state.get(f"{form_key}_wizard_src_web_tavily", True)
+        ),
         "web_exa": bool(st.session_state.get(f"{form_key}_wizard_src_web_exa", True)),
     }
 
     col_create, col_back, col_reset = st.columns([3, 1, 1])
     with col_create:
-        if st.button(submit_label, key=f"{form_key}_wizard_create", use_container_width=True):
+        if st.button(
+            submit_label, key=f"{form_key}_wizard_create", use_container_width=True
+        ):
             with st.spinner("Creating project..."):
                 result, create_error = _api.wizard_create(
                     title=state.get("title", ""),
                     description=state.get("description", ""),
                     qa_pairs=list(state.get("qa_pairs") or []),
                     refresh_strategy=str(
-                        st.session_state.get(f"{form_key}_wizard_refresh_strategy", "once")
+                        st.session_state.get(
+                            f"{form_key}_wizard_refresh_strategy", "once"
+                        )
                     ),
                     enriched_description=str(
-                        st.session_state.get(f"{form_key}_wizard_enriched_description", "")
+                        st.session_state.get(
+                            f"{form_key}_wizard_enriched_description", ""
+                        )
                     ),
                     domain_focus=domain_focus,
-                    key_entities=list(st.session_state.get(f"{form_key}_wizard_entities", [])),
-                    must_match_terms=list(st.session_state.get(f"{form_key}_wizard_must_terms", [])),
+                    key_entities=list(
+                        st.session_state.get(f"{form_key}_wizard_entities", [])
+                    ),
+                    must_match_terms=list(
+                        st.session_state.get(f"{form_key}_wizard_must_terms", [])
+                    ),
                     time_horizon=str(
-                        st.session_state.get(f"{form_key}_wizard_time_horizon", "last 1 year")
+                        st.session_state.get(
+                            f"{form_key}_wizard_time_horizon", "last 1 year"
+                        )
                     ),
                     target_sources=target_sources,
                 )
@@ -1025,18 +1147,21 @@ def _render_create_project_form(
             with st.spinner("Starting project setup..."):
                 _api.bootstrap_project(result["id"], upload_ids)
 
-            st.session_state.selected_project_id = result["id"]
-            st.session_state.current_page = "Chat"
+            _select_project(result["id"], "Chat")
             _reset_wizard_state(form_key, cfg)
             reload_projects()
             st.success(f"Project '{result['title']}' created.")
             st.rerun()
     with col_back:
-        if st.button("Back", key=f"{form_key}_wizard_back_to_qa", use_container_width=True):
+        if st.button(
+            "Back", key=f"{form_key}_wizard_back_to_qa", use_container_width=True
+        ):
             state["phase"] = "qa"
             st.rerun()
     with col_reset:
-        if st.button("Reset", key=f"{form_key}_wizard_review_reset", use_container_width=True):
+        if st.button(
+            "Reset", key=f"{form_key}_wizard_review_reset", use_container_width=True
+        ):
             _reset_wizard_state(form_key, cfg)
             st.rerun()
 
@@ -1066,7 +1191,7 @@ else:
         unsafe_allow_html=True,
     )
     with st.sidebar:
-        st.title("💄 Beauty Social")
+        st.title("Beauty Social")
         st.caption("P&G Beauty Intelligence")
 
         st.divider()
@@ -1075,16 +1200,21 @@ else:
         nav_options = ["Home", "Projects"]
         if st.session_state.selected_project_id:
             nav_options.extend(["Chat", "Discover"])
-        if st.session_state.current_page not in nav_options:
+        allowed_pages = set(nav_options) | {"InsightDetail"}
+        if st.session_state.current_page not in allowed_pages:
             st.session_state.current_page = "Home"
+
+        nav_page = st.session_state.current_page
+        if nav_page == "InsightDetail" and "Discover" in nav_options:
+            nav_page = "Discover"
 
         page = st.radio(
             "Navigation",
             nav_options,
-            index=nav_options.index(st.session_state.current_page),
+            index=nav_options.index(nav_page),
             label_visibility="collapsed",
         )
-        if page != st.session_state.current_page:
+        if page != nav_page:
             st.session_state.current_page = page
             if page == "Home":
                 reload_projects()
@@ -1093,14 +1223,22 @@ else:
         st.divider()
 
         active_project = _selected_project()
-        active_label = active_project["title"] if active_project else "None selected"
+        active_label = _strip_emoji_symbols(
+            active_project.get("title") if active_project else ""
+        )
+        if not active_label:
+            active_label = "None selected"
 
         st.markdown(f"**Active Project:** {active_label}")
 
         if active_project:
             base_description = str(active_project.get("description") or "").strip()
-            enriched_description = str(active_project.get("enriched_description") or "").strip()
-            base_html = escape(base_description or "No base description available.").replace("\n", "<br>")
+            enriched_description = str(
+                active_project.get("enriched_description") or ""
+            ).strip()
+            base_html = escape(
+                base_description or "No base description available."
+            ).replace("\n", "<br>")
             enriched_html = escape(
                 enriched_description
                 or "No enriched description yet. Complete wizard and synthesis to generate one."
@@ -1123,42 +1261,53 @@ else:
                     unsafe_allow_html=True,
                 )
 
-        if st.button("🔄 Refresh Projects", use_container_width=True):
+        if st.button("Refresh Projects", use_container_width=True):
             reload_projects()
             st.rerun()
 
         if st.session_state.selected_project_id and st.button(
-            "↩ Back to Home", use_container_width=True
+            "Back to Home", use_container_width=True
         ):
             st.session_state.current_page = "Home"
             st.rerun()
 
         if st.session_state.selected_project_id and st.button(
-            "✕ Clear Selection", use_container_width=True
+            "Clear Selection", use_container_width=True
         ):
             st.session_state.selected_project_id = None
+            _reset_insight_view_state()
             st.session_state.current_page = "Home"
             st.rerun()
 
-        if st.button("➕ Create Project", use_container_width=True):
+        if st.button("Create Project", use_container_width=True):
             st.session_state.current_page = "Home"
             st.session_state["home_show_create"] = True
             st.rerun()
 
         st.divider()
 
-        # Database / memory status — checked once at startup only
+        # Database / memory status - checked once at startup only
         if "db_status" not in st.session_state:
             st.session_state.db_status = get_database() is not None
         if st.session_state.db_status:
-            st.success("🧠 Memory Active")
+            st.markdown(
+                '<span class="memory-status-pill memory-active">'
+                '<span class="memory-status-dot"></span>Memory Active'
+                "</span>",
+                unsafe_allow_html=True,
+            )
         else:
-            st.warning("⚠️ Memory Offline")
+            st.markdown(
+                '<span class="memory-status-pill memory-offline">'
+                '<span class="memory-status-dot"></span>Memory Offline'
+                "</span>",
+                unsafe_allow_html=True,
+            )
 
 # ============ MAIN CONTENT ============
 
 # ----------------------------------------------------------------
-# HOME PAGE — default landing with project gallery + quick create
+# HOME PAGE - default landing with project gallery + quick create
 # ----------------------------------------------------------------
 if st.session_state.current_page == "Home":
     st.markdown(
@@ -1207,7 +1356,7 @@ if st.session_state.current_page == "Home":
     refresh_values = [
         p.get("last_refreshed_at") for p in projects if p.get("last_refreshed_at")
     ]
-    latest_refresh = _short_date(max(refresh_values)) if refresh_values else "—"
+    latest_refresh = _short_date(max(refresh_values)) if refresh_values else "-"
 
     col_s1, col_s2, col_s3 = st.columns(3)
     with col_s1:
@@ -1331,7 +1480,7 @@ if st.session_state.current_page == "Home":
                     <div class="project-card">
                         <div class="project-card-title">{proj["title"]}</div>
                         <div class="project-card-meta">
-                            Strategy: {proj["refresh_strategy"]} · Chunks: {proj.get("kb_chunk_count", 0)}
+                            Strategy: {proj["refresh_strategy"]} | Chunks: {proj.get("kb_chunk_count", 0)}
                         </div>
                         <div class="project-tags">{tags_html}</div>
                         <div class="project-card-desc">{(proj.get("description") or "")[:160]}</div>
@@ -1349,32 +1498,29 @@ if st.session_state.current_page == "Home":
                     if st.button(
                         "Open Chat", key=f"home_chat_{pid}", use_container_width=True
                     ):
-                        st.session_state.selected_project_id = pid
-                        st.session_state.current_page = "Chat"
+                        _select_project(pid, "Chat")
                         st.rerun()
                 with c2:
                     if st.button(
                         "Discover", key=f"home_discover_{pid}", use_container_width=True
                     ):
-                        st.session_state.selected_project_id = pid
-                        st.session_state.current_page = "Discover"
+                        _select_project(pid, "Discover")
                         st.rerun()
                 with c3:
                     if st.button(
                         "Manage", key=f"home_manage_{pid}", use_container_width=True
                     ):
-                        st.session_state.selected_project_id = pid
-                        st.session_state.current_page = "Projects"
+                        _select_project(pid, "Projects")
                         st.rerun()
 
 # ----------------------------------------------------------------
-# PROJECTS PAGE — create / delete projects, upload docs, view KB
+# PROJECTS PAGE - create / delete projects, upload docs, view KB
 # ----------------------------------------------------------------
 elif st.session_state.current_page == "Projects":
-    st.header("🗂 Projects")
+    st.header("Projects")
 
     # --- Create project form ---
-    with st.expander("➕ Create New Project", expanded=False):
+    with st.expander("Create New Project", expanded=False):
         _render_create_project_form(form_key="projects_create_project_form")
 
     st.divider()
@@ -1393,19 +1539,20 @@ elif st.session_state.current_page == "Projects":
             with st.container():
                 col_title, col_delete = st.columns([5, 1])
                 with col_title:
-                    st.subheader(proj["title"])
+                    st.subheader(_strip_emoji_symbols(proj["title"]))
                     st.caption(
                         f"Strategy: {proj['refresh_strategy']} | "
                         f"Chunks: {proj.get('kb_chunk_count', 0)} | "
                         f"Created: {_short_date(proj.get('created_at'))}"
                     )
                 with col_delete:
-                    if st.button("🗑️", key=f"del_{pid}", help="Delete project"):
+                    if st.button("Delete", key=f"del_{pid}", help="Delete project"):
                         with st.spinner("Deleting..."):
                             ok = _api.delete_project(pid)
                         if ok:
                             if st.session_state.selected_project_id == pid:
                                 st.session_state.selected_project_id = None
+                                _reset_insight_view_state()
                             reload_projects()
                             st.rerun()
                         else:
@@ -1416,7 +1563,7 @@ elif st.session_state.current_page == "Projects":
                 if kb.get("status"):
                     status_color = "green" if kb.get("status") == "ready" else "orange"
                     st.markdown(
-                        f"KB: :{status_color}[{kb['status']}] — "
+                        f"KB: :{status_color}[{kb['status']}] - "
                         f"{kb['kb_chunk_count']} chunks"
                         + (
                             f" | last refreshed {_short_datetime_ist(kb.get('last_refreshed_at'))}"
@@ -1439,7 +1586,7 @@ elif st.session_state.current_page == "Projects":
                     if result:
                         st.success(
                             f"Uploaded {result['filename']} (ID: {result['upload_id'][:8]}...). "
-                            "Processing in background — refresh KB status to track progress."
+                            "Processing in background - refresh KB status to track progress."
                         )
                     else:
                         st.error("Upload failed. Check backend logs.")
@@ -1448,7 +1595,7 @@ elif st.session_state.current_page == "Projects":
 
 
 # ----------------------------------------------------------------
-# CHAT PAGE — project SSE mode OR agent mode
+# CHAT PAGE - project SSE mode OR agent mode
 # ----------------------------------------------------------------
 elif st.session_state.current_page == "Chat":
     project_id = st.session_state.selected_project_id
@@ -1459,10 +1606,10 @@ elif st.session_state.current_page == "Chat":
         proj_name = project_id
         for p in st.session_state.projects:
             if p["id"] == project_id:
-                proj_name = p["title"]
+                proj_name = _strip_emoji_symbols(p["title"])
                 break
 
-        st.header(f"💬 {proj_name}")
+        st.header(proj_name)
         st.caption("Chatting with your project knowledge base via FastAPI")
 
         # Initialise message list for this project and load persisted history once
@@ -1494,7 +1641,7 @@ elif st.session_state.current_page == "Chat":
                 session_id = _project_chat_session_id(project_id)
                 for token in _api.stream_chat(prompt, project_id, session_id):
                     response_text += token
-                    placeholder.markdown(response_text + "▌")
+                    placeholder.markdown(response_text + "|")
                 placeholder.markdown(response_text)
 
             msgs.append({"role": "assistant", "content": response_text})
@@ -1505,194 +1652,6 @@ elif st.session_state.current_page == "Chat":
         if st.button("Go to Home", key="chat_go_home"):
             st.session_state.current_page = "Home"
             st.rerun()
-
-
-def _normalize_discover_source(source: str | None) -> str:
-    """Normalize backend source names into UI tab categories."""
-    raw = (source or "").strip().lower()
-    return {
-        "social_tiktok": "tiktok",
-        "social_instagram": "instagram",
-        "social_youtube": "youtube",
-        "social_reddit": "reddit",
-        "social_x": "x",
-        "web": "search",
-    }.get(raw, raw)
-
-
-def _to_discover_item(item: dict) -> dict:
-    """Return a normalized discover item with safe defaults."""
-    normalized = dict(item)
-    normalized["source"] = _normalize_discover_source(item.get("source"))
-    normalized["title"] = item.get("title") or "Untitled"
-    normalized["summary"] = item.get("summary") or ""
-    normalized["metadata"] = item.get("metadata") or {}
-    normalized["author"] = (
-        item.get("author") or normalized["metadata"].get("author") or ""
-    )
-    normalized["url"] = item.get("url") or normalized["metadata"].get("url")
-    normalized["video_url"] = normalized["metadata"].get("video_url") or ""
-    normalized["cover_url"] = (
-        item.get("cover_url")
-        or normalized["metadata"].get("cover_url")
-        or normalized["metadata"].get("thumbnail_url")
-        or normalized["metadata"].get("image_url")
-        or ""
-    )
-    return normalized
-
-
-def _discover_source_label(item: dict) -> str:
-    """Human-friendly source labels for discover cards."""
-    labels = {
-        "instagram": "Instagram",
-        "tiktok": "TikTok",
-        "youtube": "YouTube",
-        "reddit": "Reddit",
-        "x": "X",
-        "paper": "Research Paper",
-        "patent": "Patent",
-        "news": "News",
-        "search": "Web",
-    }
-    return labels.get(item.get("source", ""), "Discover")
-
-
-def _discover_meta_line(item: dict) -> str:
-    """Return compact source-specific metadata line."""
-    metadata = item.get("metadata") or {}
-    source = item.get("source")
-    published_raw = (
-        item.get("published_at")
-        or metadata.get("published_at")
-        or metadata.get("published_date")
-        or metadata.get("pubDate")
-        or metadata.get("year")
-    )
-    published = str(published_raw)[:10] if published_raw else ""
-    if source in {"paper", "patent"}:
-        venue = metadata.get("venue") or metadata.get("assignee") or ""
-        year = metadata.get("year") or published
-        citations = metadata.get("citation_count")
-        parts = [str(part) for part in (venue, year) if part]
-        if citations is not None:
-            parts.append(f"{citations:,} citations")
-        return " • ".join(parts)
-    if source == "news":
-        source_name = metadata.get("source_name") or metadata.get("source") or ""
-        return " • ".join([part for part in (source_name, published) if part])
-    if source == "search":
-        url = item.get("url") or ""
-        domain = urlparse(url).netloc if url else ""
-        return " • ".join([part for part in (domain, published) if part])
-    if source in {"instagram", "tiktok", "youtube"}:
-        likes = int(metadata.get("likes") or 0)
-        views = int(metadata.get("views") or 0)
-        social_stats = []
-        if likes > 0:
-            social_stats.append(f"{likes:,} likes")
-        if views > 0:
-            social_stats.append(f"{views:,} views")
-        if published:
-            social_stats.append(published)
-        return " • ".join(social_stats)
-    if source == "reddit":
-        score = int(metadata.get("score") or 0)
-        comments = int(metadata.get("comments") or 0)
-        parts = []
-        if score > 0:
-            parts.append(f"{score:,} score")
-        if comments > 0:
-            parts.append(f"{comments:,} comments")
-        if published:
-            parts.append(published)
-        return " • ".join(parts)
-    if source == "x":
-        likes = int(metadata.get("likes") or 0)
-        retweets = int(metadata.get("retweets") or 0)
-        parts = []
-        if likes > 0:
-            parts.append(f"{likes:,} likes")
-        if retweets > 0:
-            parts.append(f"{retweets:,} reposts")
-        if published:
-            parts.append(published)
-        return " • ".join(parts)
-    return published
-
-
-def _social_tile_media_html(item: dict) -> str:
-    """Build fixed-height social media HTML so media stays inside the same card block."""
-    video_url = item.get("video_url")
-    cover_url = item.get("cover_url")
-    if video_url:
-        safe_video_url = escape(video_url)
-        safe_cover_url = escape(cover_url) if cover_url else ""
-        poster_attr = f' poster="{safe_cover_url}"' if safe_cover_url else ""
-        return f"""
-        <div class="discover-media-wrap">
-            <video controls preload="metadata"{poster_attr}
-                   style="width:100%;height:228px;object-fit:cover;display:block;background:#000;">
-                <source src="{safe_video_url}" type="video/mp4">
-            </video>
-        </div>
-        """
-    if cover_url:
-        return f"""
-        <div class="discover-media-wrap">
-            <img class="discover-media-image" src="{escape(cover_url)}" />
-        </div>
-        """
-    return '<div class="discover-media-wrap discover-media-empty">No media</div>'
-
-
-def _render_discover_card(item: dict) -> None:
-    """Render one compact discover card tile."""
-    source_label = _discover_source_label(item)
-    title = escape(item.get("title") or "Untitled")
-    url = item.get("url")
-    title_html = (
-        f'<a href="{escape(url)}" target="_blank" style="color:#0f172a;text-decoration:none;">{title}</a>'
-        if url
-        else title
-    )
-    summary = escape((item.get("summary") or "")[:220])
-    meta_line = escape(_discover_meta_line(item))
-    author = escape(item.get("author") or "")
-    media_html = ""
-    if item.get("source") in {"instagram", "tiktok", "youtube"}:
-        media_html = _social_tile_media_html(item)
-    elif item.get("cover_url"):
-        media_html = f"""
-        <div class="discover-media-wrap">
-            <img class="discover-media-image" src="{escape(item['cover_url'])}" />
-        </div>
-        """
-    html = (
-        '<div class="discover-card">'
-        f"{media_html}"
-        '<div class="discover-card-body" style="background:#ffffff;color:#0f172a;">'
-        f'<div class="discover-source-pill" style="background:#e8f0ff;color:#1e3a5f;border:1px solid #d9e5ff;">{escape(source_label)}</div>'
-        f'<div class="discover-card-title" style="color:#0f172a;">{title_html}</div>'
-        f'<div class="discover-card-summary" style="color:#334155;">{summary}</div>'
-        f'<div class="discover-card-meta" style="color:#64748b;">{author}{" • " if author and meta_line else ""}{meta_line}</div>'
-        "</div>"
-        "</div>"
-    )
-    st.markdown(html, unsafe_allow_html=True)
-
-
-def _render_discover_grid(items: list[dict], *, empty_msg: str) -> None:
-    """Render compact, mixed discover tiles in backend-ranked order."""
-    if not items:
-        st.info(empty_msg)
-        return
-
-    column_count = 1 if len(items) == 1 else 3
-    columns = st.columns(column_count)
-    for idx, item in enumerate(items):
-        with columns[idx % column_count]:
-            _render_discover_card(item)
 
 
 def _render_ingest_status(status_payload: dict | None) -> None:
@@ -1726,148 +1685,404 @@ def _render_ingest_status(status_payload: dict | None) -> None:
         st.success(f"Ingestion complete. {details}".strip())
 
 
-def _maybe_auto_refresh_discover(project_id: str, discover_item_count: int) -> None:
-    """Track discover warm-up conditions without forcing blocking reruns."""
-    setup = _api.get_setup_status(project_id)
-    if setup:
-        st.session_state.setup_status_last[project_id] = setup
-    else:
-        setup = st.session_state.setup_status_last.get(project_id)
-    if not setup:
+def _trend_css_class(signal: str | None) -> str:
+    """Map trend signal to CSS class."""
+    value = str(signal or "unknown").strip().lower()
+    if value in {"rising", "declining", "emerging", "stable"}:
+        return f"trend-{value}"
+    return "trend-unknown"
+
+
+def _source_label(source_key: str) -> str:
+    """Map source keys to display labels."""
+    labels = {
+        "social_tiktok": "TikTok",
+        "social_instagram": "Instagram",
+        "social_youtube": "YouTube",
+        "social_reddit": "Reddit",
+        "social_x": "X",
+        "paper": "Papers",
+        "patent": "Patents",
+        "news": "News",
+        "search": "Web",
+        "upload": "Uploads",
+    }
+    return labels.get(source_key, source_key.title())
+
+
+def _source_pills_html(source_counts: dict) -> str:
+    """Render source count pills for a cluster card."""
+    if not isinstance(source_counts, dict) or not source_counts:
+        return '<span class="source-pill-cluster">No sources</span>'
+    ordered = sorted(source_counts.items(), key=lambda pair: int(pair[1]), reverse=True)
+    pills = [
+        f'<span class="source-pill-cluster">{int(count)} {_source_label(str(source_key))}</span>'
+        for source_key, count in ordered
+        if int(count) > 0
+    ]
+    return (
+        "".join(pills)
+        if pills
+        else '<span class="source-pill-cluster">No sources</span>'
+    )
+
+
+def _render_cluster_card(card: dict) -> None:
+    """Render one insight card in feed grid."""
+    topic = escape(_strip_emoji_symbols(card.get("topic_label") or "Untitled Insight"))
+    summary = escape(_strip_emoji_symbols(card.get("executive_summary") or ""))
+    trend = escape(str(card.get("trend_signal") or "unknown").upper())
+    trend_class = _trend_css_class(str(card.get("trend_signal") or "unknown"))
+    source_counts = card.get("source_type_counts") or {}
+    source_total = int(card.get("source_doc_count") or 0)
+    if source_total <= 0 and isinstance(source_counts, dict):
+        source_total = sum(int(v) for v in source_counts.values())
+
+    st.markdown(
+        (
+            '<div class="cluster-card">'
+            f'<div class="cluster-card-topic">{topic} '
+            f'<span class="trend-badge {trend_class}">{trend}</span></div>'
+            f'<p class="discover-card-summary">{summary}</p>'
+            f"<div>{_source_pills_html(source_counts)}</div>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+    cols = st.columns(2)
+    with cols[0]:
+        if st.button(
+            "Read Full Report ->",
+            key=f"read_report_{card.get('id')}",
+            use_container_width=True,
+        ):
+            st.session_state.selected_insight_id = card.get("id")
+            st.session_state.current_page = "InsightDetail"
+            st.rerun()
+    with cols[1]:
+        if st.button(
+            f"See all {source_total} sources",
+            key=f"open_sources_{card.get('id')}",
+            use_container_width=True,
+        ):
+            _clear_source_card_flip_state(str(card.get("id") or ""))
+            st.session_state.drawer_insight_id = card.get("id")
+            st.session_state.show_sources_drawer = True
+            st.rerun()
+
+
+def _render_insight_feed(project_id: str) -> None:
+    """Render the main insights feed."""
+    cards = _api.get_insights(project_id)
+    if not cards:
+        st.info("Insights are being generated...")
+        with st.spinner("Generating clustered insights..."):
+            st.empty()
+        return
+    grid_count = 3
+    cols = st.columns(grid_count)
+    for idx, card in enumerate(cards):
+        with cols[idx % grid_count]:
+            _render_cluster_card(card)
+
+
+def _compact_count(value: object) -> str:
+    """Format numeric counts into compact human-readable units."""
+    try:
+        n = int(float(value or 0))
+    except Exception:
+        return ""
+    if n <= 0:
+        return ""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M".rstrip("0").rstrip(".")
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K".rstrip("0").rstrip(".")
+    return str(n)
+
+
+def _format_published_label(value: object) -> str:
+    """Format source published value into short date label."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    dt = _parse_to_ist(raw)
+    if dt:
+        return dt.strftime("%d %b %Y")
+    numeric = raw.replace(".", "", 1)
+    if numeric.isdigit():
+        try:
+            ts = float(raw)
+            if ts <= 0:
+                return ""
+            if ts > 1_000_000_000_000:
+                ts = ts / 1000.0
+            return (
+                datetime.fromtimestamp(ts, tz=UTC)
+                .astimezone(IST_TZ)
+                .strftime("%d %b %Y")
+            )
+        except Exception:
+            return ""
+    return ""
+
+
+def _collect_streamed_text(stream: Generator[str, None, None]) -> str:
+    """Collect streamed token chunks into one final text payload."""
+    parts: list[str] = []
+    for chunk in stream:
+        if isinstance(chunk, str) and chunk:
+            parts.append(chunk)
+    return "".join(parts).strip()
+
+
+def _render_source_card(doc: dict, insight_id: str) -> None:
+    """Render one source card with media, short front summary, and flip brief."""
+    title = _strip_emoji_symbols(doc.get("title") or "Untitled source")
+    source = str(doc.get("source") or "source")
+    doc_id = str(doc.get("id") or doc.get("url") or doc.get("title") or "")
+    flip_state_key = f"source_card_state_flip_{insight_id}_{doc_id}"
+    is_flipped = bool(st.session_state.get(flip_state_key, False))
+    flip_button_key = f"source_card_flip_btn_{insight_id}_{doc_id}"
+    back_button_key = f"source_card_back_btn_{insight_id}_{doc_id}"
+    url = str(doc.get("url") or "").strip()
+    summary_preview, summary_full = build_source_card_summaries(doc.get("summary"))
+    show_summary_button = should_show_source_summary_button(doc.get("summary"))
+    cover_url = str(doc.get("cover_url") or "").strip()
+    video_url = str(doc.get("video_url") or "").strip()
+    author = _strip_emoji_symbols(doc.get("author") or "").strip()
+    views_label = _compact_count(doc.get("views"))
+    likes_label = _compact_count(doc.get("likes"))
+    published_label = _format_published_label(doc.get("published_at"))
+    media_html = build_source_card_media(
+        source=source,
+        url=url,
+        cover_url=cover_url,
+        video_url=video_url,
+        source_label=_source_label(source),
+    )
+
+    title_html = escape(title)
+    if url:
+        title_html = f'<a href="{escape(url)}" target="_blank">{escape(title)}</a>'
+    meta_parts: list[str] = []
+    if author:
+        meta_parts.append(author)
+    if views_label:
+        meta_parts.append(f"{views_label} views")
+    if likes_label:
+        meta_parts.append(f"{likes_label} likes")
+    if published_label:
+        meta_parts.append(published_label)
+    meta_line = escape(" | ".join(meta_parts))
+
+    st.markdown(
+        (
+            '<div class="source-card-scene">'
+            f'<div class="source-card-flip-shell{" is-flipped" if is_flipped else ""}">'
+            '<div class="discover-card discover-card-face discover-card-face-front source-card-fixed-height">'
+            f"{media_html}"
+            '<div class="discover-card-body">'
+            f'<div class="discover-source-pill">{escape(_source_label(source))}</div>'
+            f'<div class="discover-card-title">{title_html}</div>'
+            f'<div class="discover-card-summary discover-card-summary-front">{escape(summary_preview or "No source summary available.")}</div>'
+            f'<div class="discover-card-meta">{meta_line}</div>'
+            "</div>"
+            "</div>"
+            '<div class="discover-card discover-card-face discover-card-face-back source-card-fixed-height">'
+            '<div class="discover-card-body discover-card-body-back">'
+            f'<div class="discover-card-summary discover-card-summary-back source-card-back-copy">{escape(summary_full or "No source summary available.")}</div>'
+            "</div>"
+            "</div>"
+            "</div>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+    if is_flipped:
+        if st.button("Back to Preview", key=back_button_key, use_container_width=True):
+            st.session_state[flip_state_key] = False
+            st.rerun()
         return
 
-    status = str(setup.get("status") or "unknown").strip().lower()
-    non_terminal = {"queued", "running", "pending", "processing"}
-    should_auto_refresh = (discover_item_count == 0) or (status in non_terminal)
-    st.session_state[f"discover_auto_refresh_needed_{project_id}"] = should_auto_refresh
+    if show_summary_button and st.button(
+        "View Full Summary", key=flip_button_key, use_container_width=True
+    ):
+        st.session_state[flip_state_key] = True
+        st.rerun()
+
+
+def _render_sources_drawer(project_id: str) -> None:
+    """Render sources drawer dialog for selected insight."""
+    insight_id = str(st.session_state.get("drawer_insight_id") or "").strip()
+
+    @st.dialog("Sources", width="large", dismissible=False)
+    def _dialog() -> None:
+        if st.button("Close", key="close_sources_dialog"):
+            _clear_source_card_flip_state(insight_id)
+            st.session_state.show_sources_drawer = False
+            st.session_state.drawer_insight_id = None
+            st.rerun()
+        # Prefer cached detail from _render_insight_detail to avoid duplicate API call
+        detail = st.session_state.get("cached_insight_detail")
+        if not detail or str((detail or {}).get("id") or "") != insight_id:
+            detail = _api.get_insight_detail(project_id, insight_id)
+        source_docs = (detail or {}).get("source_docs") or []
+        if not source_docs:
+            st.info("No sources found for this insight.")
+            return
+        st.markdown('<div class="sources-dialog-inner">', unsafe_allow_html=True)
+        cols = st.columns(3)
+        for idx, doc in enumerate(source_docs):
+            with cols[idx % len(cols)]:
+                _render_source_card(doc, insight_id)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    _dialog()
+
+
+def _render_insight_detail(project_id: str, insight_id: str) -> None:
+    """Render full-page insight detail view."""
+    detail = _api.get_insight_detail(project_id, insight_id)
+    if not detail:
+        st.warning("Insight not found or no longer available.")
+        return
+    st.session_state["cached_insight_detail"] = detail
+
+    top_cols = st.columns([1, 4, 1])
+    with top_cols[0]:
+        if st.button("Back to Insights", key="insight_back"):
+            _reset_insight_view_state()
+            st.session_state.current_page = "Discover"
+            st.rerun()
+    with top_cols[2]:
+        source_total = int(detail.get("source_doc_count") or 0)
+        if source_total <= 0:
+            source_total = len((detail.get("source_docs") or []))
+        if source_total <= 0:
+            source_total = sum(
+                int(v) for v in (detail.get("source_type_counts") or {}).values()
+            )
+        if st.button(f"See all {source_total} sources", key="insight_open_sources"):
+            _clear_source_card_flip_state(insight_id)
+            st.session_state.drawer_insight_id = insight_id
+            st.session_state.show_sources_drawer = True
+            st.rerun()
+
+    trend = str(detail.get("trend_signal") or "unknown")
+    st.markdown(
+        (
+            '<div class="insight-report-shell">'
+            f'<div class="insight-report-title">{escape(_strip_emoji_symbols(detail.get("topic_label") or "Insight"))} '
+            f'<span class="trend-badge {_trend_css_class(trend)}">{escape(trend.upper())}</span></div>'
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+    report_status = str(detail.get("full_report_status") or "pending")
+    report_text = str(detail.get("full_report") or "").strip()
+    cache = st.session_state.insight_report_cache
+    requested = st.session_state.insight_report_requested
+    request_key = f"{project_id}:{insight_id}"
+    drawer_open_for_insight = bool(
+        st.session_state.get("show_sources_drawer")
+        and str(st.session_state.get("drawer_insight_id") or "") == insight_id
+    )
+
+    if report_text:
+        cache[insight_id] = report_text
+        requested.add(request_key)
+        st.markdown(report_text)
+    elif report_status == "generating":
+        requested.add(request_key)
+        st.info("Generating full report...")
+    else:
+        if request_key not in requested and not drawer_open_for_insight:
+            requested.add(request_key)
+            with st.spinner("Generating full report..."):
+                streamed = _collect_streamed_text(
+                    _api.stream_full_report(project_id, insight_id)
+                )
+            if streamed:
+                cache[insight_id] = streamed
+                st.markdown(streamed)
+            elif cache.get(insight_id):
+                st.markdown(cache[insight_id])
+        elif report_status == "failed":
+            st.warning("Full report generation failed. Retry when ready.")
+            if st.button("Retry Full Report", key=f"retry_report_{insight_id}"):
+                requested.discard(request_key)
+                st.rerun()
+        else:
+            st.info("Full report is pending generation.")
+            if st.button("Generate Full Report", key=f"generate_report_{insight_id}"):
+                requested.discard(request_key)
+                st.rerun()
+
+    history = _api.get_followup_history(insight_id)
+    if history:
+        for message in history[-8:]:
+            role = str(message.get("role") or "assistant")
+            content = str(message.get("content") or "")
+            with st.chat_message(role):
+                st.markdown(content)
+
+    prompt = st.chat_input("Ask a follow-up from this cluster sources...")
+    if prompt:
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        with st.chat_message("assistant"):
+            st.write_stream(_api.stream_followup(insight_id, prompt))
 
 
 # ----------------------------------------------------------------
-# DISCOVER PAGE
+# INSIGHTS PAGE (Discover replacement)
 # ----------------------------------------------------------------
 if st.session_state.current_page == "Discover":
-    st.header("🔍 Discover")
-
+    st.header("Insights")
     project_id = st.session_state.selected_project_id
-
     if project_id:
-        proj_name = project_id
-        for p in st.session_state.projects:
-            if p["id"] == project_id:
-                proj_name = p["title"]
-                break
-
-        st.caption(f"Discover feed for **{proj_name}**")
-
-        col_refresh, col_sort = st.columns([1, 4])
-        with col_refresh:
-            if st.button("🔄 Refresh Feed"):
-                st.rerun()
-        with col_sort:
-            st.caption("Sorted by backend relevance score")
-
-        raw_items = _api.get_discover_feed(project_id)
-        items = [_to_discover_item(item) for item in raw_items]
-
-        _maybe_auto_refresh_discover(project_id, len(items))
-
         ingest_status = _api.get_ingest_status(project_id)
         _sync_project_chunk_count_from_ingest(project_id, ingest_status)
         _render_ingest_status(ingest_status)
 
-        if items:
-            tiktok_items = [item for item in items if item.get("source") == "tiktok"]
-            instagram_items = [item for item in items if item.get("source") == "instagram"]
-            youtube_items = [item for item in items if item.get("source") == "youtube"]
-            reddit_items = [item for item in items if item.get("source") == "reddit"]
-            x_items = [item for item in items if item.get("source") == "x"]
-            social_items = tiktok_items + instagram_items + youtube_items + reddit_items + x_items
-            paper_items = [item for item in items if item.get("source") == "paper"]
-            patent_items = [item for item in items if item.get("source") == "patent"]
-            news_items = [item for item in items if item.get("source") == "news"]
-            web_items = [item for item in items if item.get("source") == "search"]
-
-            (
-                tab_all,
-                tab_social,
-                tab_tiktok,
-                tab_instagram,
-                tab_youtube,
-                tab_reddit,
-                tab_x,
-                tab_papers,
-                tab_patents,
-                tab_news,
-                tab_web,
-            ) = st.tabs(
-                [
-                    f"All ({len(items)})",
-                    f"Social ({len(social_items)})",
-                    f"TikTok ({len(tiktok_items)})",
-                    f"Instagram ({len(instagram_items)})",
-                    f"YouTube ({len(youtube_items)})",
-                    f"Reddit ({len(reddit_items)})",
-                    f"X ({len(x_items)})",
-                    f"Papers ({len(paper_items)})",
-                    f"Patents ({len(patent_items)})",
-                    f"News ({len(news_items)})",
-                    f"Web ({len(web_items)})",
-                ]
-            )
-
-            with tab_all:
-                _render_discover_grid(items, empty_msg="No discover items yet.")
-
-            with tab_social:
-                _render_discover_grid(
-                    social_items,
-                    empty_msg="No social content yet.",
-                )
-
-            with tab_tiktok:
-                _render_discover_grid(tiktok_items, empty_msg="No TikTok content yet.")
-
-            with tab_instagram:
-                _render_discover_grid(instagram_items, empty_msg="No Instagram content yet.")
-
-            with tab_youtube:
-                _render_discover_grid(youtube_items, empty_msg="No YouTube content yet.")
-
-            with tab_reddit:
-                _render_discover_grid(reddit_items, empty_msg="No Reddit content yet.")
-
-            with tab_x:
-                _render_discover_grid(x_items, empty_msg="No X content yet.")
-
-            with tab_papers:
-                _render_discover_grid(
-                    paper_items,
-                    empty_msg="No papers found yet.",
-                )
-
-            with tab_patents:
-                _render_discover_grid(
-                    patent_items,
-                    empty_msg="No patents found yet.",
-                )
-
-            with tab_news:
-                _render_discover_grid(
-                    news_items,
-                    empty_msg="No news articles yet.",
-                )
-
-            with tab_web:
-                _render_discover_grid(
-                    web_items,
-                    empty_msg="No web results yet.",
-                )
-        else:
-            st.info(
-                "No discover items yet. Ingest may still be running in the background."
-            )
+        if st.button("Refresh Insights", key="refresh_insights_btn"):
+            accepted, message = _api.refresh_insights(project_id)
+            st.toast(message)
+            if not accepted:
+                st.info(message)
+            st.rerun()
+        _render_insight_feed(project_id)
     else:
-        st.info("Select a project from Home to open Discover.")
+        st.info("Select a project from Home to open Insights.")
         if st.button("Go to Home", key="discover_go_home"):
             st.session_state.current_page = "Home"
             st.rerun()
+
+
+if st.session_state.current_page == "InsightDetail":
+    project_id = st.session_state.selected_project_id
+    insight_id = st.session_state.selected_insight_id
+    if project_id and insight_id:
+        _render_insight_detail(project_id, insight_id)
+    else:
+        st.info("Select an insight from Discover first.")
+        if st.button("Back to Insights", key="insightdetail_back_fallback"):
+            _reset_insight_view_state()
+            st.session_state.current_page = "Discover"
+            st.rerun()
+
+
+if st.session_state.get("current_page") not in {"Discover", "InsightDetail"}:
+    st.session_state.show_sources_drawer = False
+    st.session_state.drawer_insight_id = None
+
+if (
+    st.session_state.get("current_page") in {"Discover", "InsightDetail"}
+    and st.session_state.get("show_sources_drawer")
+    and st.session_state.get("drawer_insight_id")
+    and st.session_state.get("selected_project_id")
+):
+    _render_sources_drawer(st.session_state.selected_project_id)

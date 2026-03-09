@@ -29,6 +29,17 @@ logger = structlog.get_logger(__name__)
 
 _OPENALEX_BASE_URL = "https://api.openalex.org/works"
 
+# Module-level HTTP client pool (reused across requests to prevent TLS overhead)
+_http_client: httpx.AsyncClient | None = None
+
+
+async def _get_http_client() -> httpx.AsyncClient:
+    """Get or create shared HTTP client pool for module."""
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(timeout=settings.PAPERS_OPENALEX_TIMEOUT_SECONDS)
+    return _http_client
+
 _LATEST_QUERY_TERMS: set[str] = {
     "latest",
     "recent",
@@ -209,8 +220,7 @@ def _reconstruct_abstract(inverted_index: dict | None) -> str:
 
     word_positions: list[tuple[int, str]] = []
     for word, positions in inverted_index.items():
-        for pos in positions:
-            word_positions.append((pos, word))
+        word_positions.extend((pos, word) for pos in positions)
 
     word_positions.sort()
     return " ".join(word for _, word in word_positions)
@@ -235,10 +245,10 @@ async def _get_works_with_retry(params: dict) -> dict | None:
     """
 
     async def _fetch() -> dict:
-        async with httpx.AsyncClient(timeout=settings.PAPERS_OPENALEX_TIMEOUT_SECONDS) as client:
-            response = await client.get(_OPENALEX_BASE_URL, params=params)
-            response.raise_for_status()
-            return response.json()
+        client = await _get_http_client()
+        response = await client.get(_OPENALEX_BASE_URL, params=params)
+        response.raise_for_status()
+        return response.json()
 
     # Wrap in rate limiter
     result = await retry_with_backoff(

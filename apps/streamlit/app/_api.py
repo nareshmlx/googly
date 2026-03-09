@@ -15,9 +15,8 @@ from collections.abc import Generator
 
 import httpx
 import jwt  # PyJWT
-import structlog
-
 import settings
+import structlog
 
 logger = structlog.get_logger(__name__)
 
@@ -26,6 +25,7 @@ logger = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 _DEV_TOKEN: str | None = None
+_DEV_USER_ID = os.getenv("FASTAPI_USER_ID", "00000000-0000-0000-0000-000000000001")
 
 
 def _get_bearer_token() -> str:
@@ -44,7 +44,7 @@ def _get_bearer_token() -> str:
     global _DEV_TOKEN
     if _DEV_TOKEN is None:
         _DEV_TOKEN = jwt.encode(
-            {"sub": "00000000-0000-0000-0000-000000000001"},
+            {"sub": _DEV_USER_ID},
             key="",
             algorithm="HS256",
         )
@@ -58,7 +58,7 @@ def _get_bearer_token() -> str:
 def _headers() -> dict[str, str]:
     return {
         "Authorization": f"Bearer {_get_bearer_token()}",
-        "X-User-ID": "00000000-0000-0000-0000-000000000001",
+        "X-User-ID": _DEV_USER_ID,
         "X-Internal-Token": os.getenv("APIM_INTERNAL_TOKEN", "dev-internal"),
     }
 
@@ -346,26 +346,179 @@ def delete_project(project_id: str) -> bool:
         return False
 
 
-def get_discover_feed(project_id: str) -> list[dict]:
-    """Return multi-source KB items for the Discover feed.
-
-    Returns an empty list on error or if the project has no discover content yet.
-    """
+def get_insights(project_id: str) -> list[dict]:
+    """Return insight cards for a project, or empty list on error."""
     try:
         with httpx.Client(timeout=settings.FASTAPI_DISCOVER_TIMEOUT) as client:
             resp = client.get(
-                f"{settings.FASTAPI_URL}/api/v1/projects/{project_id}/discover",
+                f"{settings.FASTAPI_URL}/api/v1/projects/{project_id}/insights",
                 headers=_headers(),
             )
             resp.raise_for_status()
-            return resp.json()
+            data = resp.json()
+            return data if isinstance(data, list) else []
+    except Exception as exc:
+        logger.warning("_api.get_insights.error", project_id=project_id, error=str(exc))
+        return []
+
+
+def get_insight_detail(project_id: str, insight_id: str) -> dict | None:
+    """Return one insight detail object."""
+    try:
+        with httpx.Client(timeout=settings.FASTAPI_DISCOVER_TIMEOUT) as client:
+            resp = client.get(
+                f"{settings.FASTAPI_URL}/api/v1/projects/{project_id}/insights/{insight_id}",
+                headers=_headers(),
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data if isinstance(data, dict) else None
     except Exception as exc:
         logger.warning(
-            "_api.get_discover_feed.error",
+            "_api.get_insight_detail.error",
             project_id=project_id,
-            timeout_seconds=settings.FASTAPI_DISCOVER_TIMEOUT,
+            insight_id=insight_id,
             error=str(exc),
         )
+        return None
+
+
+def refresh_insights(project_id: str) -> tuple[bool, str]:
+    """Enqueue insight refresh and return (accepted, message)."""
+    try:
+        with httpx.Client(timeout=settings.FASTAPI_DISCOVER_TIMEOUT) as client:
+            resp = client.post(
+                f"{settings.FASTAPI_URL}/api/v1/projects/{project_id}/insights/refresh",
+                headers=_headers(),
+            )
+            if resp.status_code != 202:
+                detail = _format_api_error_detail(resp)
+                return False, f"Refresh failed ({resp.status_code}): {detail or 'Unknown error'}"
+            payload = resp.json() if resp.content else {}
+            if isinstance(payload, dict):
+                status = str(payload.get("status") or "").strip().lower()
+                message = str(payload.get("message") or "").strip()
+                if status == "accepted":
+                    return True, (message or "Insights refresh enqueued")
+                return False, (message or "Insights refresh skipped")
+            return True, "Insights refresh enqueued"
+    except Exception as exc:
+        logger.warning("_api.refresh_insights.error", project_id=project_id, error=str(exc))
+        return False, "Could not enqueue insights refresh"
+
+
+def stream_full_report(project_id: str, insight_id: str) -> Generator[str, None, None]:
+    """Stream insight full report tokens via SSE endpoint."""
+    try:
+        with (
+            httpx.Client(timeout=None) as client,
+            client.stream(
+                "GET",
+                f"{settings.FASTAPI_URL}/api/v1/projects/{project_id}/insights/{insight_id}/report/stream",
+                headers={**_headers(), "Accept": "text/event-stream"},
+            ) as response,
+        ):
+            response.raise_for_status()
+            for raw_line in response.iter_lines():
+                if not raw_line.startswith("data: "):
+                    continue
+                data_str = raw_line[6:]
+                if data_str.strip() == "[DONE]":
+                    break
+                try:
+                    payload = json.loads(data_str)
+                    if payload.get("token"):
+                        yield str(payload["token"])
+                    elif payload.get("type") == "status":
+                        logger.info(
+                            "_api.stream_full_report.status",
+                            insight_id=insight_id,
+                            status=str(payload.get("status") or "unknown"),
+                        )
+                    elif payload.get("error"):
+                        logger.warning(
+                            "_api.stream_full_report.frame_error",
+                            insight_id=insight_id,
+                            error=str(payload.get("error") or ""),
+                        )
+                except json.JSONDecodeError:
+                    if data_str.strip():
+                        yield data_str
+    except httpx.HTTPStatusError as exc:
+        logger.warning("_api.stream_full_report.http_error", insight_id=insight_id, error=str(exc))
+        yield f"\n\n[API error {exc.response.status_code}]"
+    except Exception as exc:
+        logger.warning("_api.stream_full_report.error", insight_id=insight_id, error=str(exc))
+        yield f"\n\n[Connection error: {exc}]"
+
+
+def stream_followup(insight_id: str, message: str) -> Generator[str, None, None]:
+    """Stream follow-up tokens and convert control frames to readable UI text."""
+    payload = {"message": message}
+    try:
+        with (
+            httpx.Client(timeout=None) as client,
+            client.stream(
+                "POST",
+                f"{settings.FASTAPI_URL}/api/v1/insights/{insight_id}/followup",
+                headers={
+                    **_headers(),
+                    "Content-Type": "application/json",
+                    "Accept": "text/event-stream",
+                },
+                json=payload,
+            ) as response,
+        ):
+            response.raise_for_status()
+            for raw_line in response.iter_lines():
+                if not raw_line.startswith("data: "):
+                    continue
+                data_str = raw_line[6:]
+                if data_str.strip() == "[DONE]":
+                    break
+                try:
+                    frame = json.loads(data_str)
+                except json.JSONDecodeError:
+                    if data_str.strip():
+                        yield data_str
+                    continue
+
+                if frame.get("token"):
+                    yield str(frame["token"])
+                    continue
+                if frame.get("type") == "context_source":
+                    source = str(frame.get("source") or "")
+                    if source == "cluster_docs_expanded":
+                        yield "\n\n_Using related chunks from this insight's source documents._\n\n"
+                    else:
+                        yield "\n\n_Using direct cluster evidence._\n\n"
+                    continue
+                if frame.get("type") == "no_context":
+                    yield "\n\n[No relevant context found inside this insight's sources.]"
+                    continue
+                if frame.get("error"):
+                    yield f"\n\n[{frame['error']}]"
+    except httpx.HTTPStatusError as exc:
+        logger.warning("_api.stream_followup.http_error", insight_id=insight_id, error=str(exc))
+        yield f"\n\n[API error {exc.response.status_code}]"
+    except Exception as exc:
+        logger.warning("_api.stream_followup.error", insight_id=insight_id, error=str(exc))
+        yield f"\n\n[Connection error: {exc}]"
+
+
+def get_followup_history(insight_id: str) -> list[dict]:
+    """Return follow-up history rows for one insight."""
+    try:
+        with httpx.Client(timeout=settings.FASTAPI_DISCOVER_TIMEOUT) as client:
+            resp = client.get(
+                f"{settings.FASTAPI_URL}/api/v1/insights/{insight_id}/followup/history",
+                headers=_headers(),
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data if isinstance(data, list) else []
+    except Exception as exc:
+        logger.warning("_api.get_followup_history.error", insight_id=insight_id, error=str(exc))
         return []
 
 
@@ -405,26 +558,6 @@ def bootstrap_project(project_id: str, upload_ids: list[str]) -> dict | None:
             "_api.bootstrap_project.error",
             project_id=project_id,
             upload_count=len(upload_ids),
-            timeout_seconds=settings.FASTAPI_DISCOVER_TIMEOUT,
-            error=str(exc),
-        )
-        return None
-
-
-def get_setup_status(project_id: str) -> dict | None:
-    """Return project setup/bootstrap status for progress polling."""
-    try:
-        with httpx.Client(timeout=settings.FASTAPI_DISCOVER_TIMEOUT) as client:
-            resp = client.get(
-                f"{settings.FASTAPI_URL}/api/v1/projects/{project_id}/setup-status",
-                headers=_headers(),
-            )
-            resp.raise_for_status()
-            return resp.json()
-    except Exception as exc:
-        logger.warning(
-            "_api.get_setup_status.error",
-            project_id=project_id,
             timeout_seconds=settings.FASTAPI_DISCOVER_TIMEOUT,
             error=str(exc),
         )
@@ -497,8 +630,9 @@ def stream_chat(
         "session_id": session_id,
     }
     try:
-        with httpx.Client(timeout=None) as client:
-            with client.stream(
+        with (
+            httpx.Client(timeout=None) as client,
+            client.stream(
                 "POST",
                 f"{settings.FASTAPI_URL}/api/v1/chat/",
                 headers={
@@ -507,27 +641,28 @@ def stream_chat(
                     "Accept": "text/event-stream",
                 },
                 json=payload,
-            ) as response:
-                response.raise_for_status()
-                for raw_line in response.iter_lines():
-                    if raw_line.startswith("data: "):
-                        data_str = raw_line[6:]
-                        if data_str.strip() == "[DONE]":
-                            break
-                        try:
-                            obj = json.loads(data_str)
-                            # Support both {token: "..."} and {choices: [{delta: {content: "..."}}]}
-                            token = obj.get("token") or (
-                                (obj.get("choices") or [{}])[0]
-                                .get("delta", {})
-                                .get("content", "")
-                            )
-                            if token:
-                                yield token
-                        except (json.JSONDecodeError, KeyError, IndexError):
-                            # Raw text token (non-JSON SSE)
-                            if data_str:
-                                yield data_str
+            ) as response,
+        ):
+            response.raise_for_status()
+            for raw_line in response.iter_lines():
+                if raw_line.startswith("data: "):
+                    data_str = raw_line[6:]
+                    if data_str.strip() == "[DONE]":
+                        break
+                    try:
+                        obj = json.loads(data_str)
+                        # Support both {token: "..."} and {choices: [{delta: {content: "..."}}]}
+                        token = obj.get("token") or (
+                            (obj.get("choices") or [{}])[0]
+                            .get("delta", {})
+                            .get("content", "")
+                        )
+                        if token:
+                            yield token
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        # Raw text token (non-JSON SSE)
+                        if data_str:
+                            yield data_str
     except httpx.HTTPStatusError as exc:
         logger.warning("_api.stream_chat.http_error", error=str(exc))
         yield f"\n\n[API error {exc.response.status_code}]"

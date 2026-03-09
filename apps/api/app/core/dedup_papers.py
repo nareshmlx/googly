@@ -11,9 +11,9 @@ All functions are defensive and handle missing/malformed fields gracefully.
 """
 
 import re
-from difflib import SequenceMatcher
 
 import structlog
+from rapidfuzz import fuzz
 
 from app.core.config import settings
 
@@ -78,8 +78,8 @@ def titles_match(
     if len_ratio < 0.5:
         return False
 
-    # Use SequenceMatcher for fuzzy comparison
-    ratio = SequenceMatcher(None, norm1, norm2).ratio()
+    # Use rapidfuzz for fast fuzzy comparison (C++ implementation)
+    ratio = fuzz.ratio(norm1, norm2) / 100.0
     return ratio >= threshold
 
 

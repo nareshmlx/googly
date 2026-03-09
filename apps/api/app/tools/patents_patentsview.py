@@ -66,31 +66,33 @@ def _build_patentsview_query(
     must_match_terms: list[str] | None = None,
     domain_terms: list[str] | None = None,
 ) -> dict:
-    """Build PatentsView boolean query across title and abstract fields."""
-    must_match_terms = [str(term).strip() for term in (must_match_terms or []) if str(term).strip()]
-    domain_terms = [str(term).strip() for term in (domain_terms or []) if str(term).strip()]
-    terms = must_match_terms
-    if not terms:
-        terms = [query]
-    and_clauses: list[dict] = []
-    for term in terms:
-        and_clauses.append(
-            {
-                "_or": [
-                    {"_text_all": {"patent_title": term}},
-                    {"_text_all": {"patent_abstract": term}},
-                ]
-            }
-        )
-    if domain_terms:
-        domain_clause = {
-            "_or": [{"_text_all": {"patent_title": term}} for term in domain_terms]
-            + [{"_text_all": {"patent_abstract": term}} for term in domain_terms]
-        }
-        and_clauses.append(domain_clause)
-    if len(and_clauses) == 1:
-        return and_clauses[0]
-    return {"_and": and_clauses}
+    """Build a recall-oriented PatentsView query across title and abstract fields."""
+    candidate_terms = [
+        str(term).strip()
+        for term in [query, *(must_match_terms or []), *(domain_terms or [])]
+        if str(term).strip()
+    ]
+    unique_terms: list[str] = []
+    seen_terms: set[str] = set()
+    for term in candidate_terms:
+        normalized = term.lower()
+        if normalized in seen_terms:
+            continue
+        seen_terms.add(normalized)
+        unique_terms.append(term)
+
+    clauses = [
+        {"_text_all": {"patent_title": term}}
+        for term in unique_terms
+    ] + [
+        {"_text_all": {"patent_abstract": term}}
+        for term in unique_terms
+    ]
+    if not clauses:
+        return {"_text_all": {"patent_title": query}}
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"_or": clauses}
 
 
 async def _search_with_retry(query_payload: dict) -> dict | None:

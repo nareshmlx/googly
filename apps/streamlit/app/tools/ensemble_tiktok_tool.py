@@ -10,8 +10,6 @@ from datetime import datetime, timezone
 
 from ensembledata.api import EDClient
 
-# Global storage for discovered videos (will be accessed by Streamlit)
-_discovered_videos = []
 
 
 def _format_upload_date(video: dict) -> str:
@@ -34,17 +32,6 @@ def _format_upload_date(video: dict) -> str:
         return "Unknown"
 
 
-def get_discovered_videos():
-    """Return the list of discovered videos."""
-    return _discovered_videos
-
-
-def clear_discovered_videos():
-    """Clear the discovered videos list."""
-    global _discovered_videos
-    _discovered_videos = []
-
-
 def search_tiktok_hashtag(hashtag: str) -> str:
     """
     Search TikTok for videos related to a specific hashtag.
@@ -55,7 +42,6 @@ def search_tiktok_hashtag(hashtag: str) -> str:
     Returns:
         A formatted string containing search results with video information
     """
-    global _discovered_videos
 
     try:
         token = os.getenv("ENSEMBLE_API_TOKEN")
@@ -93,24 +79,6 @@ def search_tiktok_hashtag(hashtag: str) -> str:
             if cover.get("url_list"):
                 cover_url = cover["url_list"][0]
 
-            discovered_video = {
-                "hashtag": hashtag,
-                "video_id": video.get("aweme_id", ""),
-                "author_name": author.get("nickname", "Unknown"),
-                "author_username": author.get("unique_id", "unknown"),
-                "description": video.get("desc", "No description")[:200],
-                "likes": stats.get("digg_count", 0),
-                "comments": stats.get("comment_count", 0),
-                "shares": stats.get("share_count", 0),
-                "views": stats.get("play_count", 0),
-                "video_url": video_url,
-                "cover_url": cover_url,
-                "duration": video_data.get("duration", 0),
-                "upload_date": upload_date,
-            }
-
-            if not any(v["video_id"] == discovered_video["video_id"] for v in _discovered_videos):
-                _discovered_videos.append(discovered_video)
 
             formatted_results.append(f"\nVideo {i}:")
             formatted_results.append(

@@ -23,7 +23,7 @@ Schema:
   "expanded_terms": ["<optional related terms for recall>"],
   "domain_terms": ["<context terms that constrain domain relevance>"],
   "query_specificity": "<specific | broad>",
-  "confidence": <float 0.0–1.0>,
+  "confidence": <float 0.0-1.0>,
   "is_research_query": <true | false>,
   "target_domain": "<domain like techcrunch.com if user explicitly names a specific website/publication, else null>"
 }

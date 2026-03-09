@@ -28,6 +28,17 @@ logger = structlog.get_logger(__name__)
 
 _EXA_BASE_URL = "https://api.exa.ai/search"
 
+# Module-level HTTP client pool (reused across requests to prevent TLS overhead)
+_http_client: httpx.AsyncClient | None = None
+
+
+async def _get_http_client() -> httpx.AsyncClient:
+    """Get or create shared HTTP client pool for module."""
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(timeout=settings.EXA_TIMEOUT_SECONDS)
+    return _http_client
+
 
 def _cache_key(project_id: str, query: str, domains: list[str] | None = None) -> str:
     """Generate deterministic project-scoped cache key for a query."""
@@ -71,17 +82,17 @@ async def _search_with_retry(query: str, include_domains: list[str] | None = Non
         }
         if include_domains:
             payload["includeDomains"] = include_domains
-        async with httpx.AsyncClient(timeout=settings.EXA_TIMEOUT_SECONDS) as client:
-            response = await client.post(
-                _EXA_BASE_URL,
-                headers={
-                    "Authorization": f"Bearer {settings.EXA_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
-            response.raise_for_status()
-            return response.json()
+        client = await _get_http_client()
+        response = await client.post(
+            _EXA_BASE_URL,
+            headers={
+                "Authorization": f"Bearer {settings.EXA_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+        response.raise_for_status()
+        return response.json()
 
     # Wrap in rate limiter + retry
     result = await retry_with_backoff(
@@ -163,9 +174,17 @@ async def _search_impl(query: str, include_domains: list[str] | None = None) -> 
                     "title": r.get("title", ""),
                     "url": r.get("url", ""),
                     "content": text_content,
+                    "summary": text_content,
                     "score": r.get("score", 0.0),
                     "source": "exa",
                     "published_date": r.get("publishedDate"),
+                    "cover_url": (
+                        r.get("cover_url")
+                        or r.get("image")
+                        or r.get("image_url")
+                        or r.get("thumbnail_url")
+                        or ""
+                    ),
                     # Emit as `authors` list (consistent with all other tools).
                     # Exa returns a single string or None under `author`.
                     "authors": [r["author"]] if r.get("author") else [],

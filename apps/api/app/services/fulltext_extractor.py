@@ -19,10 +19,18 @@ def extract_text_from_asset(content_bytes: bytes, mime_type: str | None) -> Full
     try:
         reader = pypdf.PdfReader(io.BytesIO(content_bytes))
         page_count = min(len(reader.pages), int(settings.FULLTEXT_MAX_PAGES))
-        parts: list[str] = []
-        for idx in range(page_count):
-            parts.append((reader.pages[idx].extract_text() or "").strip())
-        text = "\n\n".join(part for part in parts if part).strip()
+
+        # Use a generator expression for potentially better memory efficiency and
+        # specify extraction_mode for improved handling of ambiguous Unicode characters.
+        # Filter out empty parts directly in the generator.
+        text_parts_generator = (
+            (reader.pages[idx].extract_text(extraction_mode="layout") or "").strip()
+            for idx in range(page_count)
+        )
+
+        # Join non-empty parts.
+        text = "\n\n".join(part for part in text_parts_generator if part).strip()
+
         if not text:
             return FulltextExtractResult(status="empty", page_count=page_count)
         return FulltextExtractResult(

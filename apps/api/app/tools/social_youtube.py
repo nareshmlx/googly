@@ -2,12 +2,15 @@
 
 import json
 import re
+from contextlib import suppress
 
 import httpx
 import structlog
 
 from app.core.cache_keys import build_search_cache_key, build_stale_cache_key
+from app.core.circuit import ensemble_breaker
 from app.core.config import settings
+from app.tools.social_common import RobustInt, extract_items_from_payload
 
 logger = structlog.get_logger(__name__)
 
@@ -55,24 +58,7 @@ def _extract_items(payload: object) -> list[dict]:
     """Best-effort extraction of list payloads from EnsembleData response envelopes."""
     if isinstance(payload, list):
         return [row for row in payload if isinstance(row, dict)]
-    if not isinstance(payload, dict):
-        return []
-
-    candidates = [
-        payload.get("data"),
-        payload.get("posts"),
-        payload.get("videos"),
-        payload.get("results"),
-    ]
-    for value in candidates:
-        if isinstance(value, list):
-            return [row for row in value if isinstance(row, dict)]
-        if isinstance(value, dict):
-            for nested_key in ("data", "posts", "videos", "results"):
-                nested_value = value.get(nested_key)
-                if isinstance(nested_value, list):
-                    return [row for row in nested_value if isinstance(row, dict)]
-    return []
+    return extract_items_from_payload(payload)
 
 
 def _text_from_runs(value: object) -> str:
@@ -177,15 +163,13 @@ async def search_youtube_videos(
         return results
     except Exception as exc:
         if redis:
-            try:
+            with suppress(Exception):
                 stale = await redis.get(stale_key)
                 if stale:
                     logger.info(
                         "social_youtube.serving_stale", project_id=project_id, error=str(exc)
                     )
                     return json.loads(stale)
-            except Exception:
-                pass
         raise
 
 
@@ -222,7 +206,8 @@ async def _search_youtube_videos_impl(
     async with httpx.AsyncClient(timeout=settings.SOCIAL_YOUTUBE_TIMEOUT_SECONDS) as client:
         for endpoint in _endpoint_candidates():
             try:
-                response = await client.get(
+                protected_get = ensemble_breaker(client.get)
+                response = await protected_get(
                     endpoint,
                     params=params,
                     headers={"Accept": "application/json"},
@@ -230,22 +215,12 @@ async def _search_youtube_videos_impl(
                 response.raise_for_status()
                 payload = response.json()
                 break
-            except httpx.HTTPStatusError as exc:
-                logger.warning(
-                    "social_youtube.endpoint_failed",
-                    query_preview=cleaned_query[:80],
-                    endpoint=endpoint,
-                    status_code=int(exc.response.status_code),
-                    response_preview=str(exc.response.text or "")[:200],
-                )
-                continue
             except Exception as exc:
                 logger.warning(
                     "social_youtube.endpoint_failed",
                     query_preview=cleaned_query[:80],
                     endpoint=endpoint,
                     error_type=type(exc).__name__,
-                    error=str(exc)[:200],
                 )
                 continue
     if payload is None:

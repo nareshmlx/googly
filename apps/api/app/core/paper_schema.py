@@ -7,7 +7,7 @@ All public functions return list[dict] and never raise — defensive coding per
 AGENTS.md Rule 4.
 """
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 import structlog
 
@@ -34,7 +34,7 @@ def _parse_year_from_date(date_str: str) -> int | None:
 
     for fmt in date_formats:
         try:
-            parsed = datetime.strptime(date_str.strip(), fmt)
+            parsed = datetime.strptime(date_str.strip(), fmt).replace(tzinfo=UTC)
             return parsed.year
         except (ValueError, AttributeError):
             continue

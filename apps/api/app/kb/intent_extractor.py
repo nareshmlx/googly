@@ -14,22 +14,17 @@ from datetime import UTC, datetime
 from typing import Any
 
 import structlog
-from openai import AsyncOpenAI
 
 from app.core.config import settings
+from app.core.openai_client import get_openai_client, openai_completions_with_circuit_breaker
+from app.core.query_sanitize import (
+    derive_must_match_terms,
+    extract_signal_terms,
+    sanitize_search_seed,
+    strip_labeled_text,
+)
 
 logger = structlog.get_logger(__name__)
-
-# Module-level singleton — avoids re-creating the httpx connection pool on every call.
-_openai_client: AsyncOpenAI | None = None
-
-
-def _get_client() -> AsyncOpenAI:
-    """Return (or lazily create) the module-level AsyncOpenAI client."""
-    global _openai_client
-    if _openai_client is None:
-        _openai_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
-    return _openai_client
 
 
 _EXTRACT_SYSTEM = """\
@@ -37,40 +32,99 @@ You are a domain-agnostic research intent analyst.
 Extract structured research intent from a project description.
 Output ONLY valid JSON — no prose, no markdown fences.
 
-Before producing JSON, reason through these questions internally:
-1. What is the most specific domain label? (e.g. "cosmetic_formulation", "battery_materials", "llm_evaluation")
-2. What named entities are relevant? (brands, companies, products, compounds, frameworks, standards)
-3. What technical terms are central?
-4. What practitioners or creators discuss this topic?
-5. What academic/journal terms would appear in a paper abstract about this topic?
-6. What hashtags are actually used on social platforms for this topic?
-7. What 1–3 word descriptive phrase best characterises this space for Instagram account search?
-
 Schema:
 {
   "domain": "<specific snake_case domain label, e.g. cosmetic_formulation, battery_recycling, llm_safety>",
-  "keywords": ["<expanded keyword1>", "<expanded keyword2>", ...],
+  "entities": ["<exact named entities such as brands, products, ingredients, compounds, standards>"],
+  "domain_terms": ["<supporting category, use-case, or technical context terms>"],
+  "keywords": ["<ordered keywords with anchors first, then supporting context>"],
+  "must_match_terms": ["<strongest anchors that must remain central to retrieval>"],
   "search_filters": {
     "news": "<natural language query for news APIs — domain terms/entities, no hashtags>",
     "papers": "<natural language query for academic paper APIs — technical/scientific terms, no hashtags, no # symbols>",
     "patents": "<natural language query for patent APIs — company names + technical terms, no hashtags>",
     "tiktok": "<hashtags for TikTok search when applicable; may be empty if topic is not social-native>",
-    "social": "<same as tiktok — kept for backwards compatibility>",
-    "instagram": "<1–3 word phrase for Instagram account search, no hashtags>"
+    "social": "<same as tiktok - kept for backwards compatibility>",
+    "instagram": "<1-3 word phrase for Instagram account search, no hashtags>"
   },
-  "confidence": <float 0.0–1.0>
+  "confidence": <float 0.0-1.0>
 }
 
 Rules:
-- domain: most specific label possible, always snake_case — think like a librarian classifying a journal
-- keywords: 5–10 terms — expand beyond the user's words to expert vocabulary
+- domain: most specific label possible, always snake_case - think like a librarian classifying a journal
+- entities: preserve exact multi-word phrases when the user names a brand, product, ingredient, company, framework, or standard
+- domain_terms: supporting context only; examples include category, use-case, problem, audience, or technical mechanism
+- keywords: 3-10 ordered terms; put the strongest anchors first, then supporting context
+- must_match_terms: 2-6 strongest anchors only; prefer exact named entities over generic descriptors
 - Never force a domain that is not present in the user description or sample text.
-- search_filters.papers: natural language only — no hashtags, no # symbols, no boolean operators
+- Never split a brand or product name into fragments when the full phrase is available.
+- Avoid weak generic terms such as "brand", "product", "products", "themes", "research", "analysis", "latest".
+- When brand + product are both present, include both in entities and must_match_terms.
+- When ingredient + category are present, keep the ingredient first and the category/context terms after it.
+- search_filters.papers: natural language only - no hashtags, no # symbols, no boolean operators
 - search_filters.tiktok: hashtag format (#) when used; keep concise and topic-focused
 - search_filters.social: exact copy of tiktok (backwards compatibility)
-- search_filters.instagram: SHORT — 1–3 words max, descriptive, no hashtags
+- search_filters.instagram: SHORT - 1-3 words max, descriptive, no hashtags
 - confidence: 1.0 = unambiguous domain, 0.5 = could be multiple domains
 - Output ONLY the JSON object, nothing else
+
+Examples:
+Input: "Track Vitamin C claim performance in skincare sunscreen and moisturizer products."
+Output:
+{
+  "domain": "skincare_claim_analysis",
+  "entities": ["Vitamin C"],
+  "domain_terms": ["skincare", "sunscreen", "moisturizer", "claim performance"],
+  "keywords": ["Vitamin C", "skincare", "sunscreen", "moisturizer", "claim performance"],
+  "must_match_terms": ["Vitamin C", "sunscreen", "moisturizer"],
+  "search_filters": {
+    "news": "Vitamin C skincare sunscreen moisturizer claim performance",
+    "papers": "Vitamin C skincare sunscreen moisturizer claim performance",
+    "patents": "Vitamin C sunscreen moisturizer formulation claims",
+    "tiktok": "#vitaminc #skincare #sunscreen #moisturizer",
+    "social": "#vitaminc #skincare #sunscreen #moisturizer",
+    "instagram": "vitamin c skincare"
+  },
+  "confidence": 0.89
+}
+
+Input: "Analyze La Roche-Posay Cicaplast Baume B5 and its barrier-repair positioning."
+Output:
+{
+  "domain": "skincare_products",
+  "entities": ["La Roche-Posay", "Cicaplast Baume B5"],
+  "domain_terms": ["barrier repair", "sensitive skin", "balm"],
+  "keywords": ["Cicaplast Baume B5", "La Roche-Posay", "barrier repair", "balm"],
+  "must_match_terms": ["La Roche-Posay", "Cicaplast Baume B5"],
+  "search_filters": {
+    "news": "La Roche-Posay Cicaplast Baume B5 barrier repair",
+    "papers": "Cicaplast Baume B5 barrier repair sensitive skin",
+    "patents": "La Roche-Posay Cicaplast Baume B5 balm formulation",
+    "tiktok": "#larocheposay #cicaplastbaumeb5 #barrierrepair",
+    "social": "#larocheposay #cicaplastbaumeb5 #barrierrepair",
+    "instagram": "laroche posay cicaplast"
+  },
+  "confidence": 0.94
+}
+
+Input: "Research ceramide ingredients in skincare products, focusing on anti-aging claims and clinical efficacy."
+Output:
+{
+  "domain": "skincare_ingredients",
+  "entities": ["ceramide"],
+  "domain_terms": ["skincare", "anti-aging claims", "clinical efficacy", "ingredient mechanisms"],
+  "keywords": ["ceramide", "skincare", "anti-aging claims", "clinical efficacy", "ingredient mechanisms"],
+  "must_match_terms": ["ceramide", "clinical efficacy", "anti-aging claims"],
+  "search_filters": {
+    "news": "ceramide skincare anti-aging claims clinical efficacy",
+    "papers": "ceramide skincare anti-aging claims clinical efficacy ingredient mechanisms",
+    "patents": "ceramide skincare formulation clinical efficacy",
+    "tiktok": "#ceramide #skincare #skinbarrier #antiaging",
+    "social": "#ceramide #skincare #skinbarrier #antiaging",
+    "instagram": "ceramide skincare"
+  },
+  "confidence": 0.9
+}
 """
 
 _REFINE_SYSTEM = """\
@@ -84,12 +138,12 @@ You will receive:
 Rules:
 - Only update the domain if the new content strongly suggests a different domain
   AND your confidence in the new domain is > 0.75
-- Merge keywords additively — union of existing + new, deduplicated, max 12 total
+- Merge keywords additively - union of existing + new, deduplicated, max 12 total
 - Update search_filters only if new keywords materially change the meaning of the search
 - Preserve all existing search_filters fields including tiktok, social, and instagram
 - search_filters.social must always equal search_filters.tiktok (backwards compatibility)
-- search_filters.instagram must remain SHORT — 1–3 words max, no hashtags
-- search_filters.papers must remain natural language only — no hashtags, no # symbols
+- search_filters.instagram must remain SHORT - 1-3 words max, no hashtags
+- search_filters.papers must remain natural language only - no hashtags, no # symbols
 - If nothing significant changed, return the existing_intent unchanged
 - Output ONLY the JSON object, nothing else
 """
@@ -124,60 +178,19 @@ _STOPWORD_KEYWORDS: set[str] = {
     "top",
     "new",
 }
-
-_BEAUTY_SCOPE_TERMS: set[str] = {
-    "beauty",
-    "cosmetic",
-    "cosmetics",
-    "skincare",
-    "skin",
-    "haircare",
-    "hair",
-    "makeup",
-    "fragrance",
-    "perfume",
-    "deodorant",
-    "moisturizer",
-    "sunscreen",
-    "balm",
-    "serum",
-    "toner",
-    "exfoliant",
-    "acne",
-    "pigmentation",
-    "bodycare",
-    "cleanser",
-    "foundation",
-    "concealer",
-    "lipstick",
-    "lip",
-    "lipbalm",
-    "lipgloss",
-    "mascara",
-    "eyeliner",
-    "blush",
-    "bronzer",
-    "primer",
-    "retinol",
-    "niacinamide",
-    "hyaluronic",
-    "ceramide",
-    "peptide",
-    "aha",
-    "bha",
-    "spf",
-    "parfum",
+_ANALYSIS_MODIFIER_KEYWORDS: set[str] = {
+    "claim",
+    "claims",
+    "drop",
+    "drop off",
+    "decline",
+    "declining",
+    "performance",
+    "risk",
+    "risks",
+    "theme",
+    "themes",
 }
-
-_BEAUTY_FALLBACK_KEYWORDS: list[str] = [
-    "skincare",
-    "makeup",
-    "fragrance",
-    "retinol",
-    "niacinamide",
-    "hyaluronic acid",
-    "peptides",
-]
 
 _RELATED_KEYWORD_HINTS: dict[str, list[str]] = {
     "cosmetic_formulation": [
@@ -227,34 +240,40 @@ async def extract_intent(
     Returns the parsed intent dict. On any LLM or parse failure, returns a
     safe default so project creation never fails due to intent extraction.
     """
+    clean_description = strip_labeled_text(description)
+    default_seed = sanitize_search_seed(clean_description, max_terms=8) or clean_description[:80]
     default_filters: dict[str, str] = {
-        "news": description[:80],
-        "papers": description[:80],
-        "patents": description[:80],
+        "news": default_seed,
+        "papers": default_seed,
+        "patents": default_seed,
         "tiktok": "",
         "social": "",
         "instagram": "",
     }
     default: dict[str, Any] = {
         "domain": "general",
+        "entities": [],
+        "domain_terms": [],
         "keywords": [],
+        "must_match_terms": [],
         "search_filters": default_filters,
         "confidence": 0.0,
     }
 
     if not settings.OPENAI_API_KEY:
         logger.warning("intent_extractor.no_api_key")
-        return _postprocess_intent(default, description=description)
+        return _postprocess_intent(default, description=clean_description)
 
-    prompt = f"Project description: {description}"
+    prompt = f"Project description: {clean_description}"
     if sample_text:
         prompt += f"\n\nSample document text (first 500 chars):\n{sample_text[:500]}"
 
     logger.info("intent_extractor.extract.start", description_preview=description[:60])
 
     try:
-        client = _get_client()
-        response = await client.chat.completions.create(
+        client = get_openai_client()
+        create_comp = openai_completions_with_circuit_breaker(client)
+        response = await create_comp(
             model=settings.INTENT_MODEL,
             messages=[
                 {"role": "system", "content": _EXTRACT_SYSTEM},
@@ -280,21 +299,21 @@ async def extract_intent(
         # social must always mirror tiktok — unconditional, never diverge.
         merged_filters["social"] = merged_filters.get("tiktok") or merged_filters.get("social", "")
         result = {**default, **intent, "search_filters": merged_filters}
-        result = _postprocess_intent(result, description=description)
+        result = _postprocess_intent(result, description=clean_description)
         return result
     except json.JSONDecodeError:
         logger.warning(
             "intent_extractor.extract.parse_error",
             description_preview=description[:60],
         )
-        return _postprocess_intent(default, description=description)
+        return _postprocess_intent(default, description=clean_description)
     except Exception as exc:
         logger.error(
             "intent_extractor.extract.error",
             error_type=type(exc).__name__,
             error=str(exc),
         )
-        return _postprocess_intent(default, description=description)
+        return _postprocess_intent(default, description=clean_description)
 
 
 async def refine_intent(
@@ -330,8 +349,9 @@ async def refine_intent(
     )
 
     try:
-        client = _get_client()
-        response = await client.chat.completions.create(
+        client = get_openai_client()
+        create_comp = openai_completions_with_circuit_breaker(client)
+        response = await create_comp(
             model=settings.INTENT_MODEL,
             messages=[
                 {"role": "system", "content": _REFINE_SYSTEM},
@@ -519,12 +539,6 @@ def _expand_related_keywords(domain: str, seed_keywords: list[str]) -> list[str]
     for domain_key, hints in _RELATED_KEYWORD_HINTS.items():
         if domain_key in domain:
             related.extend(hints)
-    if not related:
-        seed_joined = " ".join(seed_keywords).lower()
-        if any(
-            token in seed_joined for token in ("retinol", "niacinamide", "skincare", "cosmetic")
-        ):
-            related.extend(_RELATED_KEYWORD_HINTS["skincare"])
     return related
 
 
@@ -544,6 +558,33 @@ def _keyword_quality_filter(keywords: list[str]) -> list[str]:
     return filtered
 
 
+def _normalize_phrase_key(value: str) -> str:
+    """Return a normalized key for case-insensitive phrase deduplication."""
+    return re.sub(r"\s+", " ", str(value or "").strip().lower()).strip()
+
+
+def _clean_phrase_list(value: object, *, max_items: int = 12) -> list[str]:
+    """Preserve useful user/LLM phrases while removing empty or duplicate items."""
+    if not isinstance(value, list | tuple | set):
+        return []
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        text = str(item or "").replace("#", " ").strip()
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text:
+            continue
+        key = _normalize_phrase_key(text)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+        if len(out) >= max_items:
+            break
+    return out
+
+
 def _normalize_domain(domain: str, keywords: list[str], description: str) -> str:
     """Normalize domain label to snake_case and infer from context when missing."""
     raw = str(domain or "").strip().lower().replace(" ", "_")
@@ -561,11 +602,29 @@ def _normalize_domain(domain: str, keywords: list[str], description: str) -> str
 def _derive_hashtag_terms(keywords: list[str], description: str) -> list[str]:
     """Derive compact, high-signal hashtag terms from keywords/description."""
     blocked = _STOPWORD_KEYWORDS | _GENERIC_KEYWORDS
-    source_tokens = _tokenize(" ".join(keywords))
-    if not source_tokens:
-        source_tokens = _tokenize(description)
     out: list[str] = []
     seen: set[str] = set()
+
+    for phrase in keywords:
+        raw_parts = _tokenize(phrase)
+        if len(raw_parts) > 1:
+            parts = [token for token in raw_parts if token not in blocked and len(token) >= 1]
+        else:
+            parts = [token for token in raw_parts if token not in blocked and len(token) >= 2]
+        if not parts:
+            continue
+        compact = "".join(parts) if len(parts) > 1 else parts[0]
+        if compact in seen or len(compact) < 3:
+            continue
+        seen.add(compact)
+        out.append(compact)
+        if len(out) >= 4:
+            return out
+
+    if len(out) >= 3:
+        return out
+
+    source_tokens = _tokenize(description)
     for token in source_tokens:
         if token in blocked or len(token) < 3:
             continue
@@ -576,6 +635,30 @@ def _derive_hashtag_terms(keywords: list[str], description: str) -> list[str]:
         if len(out) >= 4:
             break
     return out
+
+
+def _order_keywords_for_intent(keywords: list[str]) -> list[str]:
+    """Prioritize anchor and product terms ahead of generic analysis modifiers."""
+    ranked: list[tuple[int, int, str]] = []
+    for index, keyword in enumerate(keywords):
+        text = str(keyword or "").strip()
+        if not text:
+            continue
+        lowered = text.lower()
+        tokens = _tokenize(lowered)
+        has_compound_shape = " " in lowered or any(len(token) <= 2 for token in tokens)
+        is_analysis_modifier = lowered in _ANALYSIS_MODIFIER_KEYWORDS
+        if has_compound_shape and is_analysis_modifier:
+            priority = 2
+        elif has_compound_shape:
+            priority = 0
+        elif is_analysis_modifier:
+            priority = 2
+        else:
+            priority = 1
+        ranked.append((priority, index, text))
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    return [item[2] for item in ranked]
 
 
 def _enforce_dynamic_filters(search_filters: dict, keywords: list[str], description: str) -> dict:
@@ -612,30 +695,72 @@ def _build_minimum_keywords(
     *,
     description: str,
     domain: str,
+    entities: list[str],
+    domain_terms: list[str],
     llm_keywords: list[str],
     search_filters: dict,
 ) -> list[str]:
     """
-    Build a robust 5–10 keyword list with related terms and deterministic fallback.
+    Build a robust 5-10 keyword list with related terms and deterministic fallback.
     """
-    seeds = _keyword_quality_filter(llm_keywords)
-    related = _expand_related_keywords(domain, seeds)
     filter_tokens = [
         search_filters.get("news", ""),
         search_filters.get("papers", ""),
         search_filters.get("patents", ""),
         search_filters.get("instagram", ""),
     ]
-    description_terms = _tokenize(description)[:20]
-    filter_terms = _tokenize(" ".join(str(x) for x in filter_tokens))[:20]
-    candidate_terms = seeds + related + filter_terms + description_terms
+    description_terms = extract_signal_terms(description, max_terms=20)
+    filter_terms = extract_signal_terms(" ".join(str(x) for x in filter_tokens), max_terms=20)
+    entity_terms = _keyword_quality_filter(entities)
+    domain_seed_terms = _keyword_quality_filter(domain_terms)
+    seeds = _keyword_quality_filter(llm_keywords)
+    candidate_terms = seeds + entity_terms + domain_seed_terms
     candidate_terms = _dedupe_keep_order(candidate_terms)
     candidate_terms = _keyword_quality_filter(candidate_terms)
     if len(candidate_terms) < 5:
-        candidate_terms.extend(_tokenize(description)[:8])
+        expansion_seed_terms = candidate_terms or filter_terms or description_terms
+        related = _expand_related_keywords(domain, expansion_seed_terms)
+        candidate_terms = candidate_terms + related + filter_terms + description_terms
         candidate_terms = _dedupe_keep_order(candidate_terms)
         candidate_terms = _keyword_quality_filter(candidate_terms)
     return candidate_terms[:10]
+
+
+def _build_must_match_terms(
+    *,
+    explicit_terms: list[str],
+    entities: list[str],
+    keywords: list[str],
+    domain_terms: list[str],
+    description: str,
+) -> list[str]:
+    """Preserve explicit anchors when present; derive only when they are missing."""
+    if explicit_terms:
+        merged_explicit = _clean_phrase_list([*entities, *explicit_terms], max_items=6)
+        if len(merged_explicit) >= 2:
+            return merged_explicit[:6]
+
+        derived_tail = derive_must_match_terms(
+            explicit_terms=[],
+            entities=entities,
+            keywords=keywords,
+            domain_terms=domain_terms,
+            description=description,
+            min_terms=3,
+            max_terms=6,
+        )
+        merged = _clean_phrase_list([*merged_explicit, *derived_tail], max_items=6)
+        return merged
+
+    return derive_must_match_terms(
+        explicit_terms=[],
+        entities=entities,
+        keywords=keywords,
+        domain_terms=domain_terms,
+        description=description,
+        min_terms=3,
+        max_terms=6,
+    )
 
 
 def _postprocess_intent(intent: dict, description: str) -> dict:
@@ -643,7 +768,7 @@ def _postprocess_intent(intent: dict, description: str) -> dict:
     Enforce intent invariants required by ingestion/search quality.
 
     Invariants:
-    - keywords must be 5–10 meaningful terms (non-generic where possible)
+    - keywords must be 5-10 meaningful terms (non-generic where possible)
     - social filter must mirror tiktok
     - instagram filter must remain short (max 3 words)
     - papers filter must be natural language (no hashtags)
@@ -662,26 +787,41 @@ def _postprocess_intent(intent: dict, description: str) -> dict:
     papers_text = str(search_filters.get("papers") or "").replace("#", " ").strip()
     search_filters["papers"] = papers_text
 
-    keywords = intent.get("keywords") or []
-    if not isinstance(keywords, list):
-        keywords = []
-    keywords = [str(k) for k in keywords]
+    entities = _clean_phrase_list(intent.get("entities"), max_items=8)
+    domain_terms = _clean_phrase_list(intent.get("domain_terms"), max_items=12)
+    explicit_keywords = _clean_phrase_list(intent.get("keywords"), max_items=12)
+    explicit_must_match = _clean_phrase_list(intent.get("must_match_terms"), max_items=6)
+
     normalized_keywords = _build_minimum_keywords(
         description=description,
         domain=str(intent.get("domain") or "general"),
-        llm_keywords=keywords,
+        entities=entities,
+        domain_terms=domain_terms,
+        llm_keywords=explicit_keywords,
         search_filters=search_filters,
     )
+    if not explicit_keywords:
+        normalized_keywords = _order_keywords_for_intent(normalized_keywords)
     normalized_domain = _normalize_domain(
         str(intent.get("domain") or "general"),
         normalized_keywords,
         description,
     )
     search_filters = _enforce_dynamic_filters(search_filters, normalized_keywords, description)
+    must_match_terms = _build_must_match_terms(
+        explicit_terms=explicit_must_match,
+        entities=entities,
+        keywords=normalized_keywords,
+        domain_terms=domain_terms,
+        description=description,
+    )
 
     return {
         **intent,
         "domain": normalized_domain,
+        "entities": entities,
+        "domain_terms": domain_terms,
         "keywords": normalized_keywords,
+        "must_match_terms": must_match_terms,
         "search_filters": search_filters,
     }

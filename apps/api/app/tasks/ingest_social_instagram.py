@@ -2,11 +2,13 @@
 
 import asyncio
 import math
+import re
 from datetime import UTC, datetime, timedelta
 
 import structlog
 
 from app.core.config import settings
+from app.core.query_sanitize import derive_must_match_terms
 from app.kb.ingester import RawDocument
 from app.tasks.ingest_utils import (
     REEL_RECENCY_DAYS,
@@ -27,13 +29,22 @@ from app.tools.social_instagram import (
 
 logger = structlog.get_logger(__name__)
 
+_INSTAGRAM_QUERY_NOISE_TERMS: set[str] = {
+    "product",
+    "products",
+    "official",
+    "brand",
+    "brands",
+    "research",
+    "project",
+    "goal",
+}
+
 
 def _clean_instagram_keyword_query(raw: str) -> str:
     """
     Convert a raw keyword into a safe short Instagram search query.
     """
-    import re
-
     cleaned = re.sub(r"[^a-zA-Z0-9\s]", " ", raw).strip()
     cleaned = re.sub(r"\s+", " ", cleaned)
     if not cleaned:
@@ -44,13 +55,70 @@ def _clean_instagram_keyword_query(raw: str) -> str:
     return " ".join(words)
 
 
+def _instagram_search_probes(
+    *,
+    intent: dict,
+    social_filter: str,
+    project_title: str = "",
+    project_description: str = "",
+) -> list[str]:
+    """Build bounded high-signal Instagram account-search probes."""
+    anchors = derive_must_match_terms(
+        explicit_terms=intent.get("must_match_terms") or [],
+        entities=intent.get("entities") or [],
+        keywords=intent.get("keywords") or [],
+        domain_terms=intent.get("domain_terms") or [],
+        description=" ".join(
+            value
+            for value in [social_filter, project_title, project_description]
+            if str(value or "").strip()
+        ),
+        min_terms=2,
+        max_terms=5,
+    )
+
+    probes: list[str] = []
+    seen: set[str] = set()
+
+    def _push(value: str) -> None:
+        cleaned = _clean_instagram_keyword_query(value)
+        if not cleaned:
+            return
+        if cleaned.lower() in _INSTAGRAM_QUERY_NOISE_TERMS:
+            return
+        key = cleaned.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        probes.append(cleaned)
+
+    if anchors:
+        primary = anchors[0]
+        _push(primary)
+        if len(probes) < 2:
+            for anchor in anchors[1:]:
+                if anchor.lower() in _INSTAGRAM_QUERY_NOISE_TERMS:
+                    continue
+                if len(primary.split()) == 1:
+                    combined = _clean_instagram_keyword_query(f"{primary} {anchor}")
+                    if combined and combined.lower() != primary.lower():
+                        _push(combined)
+                        break
+                _push(anchor)
+                if len(probes) >= 2:
+                    break
+
+    if not probes and social_filter:
+        _push(social_filter.replace("#", " "))
+
+    return probes[:2]
+
+
 def _normalize_hashtag_token(raw: str) -> str:
     """Normalize free text into a hashtag-safe token without spaces."""
     cleaned = _clean_instagram_keyword_query(raw)
     if not cleaned:
         return ""
-    import re
-
     compact = re.sub(r"\s+", "", cleaned).strip().lower()
     return compact if len(compact) >= 3 else ""
 
@@ -59,7 +127,6 @@ def _extract_hashtags(text: str) -> list[str]:
     """Extract cleaned hashtag terms from a social filter string."""
     if not text:
         return []
-    import re
 
     tags = re.findall(r"#([a-zA-Z0-9_]+)", text)
     out: list[str] = []
@@ -78,8 +145,6 @@ def _extract_hashtags(text: str) -> list[str]:
 
 def _instagram_handle_candidates(social_filter: str, intent: dict) -> list[str]:
     """Build candidate Instagram handle queries for fallback account lookup."""
-    import re
-
     candidates: list[str] = []
     seen: set[str] = set()
 
@@ -98,6 +163,11 @@ def _instagram_handle_candidates(social_filter: str, intent: dict) -> list[str]:
     explicit_handles = re.findall(r"@([A-Za-z0-9_.]{2,30})", str(social_filter or ""))
     for handle in explicit_handles:
         _push_candidate(handle)
+        if len(candidates) >= max(1, settings.INGEST_INSTAGRAM_ACCOUNT_CANDIDATES):
+            return candidates
+
+    for probe in _instagram_search_probes(intent=intent, social_filter=social_filter):
+        _push_candidate(probe)
         if len(candidates) >= max(1, settings.INGEST_INSTAGRAM_ACCOUNT_CANDIDATES):
             return candidates
 
@@ -121,6 +191,8 @@ def _instagram_handle_candidates(social_filter: str, intent: dict) -> list[str]:
             continue
         cleaned = _clean_instagram_keyword_query(cleaned)
         if not cleaned:
+            continue
+        if cleaned.lower() in _INSTAGRAM_QUERY_NOISE_TERMS:
             continue
 
         _push_candidate(cleaned)
@@ -174,6 +246,7 @@ async def _fetch_single_candidate(
 
     reels_out = []
     for reel in reels or []:
+        reel.setdefault("user_id", uid)
         if not reel.get("username"):
             reel["username"] = username
         reels_out.append(reel)
@@ -248,7 +321,7 @@ async def _fetch_instagram_reels_from_candidates(
         if isinstance(batch, BaseException):
             raise batch
         for reel in batch:
-            uid = reel.get("user", {}).get("pk") or reel.get("owner", {}).get("id")
+            uid = reel.get("user_id")
             if uid:
                 try:
                     uid = int(str(uid))

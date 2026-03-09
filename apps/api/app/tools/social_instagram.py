@@ -10,45 +10,50 @@ EnsembleData observed response times:
 SDK calls are synchronous — wrapped with asyncio.to_thread throughout.
 """
 
-import asyncio
 import json
 import os
+from contextlib import suppress
+from typing import Any
 
 import certifi
 import httpx
 import structlog
-
-try:
-    from ensembledata.api import EDClient
-except ImportError:  # pragma: no cover - environment-dependent optional dependency
-    EDClient = None  # type: ignore[assignment]
+from pydantic import BaseModel, Field
 
 from app.core.cache_keys import build_search_cache_key, build_stale_cache_key
 from app.core.config import settings
-from app.core.normalize import coerce_int
+from app.tools.social_common import (
+    RobustInt,
+    ensemble_sdk_call,
+)
+
+
+class InstagramPostSchema(BaseModel):
+    shortcode: str = Field(default="")
+    caption: str = Field(default="")
+    timestamp: Any = Field(default=None)
+    like_count: RobustInt = Field(default=0)
+    view_count: RobustInt = Field(default=0)
+    cover_url: str = Field(default="")
+    video_url: str = Field(default="")
+    username: str | None = Field(default=None)
 
 logger = structlog.get_logger(__name__)
 _SDK_WARNED = False
 
 
 def _ensure_ssl_ca_bundle() -> None:
-    """Ensure a valid CA bundle path exists for SDK/httpx TLS verification."""
+    """Retain the historical local helper name for TLS bootstrap tests/callers."""
     certifi_path = certifi.where()
     if certifi_path and os.path.exists(certifi_path):
-        # Only set defaults when caller/operator has not explicitly configured TLS bundle.
         os.environ.setdefault("SSL_CERT_FILE", certifi_path)
         os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi_path)
 
 
-def _sdk_available() -> bool:
-    """Return whether EnsembleData SDK is importable in this runtime."""
-    global _SDK_WARNED
-    if EDClient is None:
-        if not _SDK_WARNED:
-            logger.warning("social_instagram.sdk_missing")
-            _SDK_WARNED = True
-        return False
-    return True
+
+
+
+
 
 
 def _cache_key(project_id: str, tool: str, **kwargs) -> str:
@@ -89,50 +94,39 @@ async def instagram_search(project_id: str, text: str, redis=None) -> list[dict]
         return results
     except Exception as exc:
         if redis:
-            try:
+            with suppress(Exception):
                 stale = await redis.get(stale_key)
                 if stale:
                     logger.info(
                         "social_instagram.serving_stale", project_id=project_id, error=str(exc)
                     )
                     return json.loads(stale)
-            except Exception:
-                pass
-        raise
+        logger.warning(
+            "social_instagram.search_failed",
+            project_id=project_id,
+            error=str(exc),
+        )
+        return []
 
 
 async def _instagram_search_impl(text: str) -> list[dict]:
     """Internal implementation of Instagram search."""
+    result = await ensemble_sdk_call(
+        "instagram",
+        "instagram.search",
+        text=text,
+    )
+    if not result:
+        return []
 
-    if not settings.ENSEMBLE_API_TOKEN:
-        logger.warning("social_instagram.no_token")
+    data = (result.data or {}) if hasattr(result, "data") else {}
+    users_raw = data.get("users", [])
+    if not isinstance(users_raw, list):
         return []
-    if not _sdk_available():
-        return []
-    _ensure_ssl_ca_bundle()
 
-    logger.info("social_instagram.search.start", text_preview=text[:60])
-    try:
-        client = EDClient(token=settings.ENSEMBLE_API_TOKEN)
-        result = await asyncio.to_thread(lambda: client.instagram.search(text=text))
-        users_raw = (result.data or {}).get("users", [])
-        if not isinstance(users_raw, list):
-            logger.warning(
-                "social_instagram.search.unexpected_shape",
-                keys=list((result.data or {}).keys()),
-            )
-            return []
-        # Each entry wraps the real user object under the "user" key
-        items = [entry["user"] for entry in users_raw if entry.get("user")]
-        logger.info("social_instagram.search.success", result_count=len(items))
-        return items
-    except Exception:
-        safe_preview = text.encode("ascii", "ignore").decode("ascii")[:60]
-        try:
-            logger.exception("social_instagram.search.unexpected_error", text_preview=safe_preview)
-        except Exception:
-            logger.error("social_instagram.search.unexpected_error_fallback")
-        return []
+    # Each entry wraps the real user object under the "user" key
+    return [entry["user"] for entry in users_raw if entry.get("user")]
+
 
 
 async def instagram_user_reels(
@@ -166,16 +160,20 @@ async def instagram_user_reels(
         return results
     except Exception as exc:
         if redis:
-            try:
+            with suppress(Exception):
                 stale = await redis.get(stale_key)
                 if stale:
                     logger.info(
                         "social_instagram.serving_stale", project_id=project_id, error=str(exc)
                     )
                     return json.loads(stale)
-            except Exception:
-                pass
-        raise
+        logger.warning(
+            "social_instagram.user_reels_failed",
+            project_id=project_id,
+            user_id=user_id,
+            error=str(exc),
+        )
+        return []
 
 
 async def _instagram_user_reels_impl(
@@ -197,32 +195,23 @@ async def _instagram_user_reels_impl(
 
     Returns list of normalised reel dicts on success. Returns [] on any failure — never raises.
     """
-    if not settings.ENSEMBLE_API_TOKEN:
-        logger.warning("social_instagram.no_token")
-        return []
-    if not _sdk_available():
-        return []
-    _ensure_ssl_ca_bundle()
-
-    logger.info("social_instagram.reels.start", user_id=user_id, depth=depth)
     try:
-        client = EDClient(token=settings.ENSEMBLE_API_TOKEN)
-        result = await asyncio.to_thread(
-            lambda: client.instagram.user_reels(
-                user_id=user_id,
-                depth=depth,
-                include_feed_video=True,
-            )
+        result = await ensemble_sdk_call(
+            "instagram",
+            "instagram.user_reels",
+            user_id=user_id,
+            depth=depth,
+            include_feed_video=True,
         )
+        if not result:
+            return []
+
         reels_raw = (result.data or {}).get("reels", [])
         if not isinstance(reels_raw, list):
-            logger.warning(
-                "social_instagram.reels.unexpected_shape",
-                keys=list((result.data or {}).keys()),
-            )
             return []
 
         items = []
+
         for entry in reels_raw:
             media = entry.get("media") if isinstance(entry, dict) else None
             if not isinstance(media, dict):
@@ -240,26 +229,20 @@ async def _instagram_user_reels_impl(
             video_versions = media.get("video_versions") or []
             video_url = video_versions[0].get("url", "") if video_versions else ""
 
-            like_count = coerce_int(
-                media.get("like_count")
-                or (media.get("edge_media_preview_like") or {}).get("count")
-                or (media.get("edge_liked_by") or {}).get("count")
-            )
-            view_count = coerce_int(
-                media.get("play_count") or media.get("view_count") or media.get("video_view_count")
-            )
-
-            items.append(
+            model = InstagramPostSchema.model_validate(
                 {
                     "shortcode": media.get("code") or str(media.get("pk", "")),
                     "caption": caption,
                     "timestamp": media.get("taken_at"),
-                    "like_count": like_count,
-                    "view_count": view_count,
+                    "like_count": media.get("like_count")
+                    or (media.get("edge_media_preview_like") or {}).get("count")
+                    or (media.get("edge_liked_by") or {}).get("count") or 0,
+                    "view_count": media.get("play_count") or media.get("view_count") or media.get("video_view_count") or 0,
                     "cover_url": cover_url,
                     "video_url": video_url,
                 }
             )
+            items.append(model.model_dump(exclude_none=True))
 
         # Filter out reels older than oldest_timestamp
         if oldest_timestamp is not None:
@@ -378,7 +361,7 @@ async def instagram_hashtag_posts(
         return items, next_cursor
     except Exception as exc:
         if redis:
-            try:
+            with suppress(Exception):
                 stale = await redis.get(stale_key)
                 if stale:
                     data = json.loads(stale)
@@ -386,9 +369,13 @@ async def instagram_hashtag_posts(
                         "social_instagram.serving_stale", project_id=project_id, error=str(exc)
                     )
                     return data[0], data[1]
-            except Exception:
-                pass
-        raise
+        logger.warning(
+            "social_instagram.hashtag_posts_failed",
+            project_id=project_id,
+            hashtag=hashtag,
+            error=str(exc),
+        )
+        return [], None
 
 
 async def _instagram_hashtag_posts_impl(
@@ -497,29 +484,23 @@ async def _instagram_hashtag_posts_impl(
                 if not video_url:
                     video_url = str(node.get("video_url") or "")
 
-                like_count = coerce_int(
-                    node.get("like_count")
-                    or (node.get("edge_media_preview_like") or {}).get("count")
-                    or (node.get("edge_liked_by") or {}).get("count")
-                )
-                view_count = coerce_int(
-                    node.get("play_count") or node.get("view_count") or node.get("video_view_count")
-                )
-
-                items.append(
+                model = InstagramPostSchema.model_validate(
                     {
                         "shortcode": str(
                             node.get("code") or node.get("shortcode") or node.get("id") or ""
                         ),
                         "caption": _extract_caption_text(node),
                         "timestamp": node.get("taken_at") or node.get("taken_at_timestamp"),
-                        "like_count": like_count,
-                        "view_count": view_count,
+                        "like_count": node.get("like_count")
+                        or (node.get("edge_media_preview_like") or {}).get("count")
+                        or (node.get("edge_liked_by") or {}).get("count") or 0,
+                        "view_count": node.get("play_count") or node.get("view_count") or node.get("video_view_count") or 0,
                         "cover_url": cover_url,
                         "video_url": video_url,
                         "username": username,
                     }
                 )
+                items.append(model.model_dump(exclude_none=True))
 
             logger.info(
                 "social_instagram.hashtag_posts.success",

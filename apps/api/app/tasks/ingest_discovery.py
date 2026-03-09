@@ -72,6 +72,14 @@ async def _ingest_news(
                     "url": story.get("url") or "",
                     "source_name": story.get("source_name") or "",
                     "published_at": story.get("published_at") or "",
+                    "summary": story.get("content") or story.get("summary") or "",
+                    "cover_url": (
+                        story.get("cover_url")
+                        or story.get("image_url")
+                        or story.get("imageUrl")
+                        or story.get("thumbnail_url")
+                        or ""
+                    ),
                     "tool": "perigon",
                 },
             )
@@ -186,6 +194,14 @@ async def _ingest_web_source(
                 content=content,
                 metadata={
                     "url": row.get("url", ""),
+                    "summary": row.get("content") or row.get("snippet") or "",
+                    "cover_url": (
+                        row.get("cover_url")
+                        or row.get("image_url")
+                        or row.get("thumbnail_url")
+                        or row.get("image")
+                        or ""
+                    ),
                     "tool": tool_name,
                 },
             )

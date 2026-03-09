@@ -4,7 +4,9 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from app.kb.ingester import RawDocument
 from app.services import project_wizard
+from app.tasks import ingest_documents_handler as ingest_documents_handler_module
 from app.tasks.ingest_filters import (
     _filter_relevance,
     _filter_stage1_embedding,
@@ -19,6 +21,7 @@ from app.tasks.ingest_utils import (
     _social_must_terms,
     _social_web_url_allowed,
 )
+from app.tools.patents_patentsview import _build_patentsview_query
 
 
 @pytest.mark.asyncio
@@ -30,7 +33,7 @@ async def test_stage1_drops_bottom_40_percent() -> None:
     item_vecs = [[float(10 - i) / 10.0, float(i) / 10.0, 0.0] for i in range(10)]
 
     with patch("app.tasks.ingest_filters.embed_texts", new=AsyncMock()) as embed_texts_mock:
-        embed_texts_mock.return_value = [intent_vec] + item_vecs
+        embed_texts_mock.return_value = [intent_vec, *item_vecs]
         result = await _filter_stage1_embedding(items=items, intent_text="intent", redis=None)
 
     assert len(result) == 6
@@ -104,7 +107,75 @@ async def test_filter_relevance_paper_min_survivors_when_stage2_is_too_strict() 
             redis=None,
         )
 
-    assert len(result) == 0
+    assert len(result) == 3
+    assert result == items[:3]
+
+
+@pytest.mark.asyncio
+async def test_prepare_kept_documents_for_source_skips_second_strict_social_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shared ingest filtering should not reapply lexical strict terms for social docs."""
+    docs = [
+        RawDocument(
+            project_id="p1",
+            user_id="u1",
+            source="social_tiktok",
+            source_id="v1",
+            title="@creator",
+            content="Retinol routine breakdown",
+            metadata={"video_url": "https://tiktok.com/@creator/video/1"},
+        )
+    ]
+    filter_mock = AsyncMock(
+        return_value=[
+            {
+                "_idx": 0,
+                "title": "@creator",
+                "content": "Retinol routine breakdown",
+            }
+        ]
+    )
+    monkeypatch.setattr(ingest_documents_handler_module, "_filter_relevance", filter_mock)
+
+    kept_docs, diagnostics, source_completed = await (
+        ingest_documents_handler_module._prepare_kept_documents_for_source(
+            result=docs,
+            source="social_tiktok",
+            source_enabled=True,
+            oldest_timestamp=None,
+            strict_social_terms=["retinol"],
+            intent_text='{"must_match_terms":["retinol"]}',
+            redis=None,
+            expansion_meta={},
+            intent_embedding=None,
+        )
+    )
+
+    assert kept_docs == docs
+    assert diagnostics["kept"] == 1
+    assert source_completed is True
+    _, kwargs = filter_mock.await_args
+    assert kwargs["must_match_terms"] == []
+    assert kwargs["social_match_terms"] == []
+
+
+def test_build_patentsview_query_uses_query_recall_even_with_specific_terms() -> None:
+    """PatentsView query should not require every must-match term to hit in one record."""
+    payload = _build_patentsview_query(
+        "retinol encapsulation stability",
+        must_match_terms=["retinol", "encapsulation", "stability"],
+        domain_terms=["cosmetic"],
+    )
+
+    assert "_or" in payload
+    clauses = payload["_or"]
+    assert any(
+        clause == {"_text_all": {"patent_title": "retinol encapsulation stability"}}
+        or clause == {"_text_all": {"patent_abstract": "retinol encapsulation stability"}}
+        for clause in clauses
+    )
+    assert not any("_and" in clause for clause in clauses if isinstance(clause, dict))
 
 
 def test_query_for_patents_falls_back_to_keywords_and_entities() -> None:
@@ -346,6 +417,7 @@ async def test_wizard_synthesize_fallback_contains_defaults(
     assert payload["domain_focus"]
     assert isinstance(payload["key_entities"], list)
     assert isinstance(payload["must_match_terms"], list)
+    assert payload["must_match_terms"]
     assert payload["target_sources"]["web_tavily"] is False
     assert payload["target_sources"]["web_exa"] is False
 

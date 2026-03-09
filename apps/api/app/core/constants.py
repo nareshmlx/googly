@@ -1,3 +1,5 @@
+from typing import ClassVar
+
 EMBEDDING_DIM = 1536
 
 
@@ -23,6 +25,12 @@ class RedisKeys:
     PROJECTS_SUMMARY = "projects_summary:{user_id}"
     PROJECT_INGEST_STATUS = "ingest_status:{project_id}"
     PROJECT_SETUP_STATUS = "setup_status:{project_id}"
+    CLUSTER_LOCK = "cluster_lock:{project_id}"
+    CLUSTER_ENQUEUE_LOCK = "cluster_enqueue_lock:{project_id}"
+    CLUSTER_DIRTY = "cluster_dirty:{project_id}"
+    INSIGHT_REPORT_LOCK = "insight_report_lock:{insight_id}"
+    INSIGHTS_CACHE = "insights:v2:{project_id}"
+    FOLLOWUP_HISTORY = "followup:{insight_id}:{user_id}"
     FULLTEXT_ASSET_LOCK = "fulltext:asset:lock:{asset_id}"
     FULLTEXT_ASSET_STATUS = "fulltext:asset:status:{asset_id}"
     FULLTEXT_ASSET_DEDUP = "fulltext:asset:dedup:{project_id}:{source}:{source_id}:{url_hash}"
@@ -41,6 +49,14 @@ class RedisKeys:
     CIRCUIT_BREAKER_STATE = "circuit:{api}:state"
     CIRCUIT_BREAKER_FAILURE_COUNT = "circuit:{api}:failures"
     CIRCUIT_BREAKER_LAST_FAILURE = "circuit:{api}:last_failure"
+
+    @classmethod
+    def arq_queue(cls, queue: str = "") -> str:
+        """Return the ARQ queue key, omitting the suffix for the default queue."""
+        queue_name = str(queue or "").strip()
+        if not queue_name:
+            return "arq:queue"
+        return cls.ARQ_QUEUE.format(queue=queue_name)
 
 
 class RedisTTL:
@@ -62,6 +78,11 @@ class RedisTTL:
     PROJECTS_SUMMARY = 300  # 5 minutes
     PROJECT_INGEST_STATUS = 86400  # 24 hours
     PROJECT_SETUP_STATUS = 86400  # 24 hours
+    CLUSTER_LOCK = 600  # 10 minutes
+    CLUSTER_ENQUEUE_LOCK = 600  # 10 minutes
+    INSIGHT_REPORT_LOCK = 900  # 15 minutes
+    INSIGHTS_CACHE = 300  # 5 minutes
+    FOLLOWUP_HISTORY = 604800  # 7 days
     FULLTEXT_ASSET_LOCK = 900  # 15 minutes
     FULLTEXT_ASSET_STATUS = 86400  # 24 hours
     FULLTEXT_ASSET_DEDUP = 604800  # 7 days
@@ -90,11 +111,11 @@ class EmbeddingBatchSize:
 
 
 class KBUpload:
-    ALLOWED_EXTENSIONS: frozenset[str] = frozenset({"pdf", "docx", "txt", "md"})
+    ALLOWED_EXTENSIONS: ClassVar[frozenset[str]] = frozenset({"pdf", "docx", "txt", "md"})
 
 
 class ProjectRefresh:
-    VALID_STRATEGIES: frozenset[str] = frozenset({"once", "daily", "weekly", "on_demand"})
+    VALID_STRATEGIES: ClassVar[frozenset[str]] = frozenset({"once", "daily", "weekly", "on_demand"})
 
 
 class SourceType:
@@ -109,7 +130,7 @@ class SourceType:
     SEARCH = "search"
     UPLOAD = "upload"
 
-    SOCIAL_SOURCES: frozenset[str] = frozenset(
+    SOCIAL_SOURCES: ClassVar[frozenset[str]] = frozenset(
         {
             SOCIAL_TIKTOK,
             SOCIAL_INSTAGRAM,
@@ -118,9 +139,9 @@ class SourceType:
             SOCIAL_X,
         }
     )
-    FULLTEXT_ELIGIBLE_SOURCES: frozenset[str] = frozenset({PAPER, PATENT})
-    DISCOVER_DIRECT_SOURCES: frozenset[str] = frozenset({PAPER, PATENT, NEWS, SEARCH})
-    DISCOVER_SOURCE_MAP: dict[str, str] = {
+    FULLTEXT_ELIGIBLE_SOURCES: ClassVar[frozenset[str]] = frozenset({PAPER, PATENT})
+    DISCOVER_DIRECT_SOURCES: ClassVar[frozenset[str]] = frozenset({PAPER, PATENT, NEWS, SEARCH})
+    DISCOVER_SOURCE_MAP: ClassVar[dict[str, str]] = {
         SOCIAL_TIKTOK: "tiktok",
         SOCIAL_INSTAGRAM: "instagram",
         SOCIAL_YOUTUBE: "youtube",

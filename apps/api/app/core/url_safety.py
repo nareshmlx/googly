@@ -5,7 +5,7 @@ from urllib.parse import urlparse
 
 _BLOCKED_HOSTNAMES = {
     "localhost",
-    "0.0.0.0",
+    "0.0.0.0",  # noqa: S104
     "127.0.0.1",
     "::1",
 }
@@ -38,7 +38,7 @@ def is_safe_public_url(url: str, allowed_domains: set[str] | None = None) -> tup
     if not hostname:
         return False, "missing_hostname"
 
-    if hostname in _BLOCKED_HOSTNAMES or hostname.endswith(".local") or hostname.endswith(".internal"):
+    if hostname in _BLOCKED_HOSTNAMES or hostname.endswith((".local", ".internal")):
         return False, "blocked_hostname"
 
     if _is_private_ip(hostname):

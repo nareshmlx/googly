@@ -14,7 +14,14 @@ from app.core.redis import get_redis
 
 logger = structlog.get_logger(__name__)
 
-async def check_user_rate_limit(user_id: str, endpoint: str) -> None:
+
+async def check_user_rate_limit(
+    user_id: str,
+    endpoint: str,
+    *,
+    limit: int | None = None,
+    window_seconds: int | None = None,
+) -> None:
     """
     Check if user has exceeded rate limit for the endpoint.
 
@@ -23,14 +30,25 @@ async def check_user_rate_limit(user_id: str, endpoint: str) -> None:
 
     Args:
         user_id: User ID to check
-        endpoint: Endpoint name (e.g., "chat")
+        endpoint: Endpoint name (e.g., "chat", "followup")
+        limit: Optional per-endpoint limit override (defaults to CHAT_RATE_LIMIT)
+        window_seconds: Optional per-endpoint window override (defaults to CHAT_RATE_WINDOW_SECONDS)
 
     Raises:
         HTTPException: 429 if rate limit exceeded
     """
+    if limit is None:
+        limit = settings.FOLLOWUP_RATE_LIMIT if endpoint == "followup" else settings.CHAT_RATE_LIMIT
+    if window_seconds is None:
+        window_seconds = (
+            settings.FOLLOWUP_RATE_WINDOW_SECONDS
+            if endpoint == "followup"
+            else settings.CHAT_RATE_WINDOW_SECONDS
+        )
+
     try:
         redis = await get_redis()
-        window = int(time.time()) // settings.CHAT_RATE_WINDOW_SECONDS
+        window = int(time.time()) // window_seconds
         key = f"ratelimit:user:{user_id}:{endpoint}:{window}"
 
         # Atomic increment + check
@@ -38,25 +56,25 @@ async def check_user_rate_limit(user_id: str, endpoint: str) -> None:
 
         if count == 1:
             # First request in this window - set expiry
-            await redis.expire(key, settings.CHAT_RATE_WINDOW_SECONDS * 2)
+            await redis.expire(key, window_seconds * 2)
 
-        if count > settings.CHAT_RATE_LIMIT:
+        if count > limit:
             logger.warning(
                 "rate_limit.exceeded",
                 user_id=user_id,
                 endpoint=endpoint,
                 count=count,
-                limit=settings.CHAT_RATE_LIMIT,
-                window_seconds=settings.CHAT_RATE_WINDOW_SECONDS,
+                limit=limit,
+                window_seconds=window_seconds,
             )
             raise HTTPException(
                 status_code=429,
                 detail=(
                     "Rate limit exceeded. Maximum "
-                    f"{settings.CHAT_RATE_LIMIT} requests per "
-                    f"{settings.CHAT_RATE_WINDOW_SECONDS} seconds."
+                    f"{limit} requests per "
+                    f"{window_seconds} seconds."
                 ),
-                headers={"Retry-After": str(settings.CHAT_RATE_WINDOW_SECONDS)},
+                headers={"Retry-After": str(window_seconds)},
             )
 
         logger.debug(
@@ -64,7 +82,7 @@ async def check_user_rate_limit(user_id: str, endpoint: str) -> None:
             user_id=user_id,
             endpoint=endpoint,
             count=count,
-            limit=settings.CHAT_RATE_LIMIT,
+            limit=limit,
         )
 
     except HTTPException:
@@ -79,7 +97,7 @@ async def check_user_rate_limit(user_id: str, endpoint: str) -> None:
         )
 
 
-def check_chat_rate_limit(current_user: dict):
+def check_chat_rate_limit(current_user: dict):  # type: ignore[no-untyped-def]
     """
     FastAPI dependency factory for per-user chat rate limiting.
 

@@ -3,13 +3,30 @@
 import base64
 import json
 import re
+from contextlib import suppress
+from typing import Annotated, Any
 
 import httpx
 import structlog
+from pydantic import BaseModel, Field
 
 from app.core.cache_keys import build_search_cache_key, build_stale_cache_key
 from app.core.config import settings
-from app.core.normalize import coerce_int
+from app.tools.social_common import RobustInt, extract_items_from_payload
+
+
+
+
+class XPostSchema(BaseModel):
+    source_id: str = Field(default="")
+    content: str = Field(default="")
+    author: str = Field(default="")
+    likes: RobustInt = Field(default=0)
+    retweets: RobustInt = Field(default=0)
+    replies: RobustInt = Field(default=0)
+    quotes: RobustInt = Field(default=0)
+    published_at: str = Field(default="")
+    url: str = Field(default="")
 
 logger = structlog.get_logger(__name__)
 
@@ -61,23 +78,7 @@ def _extract_items(payload: object) -> list[dict]:
     """Extract list records from common API envelope shapes."""
     if isinstance(payload, list):
         return [row for row in payload if isinstance(row, dict)]
-    if not isinstance(payload, dict):
-        return []
-    candidates = [
-        payload.get("data"),
-        payload.get("posts"),
-        payload.get("tweets"),
-        payload.get("results"),
-    ]
-    for value in candidates:
-        if isinstance(value, list):
-            return [row for row in value if isinstance(row, dict)]
-        if isinstance(value, dict):
-            for nested_key in ("data", "posts", "tweets", "results"):
-                nested = value.get(nested_key)
-                if isinstance(nested, list):
-                    return [row for row in nested if isinstance(row, dict)]
-    return []
+    return extract_items_from_payload(payload)
 
 
 def _normalize_user_id(value: object) -> str:
@@ -90,13 +91,11 @@ def _normalize_user_id(value: object) -> str:
     match = re.search(r"(\d{3,})", raw)
     if match:
         return match.group(1)
-    try:
+    with suppress(Exception):
         decoded = base64.b64decode(raw).decode("utf-8", errors="ignore")
         match = re.search(r"(\d{3,})", decoded)
         if match:
             return match.group(1)
-    except Exception:
-        pass
     return ""
 
 
@@ -223,34 +222,19 @@ async def _get_json_from_candidates(
     """Call candidate endpoints and return the first successful JSON payload."""
     for endpoint in _endpoint_candidates(path):
         try:
-            response = await client.get(
+            protected_get = ensemble_breaker(client.get)
+            response = await protected_get(
                 endpoint,
                 params=params,
                 headers={"Accept": "application/json"},
             )
             if _is_auth_required_error(int(response.status_code), response.text):
-                logger.warning(
-                    "social_x.auth_required",
-                    endpoint=endpoint,
-                    path=path,
-                    status_code=int(response.status_code),
-                )
                 raise _XAuthRequiredError(response.text[:200])
             response.raise_for_status()
             payload = response.json()
             if _is_auth_required_error(None, payload):
-                logger.warning("social_x.auth_required", endpoint=endpoint, path=path)
                 raise _XAuthRequiredError(str(payload)[:200])
             return payload
-        except httpx.HTTPStatusError as exc:
-            logger.warning(
-                "social_x.endpoint_failed",
-                endpoint=endpoint,
-                path=path,
-                status_code=int(exc.response.status_code),
-                response_preview=str(exc.response.text or "")[:200],
-            )
-            continue
         except _XAuthRequiredError:
             raise
         except Exception as exc:
@@ -259,7 +243,6 @@ async def _get_json_from_candidates(
                 endpoint=endpoint,
                 path=path,
                 error_type=type(exc).__name__,
-                error=str(exc)[:200],
             )
             continue
     return None
@@ -327,13 +310,11 @@ async def search_x_posts(
         return results
     except Exception as exc:
         if redis:
-            try:
+            with suppress(Exception):
                 stale = await redis.get(stale_key)
                 if stale:
                     logger.info("social_x.serving_stale", project_id=project_id, error=str(exc))
                     return json.loads(stale)
-            except Exception:
-                pass
         raise
 
 
@@ -429,22 +410,23 @@ async def _search_x_posts_impl(query: str, max_results: int = 20) -> list[dict]:
         if not url:
             url = f"https://x.com/i/web/status/{source_id}"
 
-        results.append(
+        model = XPostSchema.model_validate(
             {
                 "source_id": source_id,
                 "content": content,
                 "author": username
                 or str(normalized.get("name") or normalized.get("author") or "").strip(),
-                "likes": coerce_int(normalized.get("favorite_count") or normalized.get("likes")),
-                "retweets": coerce_int(normalized.get("retweet_count") or normalized.get("retweets")),
-                "replies": coerce_int(normalized.get("reply_count") or normalized.get("replies")),
-                "quotes": coerce_int(normalized.get("quote_count") or normalized.get("quotes")),
+                "likes": normalized.get("favorite_count") or normalized.get("likes") or 0,
+                "retweets": normalized.get("retweet_count") or normalized.get("retweets") or 0,
+                "replies": normalized.get("reply_count") or normalized.get("replies") or 0,
+                "quotes": normalized.get("quote_count") or normalized.get("quotes") or 0,
                 "published_at": str(
                     normalized.get("create_time") or normalized.get("created_at") or ""
                 ).strip(),
                 "url": url,
             }
         )
+        results.append(model.model_dump())
         if len(results) >= bounded_max:
             break
 

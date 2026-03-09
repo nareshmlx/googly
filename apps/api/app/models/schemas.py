@@ -10,6 +10,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from app.core.config import settings
+
 
 def _validate_uuid(value: str, field_name: str) -> str:
     """Reject malformed UUIDs early so they never reach the DB."""
@@ -188,6 +190,7 @@ class IngestStatusResponse(BaseModel):
     total_chunks: int | None = None
     source_counts: dict = Field(default_factory=dict)
     source_diagnostics: dict = Field(default_factory=dict)
+    cluster_diagnostics: dict = Field(default_factory=dict)
     fulltext_enqueued: int = 0
     enrichment: dict = Field(default_factory=dict)
 
@@ -218,6 +221,90 @@ class DiscoverItem(BaseModel):
     published_at: str | None = None
     score: float = 0.0
     metadata: dict = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Insights
+# ---------------------------------------------------------------------------
+
+
+class KeyFinding(BaseModel):
+    text: str
+
+
+class InsightCard(BaseModel):
+    id: str
+    topic_label: str
+    executive_summary: str
+    key_findings: list[str] = Field(default_factory=list)
+    trend_signal: Literal["rising", "stable", "declining", "emerging", "unknown"] = "unknown"
+    cluster_size: int
+    source_doc_count: int = 0
+    full_report_status: Literal["pending", "generating", "done", "failed"] = "pending"
+    source_type_counts: dict[str, int] = Field(default_factory=dict)
+
+
+class SourceDocSummary(BaseModel):
+    id: str
+    title: str
+    url: str | None = None
+    summary: str | None = None
+    source: str
+    cover_url: str | None = None
+    video_url: str | None = None
+    author: str | None = None
+    views: int | None = None
+    likes: int | None = None
+    published_at: str | None = None
+
+
+class InsightDetail(BaseModel):
+    id: str
+    topic_label: str
+    executive_summary: str
+    key_findings: list[str] = Field(default_factory=list)
+    trend_signal: Literal["rising", "stable", "declining", "emerging", "unknown"] = "unknown"
+    contradictions: str | None = None
+    cluster_size: int
+    source_doc_count: int = 0
+    chunk_ids: list[str] = Field(default_factory=list)
+    source_doc_ids: list[str] = Field(default_factory=list)
+    full_report: str | None = None
+    full_report_status: Literal["pending", "generating", "done", "failed"] = "pending"
+    source_type_counts: dict[str, int] = Field(default_factory=dict)
+    source_docs: list[SourceDocSummary] = Field(default_factory=list)
+
+
+class ClusterExtraction(BaseModel):
+    topic_label: str = Field(..., min_length=1, max_length=200)
+    executive_summary: str = Field(..., min_length=1, max_length=300)
+    key_findings: list[str] = Field(default_factory=list, max_length=settings.CLUSTER_MAX_KEY_FINDINGS)
+    trend_signal: Literal["rising", "stable", "declining", "emerging", "unknown"]
+    contradictions: str | None = None
+
+
+class FollowupRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=10000)
+
+    @field_validator("message")
+    @classmethod
+    def validate_message(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("message must not be whitespace-only")
+        return v
+
+
+class FollowupMessage(BaseModel):
+    id: str
+    role: Literal["user", "assistant"]
+    content: str
+    context_source: Literal["cluster", "cluster_docs_expanded"]
+    created_at: str
+
+
+class InsightRefreshResponse(BaseModel):
+    status: str
+    message: str
 
 
 # ---------------------------------------------------------------------------

@@ -28,6 +28,17 @@ logger = structlog.get_logger(__name__)
 
 _TAVILY_BASE_URL = "https://api.tavily.com/search"
 
+# Module-level HTTP client pool (reused across requests to prevent TLS overhead)
+_http_client: httpx.AsyncClient | None = None
+
+
+async def _get_http_client() -> httpx.AsyncClient:
+    """Get or create shared HTTP client pool for module."""
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(timeout=settings.TAVILY_TIMEOUT_SECONDS)
+    return _http_client
+
 
 def _cache_key(project_id: str, query: str, domains: list[str] | None = None) -> str:
     """Generate deterministic project-scoped cache key for a query."""
@@ -64,14 +75,14 @@ async def _search_with_retry(query: str, include_domains: list[str] | None = Non
             ),
             "include_answer": False,  # We synthesize our own answer
             "include_raw_content": False,
-            "include_images": False,
+            "include_images": True,
         }
         if include_domains:
             payload["include_domains"] = include_domains
-        async with httpx.AsyncClient(timeout=settings.TAVILY_TIMEOUT_SECONDS) as client:
-            response = await client.post(_TAVILY_BASE_URL, json=payload)
-            response.raise_for_status()
-            return response.json()
+        client = await _get_http_client()
+        response = await client.post(_TAVILY_BASE_URL, json=payload)
+        response.raise_for_status()
+        return response.json()
 
     # Wrap in rate limiter + retry
     result = await retry_with_backoff(
@@ -136,14 +147,22 @@ async def _search_impl(query: str, include_domains: list[str] | None = None) -> 
     normalized = []
     for r in results:
         try:
+            images = r.get("images")
+            image_url = (
+                r.get("cover_url")
+                or r.get("image_url")
+                or (images[0] if isinstance(images, list) and images else "")
+            )
             normalized.append(
                 {
                     "title": r.get("title", ""),
                     "url": r.get("url", ""),
                     "content": r.get("content", ""),
+                    "summary": r.get("content", ""),
                     "score": r.get("score", 0.0),
                     "source": "tavily",
                     "published_date": r.get("published_date"),
+                    "cover_url": image_url or "",
                 }
             )
         except Exception:

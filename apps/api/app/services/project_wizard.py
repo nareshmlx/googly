@@ -11,7 +11,10 @@ from typing import Any
 import structlog
 
 from app.core.config import settings
-from app.core.openai_client import get_openai_client
+from app.core.openai_client import get_openai_client, openai_completions_with_circuit_breaker
+from app.core.query_sanitize import (
+    derive_must_match_terms,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -149,6 +152,8 @@ def _snake_case(text: str) -> str:
 
 
 def _clamp_score(value: object) -> float:
+    if not isinstance(value, int | float | str):
+        return 0.0
     try:
         score = float(value)
     except (TypeError, ValueError):
@@ -177,6 +182,31 @@ def _clean_list(value: object, *, max_items: int = 12) -> list[str]:
         if len(out) >= max_items:
             break
     return out
+
+
+def build_intent_seed_text(
+    *,
+    description: str,
+    domain_focus: str = "",
+    key_entities: object = None,
+    must_match_terms: object = None,
+) -> str:
+    """Build a concise extraction seed from the core query plus explicit anchors."""
+    base_description = str(description or "").strip()
+    seed_parts: list[str] = []
+
+    if base_description:
+        seed_parts.append(base_description)
+
+    for value in [str(domain_focus or "").strip(), *_clean_list(key_entities), *_clean_list(must_match_terms)]:
+        if not value:
+            continue
+        lowered_value = value.lower()
+        if any(lowered_value in part.lower() for part in seed_parts):
+            continue
+        seed_parts.append(value)
+
+    return " ".join(seed_parts).strip() or base_description
 
 
 def _normalize_qa_pairs(qa_pairs: list[dict] | None) -> list[dict[str, str]]:
@@ -396,7 +426,8 @@ async def _llm_json(
 
     try:
         client = get_openai_client()
-        response = await client.chat.completions.create(
+        create_comp = openai_completions_with_circuit_breaker(client)
+        response = await create_comp(
             model=settings.INTENT_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -505,11 +536,20 @@ def _fallback_synthesis(
     keywords = _clean_list(structured_intent.get("keywords"), max_items=8)
     entities = _clean_list(structured_intent.get("entities"), max_items=8)
     must_terms = _clean_list(structured_intent.get("must_match_terms"), max_items=8)
+    domain_terms = _clean_list(structured_intent.get("domain_terms"), max_items=8)
 
     if not entities:
         entities = keywords[:4]
     if not must_terms:
-        must_terms = keywords[:4]
+        must_terms = derive_must_match_terms(
+            explicit_terms=[],
+            entities=entities,
+            keywords=keywords,
+            domain_terms=domain_terms,
+            description=description,
+            min_terms=3,
+            max_terms=6,
+        )
 
     domain_focus = intent_domain or "research focus"
     objective_answers = " ".join(
@@ -561,7 +601,7 @@ def _fallback_synthesis(
         "Success means stakeholders can act on a ranked set of opportunities and risks with clear evidence links."
     )
 
-    enriched_description = "\n".join(
+    enriched_description = "\n\n".join(
         [
             f"Project Goal (Research Goal): {project_goal}",
             f"User Pain Points: {pain_points}",
@@ -707,13 +747,8 @@ def _apply_explicit_overrides(
 
     if "keywords" in merged_intent and isinstance(merged_intent.get("keywords"), list):
         seeds = _clean_list(merged_intent.get("keywords"), max_items=16)
-        description_terms = [
-            token
-            for token in _tokenize(enriched_description)
-            if len(token) >= 4
-        ][:8]
         merged_intent["keywords"] = _clean_list(
-            [*seeds, *key_entities, *must_match_terms, *description_terms],
+            [*key_entities, *must_match_terms, *seeds],
             max_items=16,
         )
 
@@ -724,17 +759,37 @@ def _apply_explicit_overrides(
         )
 
     if "must_match_terms" in merged_intent and isinstance(merged_intent.get("must_match_terms"), list):
-        merged_intent["must_match_terms"] = _clean_list(
-            [*merged_intent.get("must_match_terms", []), *must_match_terms],
+        explicit_must_match = _clean_list(
+            [*must_match_terms, *merged_intent.get("must_match_terms", [])],
             max_items=12,
         )
+        if must_match_terms:
+            merged_intent["must_match_terms"] = _clean_list(
+                [*must_match_terms, *key_entities],
+                max_items=6,
+            )
+        else:
+            merged_intent["must_match_terms"] = derive_must_match_terms(
+                explicit_terms=explicit_must_match,
+                entities=merged_intent.get("entities", []),
+                keywords=merged_intent.get("keywords", []),
+                domain_terms=merged_intent.get("domain_terms", []),
+                description="",
+                min_terms=3,
+                max_terms=6,
+            )
 
     filters = _as_mapping(merged_intent.get("search_filters"))
     if filters:
         prioritized_terms = _clean_list([*must_match_terms, *key_entities], max_items=6)
         for key in ("news", "papers", "patents"):
             if key in filters:
-                filters[key] = _merge_text_terms(str(filters.get(key) or ""), prioritized_terms, time_horizon)
+                merged_filter = _merge_text_terms(
+                    str(filters.get(key) or ""),
+                    prioritized_terms,
+                    time_horizon,
+                )
+                filters[key] = re.sub(r"\s+", " ", merged_filter).strip()
 
         if "tiktok" in filters and not target_sources.get("tiktok", True):
             filters["tiktok"] = ""

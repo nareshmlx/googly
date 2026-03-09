@@ -12,6 +12,7 @@ from app.core.logging_setup import configure_logging
 from app.core.middleware import RequestIDMiddleware
 from app.core.redis import close_redis, get_redis
 from app.repositories.health import check_db_ready
+from app.repositories.insights import reset_stuck_generating_reports_for_service
 
 configure_logging(settings.LOG_LEVEL)
 
@@ -43,6 +44,12 @@ async def lifespan(app: FastAPI):
         logger.info("redis.connected")
     except Exception as e:
         logger.warning("redis.connection_failed", error=str(e))
+
+    try:
+        reset_count = await reset_stuck_generating_reports_for_service()
+        logger.info("insights.startup_report_status_reset", reset_count=reset_count)
+    except Exception as exc:
+        logger.warning("insights.startup_report_status_reset_failed", error=str(exc))
 
     yield
 
@@ -78,12 +85,14 @@ def create_app() -> FastAPI:
     app.add_middleware(RequestIDMiddleware)
     app.add_middleware(GZipMiddleware, minimum_size=settings.GZIP_MINIMUM_SIZE_BYTES)
 
-    from app.api.v1 import chat, kb, projects, users
+    from app.api.v1 import chat, cluster_followup, insights, kb, projects, users
 
     app.include_router(chat.router, prefix="/api/v1/chat", tags=["chat"])
     app.include_router(projects.router, prefix="/api/v1/projects", tags=["projects"])
     app.include_router(kb.router, prefix="/api/v1/kb", tags=["kb"])
     app.include_router(users.router, prefix="/api/v1/users", tags=["users"])
+    app.include_router(insights.router, prefix="/api/v1", tags=["insights"])
+    app.include_router(cluster_followup.router, prefix="/api/v1", tags=["insights-followup"])
 
     @app.get("/health")
     async def health_check():

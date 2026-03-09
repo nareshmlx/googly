@@ -6,6 +6,8 @@ Every new cron job MUST be added to `cron_jobs` here.
 Worker is started with: uv run arq app.tasks.worker.WorkerSettings
 """
 
+from typing import ClassVar
+
 from arq.connections import RedisSettings
 from arq.cron import cron
 from arq.worker import func
@@ -13,8 +15,13 @@ from arq.worker import func
 from app.core.config import settings
 from app.core.logging_setup import configure_logging
 from app.tasks.backfill_fulltext_assets import backfill_fulltext_assets
+from app.tasks.backfill_insights import backfill_insights
 from app.tasks.bootstrap_project_setup import bootstrap_project_setup
-from app.tasks.cleanup import cleanup_old_chat_messages
+from app.tasks.cleanup import (
+    cleanup_old_chat_messages,
+    cleanup_old_cluster_followup_messages,
+)
+from app.tasks.cluster_project import cluster_project_task
 from app.tasks.enrich_video import enrich_video
 from app.tasks.ingest_document import ingest_document
 from app.tasks.ingest_project import ingest_project
@@ -34,8 +41,10 @@ class WorkerSettings:
     health_check_interval: 30s — used by KEDA to confirm worker is alive.
     """
 
-    functions = [
+    functions: ClassVar[list] = [
         func(ingest_project, timeout=settings.ARQ_WORKER_JOB_TIMEOUT),
+        func(cluster_project_task, name="cluster_project_task", timeout=settings.ARQ_WORKER_JOB_TIMEOUT),
+        backfill_insights,
         ingest_document,
         bootstrap_project_setup,
         func(refresh_project, timeout=settings.ARQ_WORKER_JOB_TIMEOUT),
@@ -43,17 +52,20 @@ class WorkerSettings:
         backfill_fulltext_assets,
         refresh_due_projects,
         cleanup_old_chat_messages,
+        cleanup_old_cluster_followup_messages,
         func(enrich_video, timeout=settings.ARQ_WORKER_JOB_TIMEOUT),
     ]
 
-    cron_jobs = [
+    cron_jobs: ClassVar[list] = [
         # refresh_due_projects runs every 6 hours — checks which projects are
         # overdue for daily/weekly refresh and enqueues refresh_project for each
         cron(refresh_due_projects, hour=set(settings.ARQ_REFRESH_CRON_HOURS), minute=0),
         cron(backfill_fulltext_assets, minute={10, 40}),
+        cron(backfill_insights, hour=2, minute=0),
         # cleanup_old_chat_messages runs daily at 3am UTC — deletes messages
         # older than 90 days from both Postgres and Redis
         cron(cleanup_old_chat_messages, hour=3, minute=0),
+        cron(cleanup_old_cluster_followup_messages, hour=4, minute=0),
     ]
 
     redis_settings = RedisSettings.from_dsn(settings.REDIS_URL)

@@ -50,6 +50,7 @@ async def set_project_ingest_status(
     total_chunks: int | None = None,
     source_counts: dict | None = None,
     source_diagnostics: dict | None = None,
+    cluster_diagnostics: dict | None = None,
     fulltext_enqueued: int = 0,
 ) -> None:
     """Persist project ingest status in Redis for API/UI visibility."""
@@ -65,6 +66,7 @@ async def set_project_ingest_status(
         "total_chunks": total_chunks,
         "source_counts": source_counts or {},
         "source_diagnostics": source_diagnostics or {},
+        "cluster_diagnostics": cluster_diagnostics or {},
         "fulltext_enqueued": int(fulltext_enqueued),
     }
     try:
@@ -167,6 +169,7 @@ async def get_project_ingest_status(project_id: str) -> dict:
         redis_payload.setdefault("project_id", project_id)
         redis_payload.setdefault("source_counts", {})
         redis_payload.setdefault("source_diagnostics", {})
+        redis_payload.setdefault("cluster_diagnostics", {})
         redis_payload["enrichment"] = enrichment
         return redis_payload
 
@@ -184,6 +187,7 @@ async def get_project_ingest_status(project_id: str) -> dict:
         "total_chunks": kb_chunk_count if kb_chunk_count > 0 else None,
         "source_counts": {},
         "source_diagnostics": {},
+        "cluster_diagnostics": {},
         "enrichment": enrichment,
     }
 

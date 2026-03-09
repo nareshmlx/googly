@@ -161,7 +161,7 @@ async def _search_with_retry(query: str) -> dict | None:
 
     Uses production infrastructure: retry with exponential backoff, rate limiting.
     CRITICAL: Rate limiting happens ONCE for the entire operation (not per API call).
-    This prevents double rate limiting that was making PubMed 2× slower than needed.
+    This prevents double rate limiting that was making PubMed 2x slower than needed.
 
     Returns parsed JSON dict with paper details on success, None on any failure.
     """
@@ -253,9 +253,11 @@ async def _search_impl(query: str) -> list[dict]:
             authors_raw = paper.get("authors", [])
             authors = []
             if isinstance(authors_raw, list):
-                for author in authors_raw:
-                    if isinstance(author, dict) and "name" in author:
-                        authors.append(author["name"])
+                authors.extend(
+                    author["name"]
+                    for author in authors_raw
+                    if isinstance(author, dict) and "name" in author
+                )
 
             title = str(paper.get("title") or "")
             content = _best_available_content(paper, title, authors)

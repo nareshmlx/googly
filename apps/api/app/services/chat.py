@@ -1,9 +1,10 @@
 import asyncio
-import json
 import re
 import time
 from collections.abc import AsyncGenerator, Callable
+from contextlib import suppress
 
+import orjson
 import structlog
 
 from app.agents.orchestrator import run_query
@@ -140,8 +141,8 @@ def _extract_token_from_sse_chunk(chunk: str) -> str | None:
         return None
 
     try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
+        payload = orjson.loads(raw)
+    except orjson.JSONDecodeError:
         return raw
 
     token = payload.get("token")
@@ -196,7 +197,7 @@ async def get_cached_response(
         if cached:
             cache_hits_total.labels(cache_tier="L2", cache_type="semantic").inc()
             logger.info("chat.cache_hit", project_id=project_id, query_hash=query_hash)
-            return cached
+            return cached  # type: ignore[no-any-return]
         cache_misses_total.labels(cache_tier="L2", cache_type="semantic").inc()
         logger.info("chat.cache_miss", project_id=project_id, query_hash=query_hash)
         return None
@@ -241,7 +242,7 @@ async def _list_projects_summary_cached(user_id: str) -> list[dict]:
         redis = await get_redis()
         cached = await redis.get(cache_key)
         if cached:
-            payload = json.loads(cached)
+            payload = orjson.loads(cached)
             if isinstance(payload, list):
                 return payload
     except Exception:
@@ -250,7 +251,7 @@ async def _list_projects_summary_cached(user_id: str) -> list[dict]:
     projects = await list_projects_summary_for_chat(user_id)
     try:
         redis = await get_redis()
-        await redis.setex(cache_key, RedisTTL.PROJECTS_SUMMARY, json.dumps(projects))
+        await redis.setex(cache_key, RedisTTL.PROJECTS_SUMMARY, orjson.dumps(projects))
     except Exception:
         logger.warning("chat.projects_summary_cache_write_error", user_id=user_id)
     return projects
@@ -293,10 +294,9 @@ async def persist_chat_turn(
         history_key = RedisKeys.CHAT_HISTORY.format(
             user_id=user_id, project_id=project_id, session_id=session_id
         )
-        user_payload = json.dumps({"role": "user", "content": user_message}, ensure_ascii=False)
-        assistant_payload = json.dumps(
-            {"role": "assistant", "content": assistant_message},
-            ensure_ascii=False,
+        user_payload = orjson.dumps({"role": "user", "content": user_message})
+        assistant_payload = orjson.dumps(
+            {"role": "assistant", "content": assistant_message}
         )
         redis = await get_redis()
         pipe = redis.pipeline(transaction=True)
@@ -349,14 +349,12 @@ async def get_chat_history_messages(
         raw_messages: list[str] = await redis.lrange(history_key, 0, -1)
         out: list[dict] = []
         for msg in raw_messages:
-            try:
-                parsed = json.loads(msg)
-            except Exception:
-                continue
-            role = parsed.get("role")
-            content = parsed.get("content")
-            if role in {"user", "assistant"} and isinstance(content, str):
-                out.append({"role": role, "content": content})
+            with suppress(Exception):
+                parsed = orjson.loads(msg)
+                role = parsed.get("role")
+                content = parsed.get("content")
+                if role in {"user", "assistant"} and isinstance(content, str):
+                    out.append({"role": role, "content": content})
         redis_messages = out
     except Exception:
         logger.warning(
@@ -464,7 +462,7 @@ async def stream_response(
 
                 # Yield the full cached response as a single token — splitting on whitespace
                 # destroys newlines, bullet points, and code blocks in markdown responses.
-                yield f"data: {json.dumps({'token': cached})}\n\n"
+                yield f"data: {orjson.dumps({'token': cached}).decode('utf-8')}\n\n"
                 yield "data: [DONE]\n\n"
                 success = True
                 return
